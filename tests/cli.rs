@@ -67,11 +67,68 @@ fn reinitializing_fails_with_a_nonzero_exit_code() {
 }
 
 #[test]
-fn doctor_fails_with_a_nonzero_exit_code() {
-    let temp = TempDir::new("doctor");
+fn doctor_fails_with_a_nonzero_exit_code_without_a_root_manifest() {
+    let temp = TempDir::new("doctor-missing-root");
 
     let output = monore(&["doctor"], temp.path());
 
     assert_eq!(output.status.code(), Some(1));
-    assert!(stderr(&output).contains("not implemented"));
+    assert!(stderr(&output).contains("could not find a root monorepo.toml"));
+}
+
+#[test]
+fn doctor_accepts_the_manifest_created_by_init() {
+    let temp = TempDir::new("doctor-valid");
+    assert!(monore(&["init"], temp.path()).status.success());
+
+    let output = monore(&["doctor"], temp.path());
+
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    assert!(stdout(&output).contains("checked"));
+}
+
+#[test]
+fn ci_dry_run_discovers_a_package_manifest() {
+    let temp = TempDir::new("ci-dry-run");
+    assert!(monore(&["init"], temp.path()).status.success());
+
+    let package = temp.path().join("packages").join("api");
+    fs::create_dir_all(&package).expect("create package directory");
+    fs::write(
+        package.join("monorepo.toml"),
+        "[package]\nname = \"api\"\n\n[tasks.build]\ncommand = [\"echo\", \"building-api\"]\n\n[tasks.test]\ncommand = [\"echo\", \"testing-api\"]\n",
+    )
+    .expect("write package manifest");
+
+    let output = monore(&["ci", "--dry-run"], temp.path());
+
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    assert!(stdout(&output).contains("would run api:build"));
+    assert!(stdout(&output).contains("echo building-api"));
+}
+
+#[test]
+fn plan_and_graph_commands_expose_task_dependencies() {
+    let temp = TempDir::new("plan-graph");
+    assert!(monore(&["init"], temp.path()).status.success());
+
+    for (name, dependency) in [("shared", ""), ("web", "depends_on = [\"shared:build\"]\n")] {
+        let package = temp.path().join("packages").join(name);
+        fs::create_dir_all(&package).expect("create package directory");
+        fs::write(
+            package.join("monorepo.toml"),
+            format!(
+                "[package]\nname = \"{name}\"\n\n[tasks.build]\ncommand = [\"echo\", \"{name}\"]\n{dependency}\n[tasks.test]\ncommand = [\"echo\", \"{name}-test\"]\ndepends_on = [\"build\"]\n"
+            ),
+        )
+        .expect("write package manifest");
+    }
+
+    let plan = monore(&["plan"], temp.path());
+    assert!(plan.status.success(), "stderr: {}", stderr(&plan));
+    assert!(stdout(&plan).find("shared:build").unwrap() < stdout(&plan).find("web:build").unwrap());
+
+    let graph = monore(&["graph"], temp.path());
+    assert!(graph.status.success(), "stderr: {}", stderr(&graph));
+    assert!(stdout(&graph).contains("web:build <- shared:build"));
 }

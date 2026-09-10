@@ -8,15 +8,24 @@
 
 mod commands;
 mod config;
+mod runner;
 #[cfg(test)]
 mod testing;
+mod workspace;
 
 use std::error::Error as StdError;
 use std::fmt;
 
+pub use commands::ci::{
+    CiError, ci, ci_with_jobs, graph, plan, run_pipeline, run_pipeline_with_jobs,
+};
 pub use commands::doctor::{DoctorError, doctor};
 pub use commands::init::{InitError, init};
-pub use config::{CONFIG_FILE_NAME, CONFIG_VERSION, MonorepoConfig, config_path, render_config};
+pub use config::{
+    CONFIG_FILE_NAME, MonorepoConfig, PackageConfig, PipelineConfig, TaskConfig, WorkspaceConfig,
+    config_path, render_config,
+};
+pub use workspace::{Package, PlannedTask, TaskNode, Workspace, WorkspaceError};
 
 /// Every expected failure a `monore` command can report.
 ///
@@ -26,6 +35,7 @@ pub use config::{CONFIG_FILE_NAME, CONFIG_VERSION, MonorepoConfig, config_path, 
 pub enum Error {
     Init(InitError),
     Doctor(DoctorError),
+    Ci(CiError),
 }
 
 impl fmt::Display for Error {
@@ -33,6 +43,7 @@ impl fmt::Display for Error {
         match self {
             Self::Init(error) => error.fmt(f),
             Self::Doctor(error) => error.fmt(f),
+            Self::Ci(error) => error.fmt(f),
         }
     }
 }
@@ -42,6 +53,7 @@ impl StdError for Error {
         match self {
             Self::Init(error) => Some(error),
             Self::Doctor(error) => Some(error),
+            Self::Ci(error) => Some(error),
         }
     }
 }
@@ -55,5 +67,11 @@ impl From<InitError> for Error {
 impl From<DoctorError> for Error {
     fn from(error: DoctorError) -> Self {
         Self::Doctor(error)
+    }
+}
+
+impl From<CiError> for Error {
+    fn from(error: CiError) -> Self {
+        Self::Ci(error)
     }
 }

@@ -90,12 +90,12 @@ impl StdError for InitError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{CONFIG_FILE_NAME, CONFIG_VERSION};
+    use crate::config::CONFIG_FILE_NAME;
     use crate::testing::TempDir;
 
     fn read_config(path: &Path) -> MonorepoConfig {
         let contents = fs::read_to_string(path).expect("config is readable");
-        toml::from_str(&contents).expect("config parses")
+        MonorepoConfig::parse(&contents).expect("config parses")
     }
 
     #[test]
@@ -106,21 +106,21 @@ mod tests {
         let written = init(&target).expect("init succeeds");
 
         assert_eq!(written, target.join(CONFIG_FILE_NAME));
-        assert_eq!(read_config(&written).version, CONFIG_VERSION);
+        assert_eq!(read_config(&written), MonorepoConfig::template());
     }
 
     #[test]
     fn refuses_to_overwrite_an_existing_config() {
         let temp = TempDir::new();
         let existing = config_path(temp.path());
-        fs::write(&existing, "version = 99\n").expect("seed an existing config");
+        fs::write(&existing, "existing = true\n").expect("seed an existing config");
 
         let error = init(temp.path()).expect_err("a second init must fail");
 
         assert!(matches!(error, InitError::AlreadyInitialized(path) if path == existing));
         assert_eq!(
             fs::read_to_string(&existing).expect("config is readable"),
-            "version = 99\n",
+            "existing = true\n",
         );
     }
 
