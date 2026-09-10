@@ -28,7 +28,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           if gh release view --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            tag="$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName)"
             echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "tag=$tag" >> "$GITHUB_OUTPUT"
           else
             echo "exists=false" >> "$GITHUB_OUTPUT"
             echo 'No release exists yet; validation is complete.'
@@ -40,7 +42,12 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           mkdir -p dist
-          gh release download --repo "$GITHUB_REPOSITORY" --dir dist --clobber
+          gh release download "${{ steps.release.outputs.tag }}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern 'SHA256SUMS' \
+            --pattern 'monorelease-*' \
+            --dir dist \
+            --clobber
 
       - name: Verify checksums
         if: steps.release.outputs.exists == 'true'

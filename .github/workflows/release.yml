@@ -99,19 +99,26 @@ jobs:
         run: |
           mkdir -p dist
           tar -czf "dist/monorelease-${GITHUB_REF_NAME}-${{ matrix.target }}.tar.gz" \
-            -C "target/${{ matrix.target }}/release" monorelease
+            -C "target/${{ matrix.target }}/release" monorelease \
+            -C "$GITHUB_WORKSPACE" LICENSE README.md
 
       - name: Package Windows artifact
         if: matrix.archive == 'zip'
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
+          $staging = "dist/staging"
+          New-Item -ItemType Directory -Force $staging | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/monorelease.exe" "$staging/monorelease.exe"
+          Copy-Item LICENSE "$staging/LICENSE"
+          Copy-Item README.md "$staging/README.md"
           Compress-Archive `
-            -Path "target/${{ matrix.target }}/release/monorelease.exe" `
+            -Path "$staging/*" `
             -DestinationPath "dist/monorelease-$env:GITHUB_REF_NAME-${{ matrix.target }}.zip"
+          Remove-Item -Recurse -Force $staging
 
       - name: Upload release artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
         with:
           name: release-${{ matrix.target }}
           path: dist/*
@@ -127,7 +134,7 @@ jobs:
       contents: write
     steps:
       - name: Download release artifacts
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
         with:
           pattern: release-*
           path: dist
