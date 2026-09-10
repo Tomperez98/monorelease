@@ -9,13 +9,13 @@ Run these commands from the repository root:
 
 ```bash
 # Validate the standalone manifest.
-cargo run -- doctor examples/standalone
+cargo run -- check --dir examples/standalone
 
 # Inspect the dependency-first plan.
-cargo run -- plan examples/standalone
+cargo run -- plan --dir examples/standalone
 
 # Run the standalone pipeline.
-cargo run -- ci examples/standalone
+cargo run -- --dir examples/standalone
 
 # Root discovery also works from inside src/.
 (cd examples/standalone/src && cargo run -- plan)

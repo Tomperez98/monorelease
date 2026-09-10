@@ -6,22 +6,22 @@ Run these commands from the repository root:
 
 ```bash
 # Validate every manifest and task reference.
-cargo run -- doctor examples/echo
+cargo run -- check --dir examples/echo
 
 # Inspect the resolved dependency-first plan without running commands.
-cargo run -- ci examples/echo --dry-run
+cargo run -- --dir examples/echo task build --dry-run
 
 # Inspect the dependency graph.
-cargo run -- graph examples/echo
+cargo run -- graph --dir examples/echo
 
 # Run the default build/test pipeline with two workers.
-cargo run -- ci examples/echo --jobs 2
+cargo run -- run --dir examples/echo --jobs 2
 
 # Run the release pipeline.
-cargo run -- run release examples/echo --jobs 2
+cargo run -- run release --dir examples/echo --jobs 2
 
 # Select app and include its transitive shared dependency.
-cargo run -- ci examples/echo --package app --jobs 2
+cargo run -- task build --dir examples/echo --package app --jobs 2
 ```
 
 ## Workspace layout

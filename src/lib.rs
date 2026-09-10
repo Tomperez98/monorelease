@@ -27,6 +27,7 @@ pub use commands::ci::{
 };
 pub use commands::doctor::{DoctorError, doctor};
 pub use commands::init::{InitError, init, init_standalone};
+pub use commands::list::{ListError, list};
 pub use config::{
     CONFIG_FILE_NAME, MonorepoConfig, PackageConfig, PipelineConfig, TaskConfig,
     WORKSPACE_PACKAGE_NAME, WorkspaceConfig, config_path, render_config,
@@ -42,6 +43,7 @@ pub enum Error {
     Init(InitError),
     Doctor(DoctorError),
     Ci(CiError),
+    List(ListError),
 }
 
 impl fmt::Display for Error {
@@ -50,6 +52,7 @@ impl fmt::Display for Error {
             Self::Init(error) => error.fmt(f),
             Self::Doctor(error) => error.fmt(f),
             Self::Ci(error) => error.fmt(f),
+            Self::List(error) => error.fmt(f),
         }
     }
 }
@@ -60,6 +63,7 @@ impl StdError for Error {
             Self::Init(error) => Some(error),
             Self::Doctor(error) => Some(error),
             Self::Ci(error) => Some(error),
+            Self::List(error) => Some(error),
         }
     }
 }
@@ -79,5 +83,11 @@ impl From<DoctorError> for Error {
 impl From<CiError> for Error {
     fn from(error: CiError) -> Self {
         Self::Ci(error)
+    }
+}
+
+impl From<ListError> for Error {
+    fn from(error: ListError) -> Self {
+        Self::List(error)
     }
 }

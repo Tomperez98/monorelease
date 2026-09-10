@@ -33,8 +33,8 @@ from the project root or a nested directory such as `src/`; task `cwd` values
 remain relative to the project root.
 
 ```bash
-monorelease doctor
-monorelease ci
+monorelease check
+monorelease
 ```
 
 To scaffold a standalone project, provide its initial build command. Repeat
@@ -48,7 +48,7 @@ monorelease init --standalone \
 For a monorepo, create a root workspace instead:
 
 ```bash
-monorelease init .
+monorelease init
 ```
 
 The generated root manifest looks like this:
@@ -97,20 +97,26 @@ depends_on = ["build", "shared:test"]
 
 No Rust source changes or central package registry are required when adding another package under a configured member pattern.
 
-The manifest schema is intentionally fixed and has no `version` header. Unknown fields are rejected so typos fail during `doctor` or `ci`. `doctor` validates all discovered manifests, task references, command inputs, and task working directories before execution. If the schema changes in the future, the tool will provide an explicit migration rather than accepting multiple implicit formats.
+The manifest schema is intentionally fixed and has no `version` header. Unknown fields are rejected so typos fail during `check` or execution. `check` validates all discovered manifests, task references, command inputs, and task working directories before execution. If the schema changes in the future, the tool will provide an explicit migration rather than accepting multiple implicit formats.
 
 ## Commands
 
-Validate the root manifest, discover packages, and check task references:
+Run the default pipeline:
 
 ```bash
-monorelease doctor
+monorelease
 ```
 
-Run the workspace's default pipeline:
+Validate the selected project or monorepo:
 
 ```bash
-monorelease ci
+monorelease check
+```
+
+List available pipelines, packages, tasks, and examples:
+
+```bash
+monorelease list
 ```
 
 Run a named pipeline:
@@ -119,41 +125,57 @@ Run a named pipeline:
 monorelease run release
 ```
 
-Preview the resolved commands without running them:
+Run one or more tasks and their transitive dependencies:
 
 ```bash
-monorelease ci --dry-run
+monorelease task test
+monorelease task build test
+```
+
+Preview execution without running commands:
+
+```bash
+monorelease task test --dry-run
 monorelease plan
+monorelease plan release
 ```
 
 Print the task dependency graph:
 
 ```bash
 monorelease graph
+monorelease graph release
 ```
 
-Run only one package's root tasks and their transitive task dependencies:
+Select a package and run its task graph:
 
 ```bash
-monorelease ci --package web
+monorelease task test --package web
 ```
 
-Run specific task names instead of the pipeline's tasks. Repeat `--task` for multiple roots:
+Run independent task branches concurrently:
 
 ```bash
-monorelease ci --task build
-monorelease ci --task build --task test
+monorelease run --jobs 4
+```
 
-# Run independent task branches concurrently
-monorelease ci --jobs 4
+Skip or refresh cache entries:
 
-# Skip cache reads and writes for one run
-monorelease ci --no-cache
+```bash
+monorelease --no-cache
+monorelease --force
+```
 
-# Re-run cached tasks and refresh their successful entries
-monorelease ci --force
+Use a project directory consistently with `--dir`:
 
-# Remove all local cache entries
+```bash
+monorelease --dir examples/echo check
+monorelease --dir examples/echo task test
+```
+
+Remove all local cache entries:
+
+```bash
 monorelease cache clean
 ```
 

@@ -142,6 +142,54 @@ fn doctor_accepts_the_manifest_created_by_init() {
 }
 
 #[test]
+fn default_command_runs_the_default_pipeline() {
+    let temp = TempDir::new("default-command");
+    fs::write(
+        temp.path().join("monorepo.toml"),
+        "[package]\nname = \"app\"\n\n[pipelines.ci]\ntasks = [\"build\"]\n\n[tasks.build]\ncommand = [\"echo\", \"building\"]\n",
+    )
+    .expect("write standalone manifest");
+
+    let output = monore(&[], temp.path());
+
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    assert!(stdout(&output).contains("summary: 1 completed"));
+}
+
+#[test]
+fn list_describes_available_tasks_and_pipelines() {
+    let temp = TempDir::new("list");
+    fs::write(
+        temp.path().join("monorepo.toml"),
+        "[package]\nname = \"app\"\n\n[pipelines.ci]\ntasks = [\"test\"]\n\n[tasks.test]\ncommand = [\"echo\", \"testing\"]\n",
+    )
+    .expect("write standalone manifest");
+
+    let output = monore(&["list"], temp.path());
+
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    let listing = stdout(&output);
+    assert!(listing.contains("Pipelines:"));
+    assert!(listing.contains("ci  test"));
+    assert!(listing.contains("app:test"));
+}
+
+#[test]
+fn unknown_task_suggests_the_closest_task_name() {
+    let temp = TempDir::new("task-suggestion");
+    fs::write(
+        temp.path().join("monorepo.toml"),
+        "[package]\nname = \"app\"\n\n[pipelines.ci]\ntasks = [\"test\"]\n\n[tasks.test]\ncommand = [\"echo\", \"testing\"]\n",
+    )
+    .expect("write standalone manifest");
+
+    let output = monore(&["task", "tests"], temp.path());
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stderr(&output).contains("Did you mean 'test'?"));
+}
+
+#[test]
 fn standalone_project_runs_without_workspace_members() {
     let temp = TempDir::new("standalone");
     fs::create_dir_all(temp.path().join("src")).expect("create source directory");

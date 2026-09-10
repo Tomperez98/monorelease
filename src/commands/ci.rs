@@ -178,7 +178,8 @@ pub fn graph(
     let workspace = Workspace::load(path)?;
     let edges = workspace.graph(selected_package, pipeline, requested_tasks)?;
     let mut output = format!(
-        "workspace {} ({})",
+        "{} {} ({})",
+        workspace.scope_label(),
         workspace.name,
         workspace.root.display()
     );
@@ -201,7 +202,8 @@ pub fn graph(
 
 fn format_plan(workspace: &Workspace, plan: &[PlannedTask]) -> String {
     let mut output = format!(
-        "workspace {} ({})",
+        "{} {} ({})",
+        workspace.scope_label(),
         workspace.name,
         workspace.root.display()
     );

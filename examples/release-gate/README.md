@@ -10,19 +10,19 @@ From the repository root:
 
 ```bash
 # Validate every package and workspace task.
-cargo run -- doctor examples/release-gate
+cargo run -- check --dir examples/release-gate
 
 # Inspect the normal CI graph.
-cargo run -- graph examples/release-gate
+cargo run -- graph --dir examples/release-gate
 
 # Run build and test tasks with bounded parallelism.
-cargo run -- ci examples/release-gate --jobs 3
+cargo run -- run --dir examples/release-gate --jobs 3
 
 # Inspect the release graph without executing it.
-cargo run -- plan examples/release-gate --pipeline release
+cargo run -- plan release --dir examples/release-gate
 
 # Run the release pipeline.
-cargo run -- run release examples/release-gate --jobs 3
+cargo run -- run release --dir examples/release-gate --jobs 3
 ```
 
 ## Workspace layout

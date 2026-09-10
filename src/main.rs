@@ -1,4 +1,4 @@
-//! `monore` — language agnostic monorepo tooling.
+//! `monore` — language agnostic project and monorepo tooling.
 //!
 //! This is the transport edge: it parses the command line, calls into
 //! [`monorelease`], and maps the single error vocabulary onto stdout, stderr,
@@ -7,121 +7,106 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use monorelease::{CacheMode, Error};
 
 #[derive(Parser)]
 #[command(
     name = "monore",
     version = "0.1.0",
-    about = "Language agnostic monorepo tooling"
+    about = "Language agnostic project and monorepo tooling",
+    after_help = "Run `monore help <command>` for command details."
 )]
 struct Cli {
+    /// Project or monorepo directory.
+    #[arg(long = "dir", global = true, default_value = ".")]
+    path: PathBuf,
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
+}
+
+#[derive(Args, Clone)]
+struct ExecutionOptions {
+    #[arg(long)]
+    package: Option<String>,
+    #[arg(long)]
+    dry_run: bool,
+    /// Skip reading and writing the local task cache.
+    #[arg(long, conflicts_with = "force")]
+    no_cache: bool,
+    /// Ignore cache hits and refresh successful cache entries.
+    #[arg(long, conflicts_with = "no_cache")]
+    force: bool,
+    /// Maximum number of independent tasks to execute concurrently.
+    #[arg(long, default_value_t = 1)]
+    jobs: usize,
 }
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Write a fresh monorepo.toml into a directory.
+    /// Write a fresh manifest in the selected directory.
     Init {
         /// Create a standalone project instead of a monorepo workspace.
         #[arg(long)]
         standalone: bool,
-        /// Command used by the generated standalone build task.
+        /// Command argument used by the generated standalone build task.
         #[arg(long = "command", num_args = 1, requires = "standalone")]
         command: Vec<String>,
-        #[arg(default_value = ".")]
-        path: PathBuf,
     },
-    /// Check that a directory holds a healthy monorepo.
-    Doctor {
-        #[arg(default_value = ".")]
-        path: PathBuf,
-    },
-    /// Run the workspace's default pipeline.
-    Ci {
-        #[arg(default_value = ".")]
-        path: PathBuf,
-        #[arg(long)]
-        package: Option<String>,
-        #[arg(long = "task")]
-        tasks: Vec<String>,
-        #[arg(long)]
-        dry_run: bool,
-        /// Skip reading and writing the local task cache.
-        #[arg(long, conflicts_with = "force")]
-        no_cache: bool,
-        /// Ignore cache hits and refresh successful cache entries.
-        #[arg(long, conflicts_with = "no_cache")]
-        force: bool,
-        /// Maximum number of independent tasks to execute concurrently.
-        #[arg(long, default_value_t = 1)]
-        jobs: usize,
-    },
-    /// Run a named workspace pipeline.
+    /// Run a named pipeline, or the default pipeline when omitted.
+    #[command(alias = "ci")]
     Run {
-        pipeline: String,
-        #[arg(default_value = ".")]
-        path: PathBuf,
+        #[arg(value_name = "PIPELINE")]
+        pipeline: Option<String>,
+        /// Compatibility spelling for task selection; prefer `monore task`.
+        #[arg(long = "task", hide = true)]
+        tasks: Vec<String>,
+        #[command(flatten)]
+        options: ExecutionOptions,
+    },
+    /// Run one or more tasks and their dependencies.
+    Task {
+        #[arg(required = true, value_name = "TASK")]
+        tasks: Vec<String>,
+        #[command(flatten)]
+        options: ExecutionOptions,
+    },
+    /// Validate the selected project or monorepo.
+    #[command(alias = "doctor")]
+    Check,
+    /// List pipelines, packages, tasks, and common commands.
+    List,
+    /// Print the resolved plan for the default or named pipeline.
+    Plan {
+        #[arg(value_name = "PIPELINE")]
+        pipeline: Option<String>,
         #[arg(long)]
         package: Option<String>,
-        #[arg(long = "task")]
-        tasks: Vec<String>,
+    },
+    /// Print dependency edges for the default or named pipeline.
+    Graph {
+        #[arg(value_name = "PIPELINE")]
+        pipeline: Option<String>,
         #[arg(long)]
-        dry_run: bool,
-        /// Skip reading and writing the local task cache.
-        #[arg(long, conflicts_with = "force")]
-        no_cache: bool,
-        /// Ignore cache hits and refresh successful cache entries.
-        #[arg(long, conflicts_with = "no_cache")]
-        force: bool,
-        /// Maximum number of independent tasks to execute concurrently.
-        #[arg(long, default_value_t = 1)]
-        jobs: usize,
+        package: Option<String>,
     },
     /// Manage the local task cache.
     Cache {
         #[command(subcommand)]
         command: CacheCommands,
     },
-    /// Print the resolved task plan.
-    Plan {
-        #[arg(default_value = ".")]
-        path: PathBuf,
-        #[arg(long)]
-        pipeline: Option<String>,
-        #[arg(long)]
-        package: Option<String>,
-        #[arg(long = "task")]
-        tasks: Vec<String>,
-    },
-    /// Print task dependency edges.
-    Graph {
-        #[arg(default_value = ".")]
-        path: PathBuf,
-        #[arg(long)]
-        pipeline: Option<String>,
-        #[arg(long)]
-        package: Option<String>,
-        #[arg(long = "task")]
-        tasks: Vec<String>,
-    },
 }
 
 #[derive(Subcommand)]
 enum CacheCommands {
-    /// Remove all local cache entries for a workspace.
-    Clean {
-        #[arg(default_value = ".")]
-        path: PathBuf,
-    },
+    /// Remove all local cache entries for the selected project.
+    Clean,
 }
 
 fn main() -> ExitCode {
-    let Cli { command } = Cli::parse();
+    let Cli { path, command } = Cli::parse();
 
-    match run(command) {
+    match run(path, command) {
         Ok(summary) => {
             println!("{summary}");
             ExitCode::SUCCESS
@@ -143,17 +128,24 @@ fn cache_mode(no_cache: bool, force: bool) -> CacheMode {
     }
 }
 
-/// Run `command` to completion, returning the one line to print on success.
-///
-/// Each step can fail with its own error; `?` short-circuits on the first
-/// failure, and the return type records the whole failure space.
-fn run(command: Commands) -> Result<String, Error> {
+/// Run a parsed command to completion, translating domain results once at the
+/// process boundary.
+fn run(path: PathBuf, command: Option<Commands>) -> Result<String, Error> {
     match command {
-        Commands::Init {
-            path,
+        None => monorelease::run_pipeline_with_cache(
+            &path,
+            None,
+            None,
+            &[],
+            false,
+            1,
+            CacheMode::ReadWrite,
+        )
+        .map_err(Error::from),
+        Some(Commands::Init {
             standalone,
             command,
-        } => {
+        }) => {
             let written = if standalone {
                 monorelease::init_standalone(&path, command)?
             } else {
@@ -161,63 +153,45 @@ fn run(command: Commands) -> Result<String, Error> {
             };
             Ok(format!("initialized {}", written.display()))
         }
-        Commands::Doctor { path } => {
+        Some(Commands::Run {
+            pipeline,
+            tasks,
+            options,
+        }) => monorelease::run_pipeline_with_cache(
+            &path,
+            pipeline.as_deref(),
+            options.package.as_deref(),
+            &tasks,
+            options.dry_run,
+            options.jobs,
+            cache_mode(options.no_cache, options.force),
+        )
+        .map_err(Error::from),
+        Some(Commands::Task { tasks, options }) => monorelease::run_pipeline_with_cache(
+            &path,
+            None,
+            options.package.as_deref(),
+            &tasks,
+            options.dry_run,
+            options.jobs,
+            cache_mode(options.no_cache, options.force),
+        )
+        .map_err(Error::from),
+        Some(Commands::Check) => {
             monorelease::doctor(&path)?;
             Ok(format!("checked {}", path.display()))
         }
-        Commands::Ci {
-            path,
-            package,
-            tasks,
-            dry_run,
-            no_cache,
-            force,
-            jobs,
-        } => monorelease::run_pipeline_with_cache(
-            &path,
-            None,
-            package.as_deref(),
-            &tasks,
-            dry_run,
-            jobs,
-            cache_mode(no_cache, force),
-        )
-        .map_err(Error::from),
-        Commands::Run {
-            pipeline,
-            path,
-            package,
-            tasks,
-            dry_run,
-            no_cache,
-            force,
-            jobs,
-        } => monorelease::run_pipeline_with_cache(
-            &path,
-            Some(&pipeline),
-            package.as_deref(),
-            &tasks,
-            dry_run,
-            jobs,
-            cache_mode(no_cache, force),
-        )
-        .map_err(Error::from),
-        Commands::Cache { command } => match command {
-            CacheCommands::Clean { path } => monorelease::clean_cache(&path).map_err(Error::from),
+        Some(Commands::List) => monorelease::list(&path).map_err(Error::from),
+        Some(Commands::Plan { pipeline, package }) => {
+            monorelease::plan(&path, pipeline.as_deref(), package.as_deref(), &[])
+                .map_err(Error::from)
+        }
+        Some(Commands::Graph { pipeline, package }) => {
+            monorelease::graph(&path, pipeline.as_deref(), package.as_deref(), &[])
+                .map_err(Error::from)
+        }
+        Some(Commands::Cache { command }) => match command {
+            CacheCommands::Clean => monorelease::clean_cache(&path).map_err(Error::from),
         },
-        Commands::Plan {
-            path,
-            pipeline,
-            package,
-            tasks,
-        } => monorelease::plan(&path, pipeline.as_deref(), package.as_deref(), &tasks)
-            .map_err(Error::from),
-        Commands::Graph {
-            path,
-            pipeline,
-            package,
-            tasks,
-        } => monorelease::graph(&path, pipeline.as_deref(), package.as_deref(), &tasks)
-            .map_err(Error::from),
     }
 }

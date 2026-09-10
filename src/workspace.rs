@@ -198,6 +198,10 @@ impl Workspace {
             .contains_key(&workspace_config.default_pipeline)
         {
             return Err(WorkspaceError::UnknownPipeline {
+                suggestion: closest_name(
+                    &workspace_config.default_pipeline,
+                    root_config.pipelines.keys(),
+                ),
                 name: workspace_config.default_pipeline.clone(),
             });
         }
@@ -332,6 +336,7 @@ impl Workspace {
         }
         if !root_config.pipelines.contains_key("ci") {
             return Err(WorkspaceError::UnknownPipeline {
+                suggestion: closest_name("ci", root_config.pipelines.keys()),
                 name: "ci".to_owned(),
             });
         }
@@ -412,6 +417,14 @@ impl Workspace {
         }
     }
 
+    /// Return the user-facing kind of this execution scope.
+    pub fn scope_label(&self) -> &'static str {
+        match self.kind {
+            ScopeKind::Standalone => "project",
+            ScopeKind::Workspace => "monorepo",
+        }
+    }
+
     /// Produce a dependency-first task plan.
     ///
     /// When `requested_tasks` is empty, the selected pipeline is used. An
@@ -429,6 +442,7 @@ impl Workspace {
                 .pipelines
                 .get(pipeline_name)
                 .ok_or_else(|| WorkspaceError::UnknownPipeline {
+                    suggestion: closest_name(pipeline_name, self.pipelines.keys()),
                     name: pipeline_name.to_owned(),
                 })?
                 .tasks
@@ -525,6 +539,16 @@ impl Workspace {
         Ok(())
     }
 
+    fn task_suggestion(&self, package: &str, task: &str) -> Option<String> {
+        if package == WORKSPACE_PACKAGE_NAME {
+            closest_name(task, self.workspace_tasks.keys())
+        } else {
+            self.packages
+                .get(package)
+                .and_then(|package| closest_name(task, package.tasks.keys()))
+        }
+    }
+
     fn selected_packages(
         &self,
         selected_package: Option<&str>,
@@ -532,6 +556,7 @@ impl Workspace {
         if let Some(selected) = selected_package {
             if !self.packages.contains_key(selected) {
                 return Err(WorkspaceError::UnknownPackage {
+                    suggestion: closest_name(selected, self.packages.keys()),
                     name: selected.to_owned(),
                 });
             }
@@ -592,6 +617,7 @@ impl Workspace {
                 self.packages
                     .get(&node.package)
                     .ok_or_else(|| WorkspaceError::UnknownPackage {
+                        suggestion: closest_name(&node.package, self.packages.keys()),
                         name: node.package.clone(),
                     })?;
             (
@@ -601,6 +627,7 @@ impl Workspace {
             )
         };
         let task = task.ok_or_else(|| WorkspaceError::MissingTask {
+            suggestion: self.task_suggestion(&node.package, &node.task),
             package: node.package.clone(),
             task: node.task.clone(),
         })?;
@@ -664,6 +691,7 @@ impl Workspace {
         if node.package == WORKSPACE_PACKAGE_NAME {
             return self.workspace_tasks.get(&node.task).ok_or_else(|| {
                 WorkspaceError::MissingTask {
+                    suggestion: self.task_suggestion(&node.package, &node.task),
                     package: node.package.clone(),
                     task: node.task.clone(),
                 }
@@ -674,12 +702,14 @@ impl Workspace {
             self.packages
                 .get(&node.package)
                 .ok_or_else(|| WorkspaceError::UnknownPackage {
+                    suggestion: closest_name(&node.package, self.packages.keys()),
                     name: node.package.clone(),
                 })?;
         package
             .tasks
             .get(&node.task)
             .ok_or_else(|| WorkspaceError::MissingTask {
+                suggestion: self.task_suggestion(&node.package, &node.task),
                 package: node.package.clone(),
                 task: node.task.clone(),
             })
@@ -916,6 +946,35 @@ fn split_task_ref(reference: &str) -> Option<(&str, &str)> {
     reference.split_once(':')
 }
 
+fn closest_name<'a>(
+    name: &str,
+    candidates: impl IntoIterator<Item = &'a String>,
+) -> Option<String> {
+    let max_distance = if name.len() <= 4 { 1 } else { 2 };
+    candidates
+        .into_iter()
+        .filter(|candidate| candidate.as_str() != name)
+        .map(|candidate| (edit_distance(name, candidate), candidate))
+        .filter(|(distance, _)| *distance <= max_distance)
+        .min_by_key(|(distance, candidate)| (*distance, (*candidate).clone()))
+        .map(|(_, candidate)| candidate.clone())
+}
+
+fn edit_distance(left: &str, right: &str) -> usize {
+    let mut previous = (0..=right.len()).collect::<Vec<_>>();
+    for (left_index, left_byte) in left.bytes().enumerate() {
+        let mut current = vec![left_index + 1];
+        for (right_index, right_byte) in right.bytes().enumerate() {
+            let substitution = previous[right_index] + usize::from(left_byte != right_byte);
+            let insertion = current[right_index] + 1;
+            let deletion = previous[right_index + 1] + 1;
+            current.push(substitution.min(insertion).min(deletion));
+        }
+        previous = current;
+    }
+    previous[right.len()]
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum VisitState {
     Visiting,
@@ -954,9 +1013,11 @@ pub enum WorkspaceError {
     },
     UnknownPackage {
         name: String,
+        suggestion: Option<String>,
     },
     UnknownPipeline {
         name: String,
+        suggestion: Option<String>,
     },
     InvalidTaskName {
         package: String,
@@ -970,6 +1031,7 @@ pub enum WorkspaceError {
     MissingTask {
         package: String,
         task: String,
+        suggestion: Option<String>,
     },
     InvalidTaskReference {
         reference: String,
@@ -1007,8 +1069,20 @@ impl fmt::Display for WorkspaceError {
                 write!(f, "invalid workspace member pattern '{pattern}'")
             }
             Self::DuplicatePackage { name } => write!(f, "duplicate package name '{name}'"),
-            Self::UnknownPackage { name } => write!(f, "unknown package '{name}'"),
-            Self::UnknownPipeline { name } => write!(f, "unknown pipeline '{name}'"),
+            Self::UnknownPackage { name, suggestion } => {
+                write!(f, "unknown package '{name}'")?;
+                if let Some(suggestion) = suggestion {
+                    write!(f, ". Did you mean '{suggestion}'?")?;
+                }
+                Ok(())
+            }
+            Self::UnknownPipeline { name, suggestion } => {
+                write!(f, "unknown pipeline '{name}'")?;
+                if let Some(suggestion) = suggestion {
+                    write!(f, ". Did you mean '{suggestion}'?")?;
+                }
+                Ok(())
+            }
             Self::InvalidTaskName { package, task } => {
                 write!(f, "invalid task name '{package}:{task}'")
             }
@@ -1017,8 +1091,16 @@ impl fmt::Display for WorkspaceError {
                 task,
                 message,
             } => write!(f, "invalid task '{package}:{task}': {message}"),
-            Self::MissingTask { package, task } => {
-                write!(f, "package '{package}' has no task '{task}'")
+            Self::MissingTask {
+                package,
+                task,
+                suggestion,
+            } => {
+                write!(f, "package '{package}' has no task '{task}'")?;
+                if let Some(suggestion) = suggestion {
+                    write!(f, ". Did you mean '{suggestion}'?")?;
+                }
+                Ok(())
             }
             Self::InvalidTaskReference { reference, from } => write!(
                 f,
