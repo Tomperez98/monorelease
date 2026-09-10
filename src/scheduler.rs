@@ -19,9 +19,9 @@ pub(crate) fn execute_plan(
     runner: &Runner,
     output: &OutputSink,
     cache_mode: CacheMode,
-) -> Result<(), SchedulerError> {
+) -> Result<ExecutionSummary, SchedulerError> {
     if plan.is_empty() {
-        return Ok(());
+        return Ok(ExecutionSummary::default());
     }
 
     let tasks = plan
@@ -59,6 +59,7 @@ pub(crate) fn execute_plan(
     let mut task_keys = BTreeMap::<TaskNode, String>::new();
     let mut cacheable = BTreeMap::<TaskNode, bool>::new();
     let mut cache_error = None;
+    let mut output_error = None;
     let mut stopping = false;
     let root = workspace.root.clone();
     let cache = CacheStore::new(&root);
@@ -82,6 +83,11 @@ pub(crate) fn execute_plan(
                 .get(&node)
                 .expect("ready task must exist in the validated plan")
                 .clone();
+            if let Err(error) = output.present_start(&node) {
+                output_error = Some(error);
+                stopping = true;
+                break;
+            }
             let dependencies_cacheable = task
                 .depends_on()
                 .iter()
@@ -162,7 +168,7 @@ pub(crate) fn execute_plan(
         }
 
         if active.is_empty() {
-            if cache_error.is_some() {
+            if cache_error.is_some() || output_error.is_some() {
                 break;
             }
             return Err(SchedulerError::NoReadyWork);
@@ -219,16 +225,28 @@ pub(crate) fn execute_plan(
     }
 
     let mut first_error = None;
+    let mut summary = ExecutionSummary {
+        blocked: plan.len().saturating_sub(results.len()),
+        ..ExecutionSummary::default()
+    };
     for task in plan {
         let node = task.node();
         let Some(result) = results.remove(&node) else {
             continue;
         };
         match result {
-            Ok(result) => output
-                .present_success(&node, &result)
-                .map_err(SchedulerError::Output)?,
+            Ok(result) => {
+                if result.cached {
+                    summary.cached += 1;
+                } else {
+                    summary.completed += 1;
+                }
+                output
+                    .present_success(&node, &result)
+                    .map_err(SchedulerError::Output)?;
+            }
             Err(error) => {
+                summary.failed += 1;
                 output
                     .present_failure(&node, &error)
                     .map_err(SchedulerError::Output)?;
@@ -237,10 +255,33 @@ pub(crate) fn execute_plan(
         }
     }
 
+    if let Some(error) = output_error {
+        output
+            .present_summary(&summary)
+            .map_err(SchedulerError::Output)?;
+        return Err(SchedulerError::Output(error));
+    }
     if let Some(error) = cache_error {
+        output
+            .present_summary(&summary)
+            .map_err(SchedulerError::Output)?;
         return Err(SchedulerError::Cache(error));
     }
-    first_error.map_or(Ok(()), |error| Err(SchedulerError::Task(Box::new(error))))
+    if let Some(error) = first_error {
+        output
+            .present_summary(&summary)
+            .map_err(SchedulerError::Output)?;
+        return Err(SchedulerError::Task(Box::new(error)));
+    }
+    Ok(summary)
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ExecutionSummary {
+    pub(crate) completed: usize,
+    pub(crate) cached: usize,
+    pub(crate) failed: usize,
+    pub(crate) blocked: usize,
 }
 
 #[derive(Debug)]

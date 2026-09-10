@@ -15,6 +15,7 @@ use crate::runner::{CapturedOutput, TaskResult};
 use crate::workspace::PlannedTask;
 
 const CACHE_FORMAT_VERSION: u32 = 1;
+const CACHE_GITIGNORE: &str = "*\n!.gitignore\n";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CacheMode {
@@ -55,6 +56,7 @@ impl CacheStore {
         task: &PlannedTask,
         dependency_keys: &[String],
     ) -> Result<String, CacheError> {
+        self.ensure_gitignore()?;
         let mut hasher = Sha256::new();
         hash_string(&mut hasher, "monorelease-cache");
         hash_string(&mut hasher, &CACHE_FORMAT_VERSION.to_string());
@@ -211,6 +213,7 @@ impl CacheStore {
         key: &str,
         result: &TaskResult,
     ) -> Result<(), CacheError> {
+        self.ensure_gitignore()?;
         static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
         fs::create_dir_all(&self.root)
@@ -288,6 +291,27 @@ impl CacheStore {
 
     fn entry_path(&self, key: &str) -> PathBuf {
         self.root.join(key)
+    }
+
+    fn ensure_gitignore(&self) -> Result<(), CacheError> {
+        let directory = self
+            .root
+            .parent()
+            .expect("cache root has a .monorelease parent");
+        fs::create_dir_all(directory)
+            .map_err(|source| CacheError::io(directory.to_path_buf(), source))?;
+
+        let path = directory.join(".gitignore");
+        match fs::read(&path) {
+            Ok(contents) if contents == CACHE_GITIGNORE.as_bytes() => Ok(()),
+            Ok(_) => {
+                fs::write(&path, CACHE_GITIGNORE).map_err(|source| CacheError::io(path, source))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                fs::write(&path, CACHE_GITIGNORE).map_err(|source| CacheError::io(path, source))
+            }
+            Err(source) => Err(CacheError::io(path, source)),
+        }
     }
 }
 
@@ -613,6 +637,27 @@ mod tests {
         assert_eq!(
             fs::read_to_string(task.package_path().join("output.txt")).expect("read output"),
             "input"
+        );
+    }
+
+    #[test]
+    fn creates_a_gitignore_for_cache_storage() {
+        let temp = TempDir::new();
+        let workspace = workspace_with_task(&temp);
+        let task = workspace
+            .plan(None, None, &[])
+            .expect("plan succeeds")
+            .remove(0);
+        let store = CacheStore::new(&workspace.root);
+
+        store
+            .task_key(&workspace.root, &task, &[])
+            .expect("key succeeds");
+
+        assert_eq!(
+            fs::read_to_string(workspace.root.join(".monorelease/.gitignore"))
+                .expect("gitignore is created"),
+            "*\n!.gitignore\n"
         );
     }
 

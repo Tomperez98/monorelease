@@ -1,0 +1,7 @@
+[workspace]
+name = "cache-demo"
+members = ["packages/*"]
+default_pipeline = "ci"
+
+[pipelines.ci]
+tasks = ["build", "verify"]

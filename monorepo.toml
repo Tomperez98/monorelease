@@ -1,13 +1,6 @@
 [workspace]
 name = "monorepo"
-members = [
-    "apps/*",
-    "packages/*",
-]
-default_pipeline = "ci"
 
-[pipelines.ci]
-tasks = [
-    "build",
-    "test",
-]
+[tasks.fmt]
+command = ["cargo", "fmt"]
+timeout_seconds = 30

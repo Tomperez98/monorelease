@@ -4,7 +4,7 @@
 
 `monorelease` does not know or care whether a package uses Rust, Node, Go, Make, Docker, a shell script, or a custom framework. Commands are the package's responsibility.
 
-A runnable workspace using only `echo` commands is available in [`examples/echo`](examples/echo/README.md).
+Runnable workspaces are available in [`examples/echo`](examples/echo/README.md), [`examples/cache`](examples/cache/README.md), and [`examples/release-gate`](examples/release-gate/README.md).
 
 ## Quick start
 
@@ -166,7 +166,18 @@ command = ["./scripts/build"]
 depends_on = ["shared:build"]
 ```
 
-Task commands are structured executable/argument arrays rather than shell strings. The runner passes arguments without shell interpolation, captures stdout/stderr, and presents task output after completion.
+Task commands are structured executable/argument arrays rather than shell strings. The runner passes arguments without shell interpolation and captures stdout/stderr. During execution, monorelease announces each task when it starts, presents captured task output in deterministic plan order, reports a semantic status and duration, and prints a final summary.
+
+A run uses one concise output model:
+
+```text
+▶ shared:build
+[shared] build
+shared:build: completed in 14ms
+summary: 6 completed, 0 cached, 0 failed, 0 blocked across 3 package(s)
+```
+
+Cached, failed, timed-out, and blocked tasks are identified explicitly. CI runs use grouped sections while preserving the same task statuses. `plan` and `--dry-run` show declared input/output patterns, but task environment values are always redacted.
 
 Optional task execution context:
 
@@ -179,7 +190,7 @@ timeout_seconds = 600
 resource_group = "documentation"
 ```
 
-`cwd` must be an existing relative directory inside the package. The resolved path is checked after symlink resolution, so a symlink cannot escape the package. Environment values are applied only to the child process. Command arrays are executed directly without a shell; shell syntax such as pipes or redirects is not interpreted. Tasks time out after ten minutes by default; set `timeout_seconds` to change the limit. Tasks sharing a `resource_group` never run concurrently. Output is captured without a configured size limit and presented after the task completes.
+`cwd` must be an existing relative directory inside the package. The resolved path is checked after symlink resolution, so a symlink cannot escape the package. Environment values are applied only to the child process and are redacted in plan output. Command arrays are executed directly without a shell; shell syntax such as pipes or redirects is not interpreted. Tasks time out after ten minutes by default; set `timeout_seconds` to change the limit. Tasks sharing a `resource_group` never run concurrently. Output is captured without a configured size limit and presented after the task completes.
 
 ### Local task caching
 
@@ -204,6 +215,6 @@ Output patterns must match regular files; symlink outputs and output patterns th
 
 `workspace.members` is evaluated relative to the root manifest. Literal directories, `*` path segments, and `**` recursive path segments are supported. A matching directory must contain a package `monorepo.toml`.
 
-The planner creates a DAG of `package:task` and `workspace:task` nodes. Workspace tasks run once from the root; package tasks run from their package directories. It validates missing packages, missing tasks, duplicate package names, invalid references, cycles, commands, environment values, working directories, timeouts, and resource groups before execution. Task working directories must exist and resolve inside their package, including after symlink resolution. Tasks execute dependency-first using a deterministic topological order. Independent tasks can run concurrently with `--jobs N`; newly unblocked tasks are scheduled immediately, up to the worker limit. Parallel task output is captured and presented in deterministic plan order so logs and CI sections do not interleave. A task failure or timeout prevents new dependent work from being scheduled.
+The planner creates a DAG of `package:task` and `workspace:task` nodes. Workspace tasks run once from the root; package tasks run from their package directories. It validates missing packages, missing tasks, duplicate package names, invalid references, cycles, commands, environment values, working directories, timeouts, and resource groups before execution. Task working directories must exist and resolve inside their package, including after symlink resolution. Tasks execute dependency-first using a deterministic topological order. Independent tasks can run concurrently with `--jobs N`; newly unblocked tasks are scheduled immediately, up to the worker limit. Task starts are reported immediately, while captured task output is presented in deterministic plan order so logs and CI sections do not interleave. A task failure or timeout prevents new dependent work from being scheduled, and the final summary reports completed, cached, failed, and blocked tasks.
 
 Selecting a package with `--package` selects that package's pipeline roots and automatically includes their transitive task dependencies. Unrelated packages are excluded. A pipeline root in the reserved `workspace:` namespace cannot be combined with `--package`; run the pipeline without package selection or select a package task explicitly.

@@ -9,7 +9,7 @@ use crate::cache::CacheMode;
 use crate::output::OutputSink;
 use crate::runner::Runner;
 use crate::runner::format_command;
-use crate::scheduler::{SchedulerError, execute_plan};
+use crate::scheduler::{ExecutionSummary, SchedulerError, execute_plan};
 use crate::workspace::{PlannedTask, TaskNode, Workspace, WorkspaceError};
 
 /// Run the workspace's default pipeline with one worker.
@@ -130,17 +130,14 @@ pub(crate) fn run_pipeline_with_options(
 
     let runner = Runner::new();
     let output = OutputSink::new();
-    execute_plan(&workspace, &plan, jobs, &runner, &output, cache_mode)?;
+    let summary = execute_plan(&workspace, &plan, jobs, &runner, &output, cache_mode)?;
 
     let package_count = plan
         .iter()
         .map(|task| task.package())
         .collect::<BTreeSet<_>>()
         .len();
-    Ok(format!(
-        "completed {} task(s) across {package_count} package(s)",
-        plan.len()
-    ))
+    Ok(format_summary(&summary, package_count))
 }
 
 /// Return the resolved execution plan without running commands.
@@ -221,11 +218,24 @@ fn format_plan(workspace: &Workspace, plan: &[PlannedTask]) -> String {
         if let Some(group) = task.resource_group() {
             output.push_str(&format!(" [resource_group={group}]"));
         }
-        for (key, value) in task.env() {
-            output.push_str(&format!(" [{key}={value}]"));
+        if !task.inputs().is_empty() {
+            output.push_str(&format!(" [inputs={}]", task.inputs().join(", ")));
+        }
+        if !task.outputs().is_empty() {
+            output.push_str(&format!(" [outputs={}]", task.outputs().join(", ")));
+        }
+        for key in task.env().keys() {
+            output.push_str(&format!(" [env {key}=<redacted>]"));
         }
     }
     output
+}
+
+fn format_summary(summary: &ExecutionSummary, package_count: usize) -> String {
+    format!(
+        "summary: {} completed, {} cached, {} failed, {} blocked across {package_count} package(s)",
+        summary.completed, summary.cached, summary.failed, summary.blocked
+    )
 }
 
 fn format_node(node: &TaskNode) -> String {

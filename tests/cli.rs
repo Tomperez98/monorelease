@@ -223,6 +223,31 @@ fn doctor_rejects_a_missing_task_working_directory() {
 
 #[cfg(unix)]
 #[test]
+fn ci_keeps_task_output_and_status_lines_separate() {
+    let temp = TempDir::new("ci-output-boundaries");
+    assert!(monore(&["init"], temp.path()).status.success());
+
+    let package = temp.path().join("packages").join("api");
+    fs::create_dir_all(&package).expect("create package directory");
+    fs::write(
+        package.join("monorepo.toml"),
+        "[package]\nname = \"api\"\n\n[tasks.build]\ncommand = [\"sh\", \"-c\", \"printf task-output; printf task-error >&2\"]\n\n[tasks.test]\ncommand = [\"echo\", \"test\"]\n",
+    )
+    .expect("write package manifest");
+
+    let output = monore(&["ci", "--task", "build"], temp.path());
+
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    assert!(
+        stdout(&output)
+            .contains("task-output\nsummary: 1 completed, 0 cached, 0 failed, 0 blocked")
+    );
+    assert!(stderr(&output).contains("▶ api:build"));
+    assert!(stderr(&output).contains("task-error\napi:build: completed in "));
+}
+
+#[cfg(unix)]
+#[test]
 fn ci_reports_failed_task_output_and_context() {
     let temp = TempDir::new("ci-failure");
     assert!(monore(&["init"], temp.path()).status.success());
@@ -240,7 +265,66 @@ fn ci_reports_failed_task_output_and_context() {
     assert_eq!(output.status.code(), Some(1));
     assert!(stderr(&output).contains("boom"));
     assert!(stderr(&output).contains("api/build"));
+    assert!(stderr(&output).contains("api:build: failed in "));
+    assert!(stderr(&output).contains("summary: 0 completed, 0 cached, 1 failed, 1 blocked"));
     assert!(!stderr(&output).contains("should-not-run"));
+}
+
+#[cfg(unix)]
+#[test]
+fn ci_reports_task_start_progress() {
+    let temp = TempDir::new("ci-progress");
+    fs::write(
+        temp.path().join("monorepo.toml"),
+        "[workspace]\nname = \"fixture\"\nmembers = [\"packages/*\"]\ndefault_pipeline = \"ci\"\n\n[pipelines.ci]\ntasks = [\"build\"]\n",
+    )
+    .expect("write root manifest");
+    for name in ["a", "b"] {
+        let package = temp.path().join("packages").join(name);
+        fs::create_dir_all(&package).expect("create package directory");
+        fs::write(
+            package.join("monorepo.toml"),
+            format!(
+                "[package]\nname = \"{name}\"\n\n[tasks.build]\ncommand = [\"sh\", \"-c\", \"sleep 0.05; echo {name}\"]\n"
+            ),
+        )
+        .expect("write package manifest");
+    }
+
+    let output = monore(&["ci", "--jobs", "2"], temp.path());
+
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    assert!(stderr(&output).contains("▶ a:build"));
+    assert!(stderr(&output).contains("▶ b:build"));
+    assert!(stderr(&output).contains("a:build: completed in "));
+    assert!(stderr(&output).contains("b:build: completed in "));
+}
+
+#[test]
+fn plan_redacts_task_environment_values() {
+    let temp = TempDir::new("plan-redacts-env");
+    fs::write(
+        temp.path().join("monorepo.toml"),
+        "[workspace]\nname = \"fixture\"\nmembers = [\"packages/*\"]\ndefault_pipeline = \"ci\"\n\n[pipelines.ci]\ntasks = [\"build\"]\n",
+    )
+    .expect("write root manifest");
+    let package = temp.path().join("packages").join("app");
+    fs::create_dir_all(&package).expect("create package directory");
+    fs::write(
+        package.join("monorepo.toml"),
+        "[package]\nname = \"app\"\n\n[tasks.build]\ncommand = [\"echo\", \"build\"]\nenv = { API_TOKEN = \"super-secret\", MODE = \"check\" }\ninputs = [\"input.txt\"]\noutputs = [\"dist/**\"]\n",
+    )
+    .expect("write package manifest");
+
+    let output = monore(&["plan"], temp.path());
+    let output = stdout(&output);
+
+    assert!(output.contains("[inputs=input.txt]"));
+    assert!(output.contains("[outputs=dist/**]"));
+    assert!(output.contains("[env API_TOKEN=<redacted>]"));
+    assert!(output.contains("[env MODE=<redacted>]"));
+    assert!(!output.contains("super-secret"));
+    assert!(!output.contains("check"));
 }
 
 #[test]
