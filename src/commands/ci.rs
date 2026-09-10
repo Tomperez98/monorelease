@@ -1,11 +1,14 @@
 //! Central, language-agnostic workspace orchestration commands.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::error::Error as StdError;
 use std::fmt;
 use std::path::Path;
 
-use crate::runner::{Runner, RunnerError, emit_output, format_command};
+use crate::output::OutputSink;
+use crate::runner::Runner;
+use crate::runner::format_command;
+use crate::scheduler::{SchedulerError, execute_plan};
 use crate::workspace::{PlannedTask, TaskNode, Workspace, WorkspaceError};
 
 /// Run the workspace's default pipeline with one worker.
@@ -67,11 +70,13 @@ pub fn run_pipeline_with_jobs(
         return Ok(format_plan(&workspace, &plan));
     }
 
-    execute_plan(&workspace, &plan, jobs)?;
+    let runner = Runner::new();
+    let output = OutputSink::new();
+    execute_plan(&workspace, &plan, jobs, &runner, &output)?;
 
     let package_count = plan
         .iter()
-        .map(|task| task.package.as_str())
+        .map(|task| task.package())
         .collect::<BTreeSet<_>>()
         .len();
     Ok(format!(
@@ -123,78 +128,6 @@ pub fn graph(
     Ok(output)
 }
 
-fn execute_plan(workspace: &Workspace, plan: &[PlannedTask], jobs: usize) -> Result<(), CiError> {
-    if jobs == 1 {
-        let runner = Runner::new();
-        for task in plan {
-            runner.run(&workspace.root, task)?;
-        }
-        return Ok(());
-    }
-
-    let mut remaining = plan
-        .iter()
-        .map(|task| (task.node(), task.clone()))
-        .collect::<BTreeMap<_, _>>();
-    let mut completed = BTreeSet::new();
-    let runner = Runner::new();
-
-    while !remaining.is_empty() {
-        let ready = remaining
-            .iter()
-            .filter(|(_, task)| {
-                task.depends_on
-                    .iter()
-                    .all(|dependency| completed.contains(dependency))
-            })
-            .take(jobs)
-            .map(|(node, task)| (node.clone(), task.clone()))
-            .collect::<Vec<_>>();
-
-        if ready.is_empty() {
-            return Err(CiError::Workspace(WorkspaceError::InvalidWorkspace {
-                message: "execution plan contains an unresolved dependency".to_owned(),
-            }));
-        }
-
-        let results = std::thread::scope(|scope| {
-            let runner = &runner;
-            let workspace_root = &workspace.root;
-            let handles = ready
-                .iter()
-                .map(|(node, task)| {
-                    let node = node.clone();
-                    let task = task.clone();
-                    scope.spawn(move || (node, runner.run_captured(workspace_root, &task)))
-                })
-                .collect::<Vec<_>>();
-            handles
-                .into_iter()
-                .map(|handle| handle.join().expect("task worker panicked"))
-                .collect::<Vec<_>>()
-        });
-
-        let mut first_error = None;
-        for (node, result) in results {
-            match result {
-                Ok(output) => {
-                    emit_output(&output);
-                    completed.insert(node.clone());
-                }
-                Err(error) => {
-                    first_error.get_or_insert(error);
-                }
-            }
-            remaining.remove(&node);
-        }
-        if let Some(error) = first_error {
-            return Err(CiError::Runner(error));
-        }
-    }
-
-    Ok(())
-}
-
 fn format_plan(workspace: &Workspace, plan: &[PlannedTask]) -> String {
     let mut output = format!(
         "workspace {} ({})",
@@ -205,12 +138,16 @@ fn format_plan(workspace: &Workspace, plan: &[PlannedTask]) -> String {
         output.push('\n');
         output.push_str(&format!(
             "would run {}:{} in {}: {}",
-            task.package,
-            task.task,
-            task.cwd.display(),
-            format_command(&task.command)
+            task.package(),
+            task.task(),
+            task.cwd().display(),
+            format_command(task.command())
         ));
-        for (key, value) in &task.env {
+        output.push_str(&format!(" [timeout={}s]", task.timeout().as_secs()));
+        if let Some(group) = task.resource_group() {
+            output.push_str(&format!(" [resource_group={group}]"));
+        }
+        for (key, value) in task.env() {
             output.push_str(&format!(" [{key}={value}]"));
         }
     }
@@ -226,7 +163,7 @@ fn format_node(node: &TaskNode) -> String {
 pub enum CiError {
     InvalidJobs,
     Workspace(WorkspaceError),
-    Runner(RunnerError),
+    Scheduler(Box<SchedulerError>),
 }
 
 impl fmt::Display for CiError {
@@ -234,7 +171,7 @@ impl fmt::Display for CiError {
         match self {
             Self::InvalidJobs => write!(f, "--jobs must be greater than zero"),
             Self::Workspace(error) => error.fmt(f),
-            Self::Runner(error) => error.fmt(f),
+            Self::Scheduler(error) => error.fmt(f),
         }
     }
 }
@@ -243,7 +180,7 @@ impl StdError for CiError {
     fn source(&self) -> Option<&(dyn StdError + 'static)> {
         match self {
             Self::Workspace(error) => Some(error),
-            Self::Runner(error) => Some(error),
+            Self::Scheduler(error) => Some(error),
             Self::InvalidJobs => None,
         }
     }
@@ -255,9 +192,9 @@ impl From<WorkspaceError> for CiError {
     }
 }
 
-impl From<RunnerError> for CiError {
-    fn from(error: RunnerError) -> Self {
-        Self::Runner(error)
+impl From<SchedulerError> for CiError {
+    fn from(error: SchedulerError) -> Self {
+        Self::Scheduler(Box::new(error))
     }
 }
 
@@ -292,6 +229,35 @@ mod tests {
 
         assert!(output.find("base:build").unwrap() < output.find("app:build").unwrap());
         assert!(output.contains("would run app:build"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resource_groups_prevent_overlapping_tasks() {
+        let temp = TempDir::new();
+        fs::write(
+            config_path(temp.path()),
+            "[workspace]\nname = \"fixture\"\nmembers = [\"packages/*\"]\n\n[pipelines.ci]\ntasks = [\"build\"]\n",
+        )
+        .expect("write root manifest");
+        let lock = temp.path().join("resource.lock");
+        let lock = lock.to_string_lossy();
+        for (name, command) in [
+            ("a", format!("touch '{lock}'; sleep 0.2; rm '{lock}'")),
+            ("b", format!("sleep 0.05; test ! -e '{lock}'")),
+        ] {
+            let package = temp.path().join("packages").join(name);
+            fs::create_dir_all(&package).expect("create package");
+            fs::write(
+                config_path(&package),
+                format!(
+                    "[package]\nname = \"{name}\"\n\n[tasks.build]\ncommand = [\"sh\", \"-c\", \"{command}\"]\nresource_group = \"integration\"\n"
+                ),
+            )
+            .expect("write package manifest");
+        }
+
+        ci_with_jobs(temp.path(), None, &[], false, 2).expect("resource group serializes tasks");
     }
 
     #[test]

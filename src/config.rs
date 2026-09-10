@@ -81,6 +81,12 @@ pub struct TaskConfig {
     pub cwd: Option<String>,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+    /// Maximum runtime for one invocation, in seconds.
+    #[serde(default = "default_timeout_seconds")]
+    pub timeout_seconds: u64,
+    /// Tasks sharing a resource group never run concurrently.
+    #[serde(default)]
+    pub resource_group: Option<String>,
 }
 
 /// A named workspace pipeline made of task names.
@@ -102,6 +108,10 @@ fn default_pipeline() -> String {
     "ci".to_owned()
 }
 
+fn default_timeout_seconds() -> u64 {
+    600
+}
+
 /// Path of the config file inside `dir`.
 pub fn config_path(dir: &Path) -> PathBuf {
     dir.join(CONFIG_FILE_NAME)
@@ -110,6 +120,15 @@ pub fn config_path(dir: &Path) -> PathBuf {
 /// Render a config as TOML.
 pub fn render_config(config: &MonorepoConfig) -> String {
     toml::to_string_pretty(config).expect("MonorepoConfig must serialize to TOML")
+}
+
+/// Return a manifest validation message when a value cannot be passed to a
+/// child process safely.
+pub(crate) fn validate_process_value(value: &str, field: &str) -> Result<(), String> {
+    if value.contains('\0') {
+        return Err(format!("{field} must not contain a NUL byte"));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -146,6 +165,8 @@ mod tests {
                 depends_on: Vec::new(),
                 cwd: None,
                 env: BTreeMap::new(),
+                timeout_seconds: 600,
+                resource_group: None,
             }
         );
     }

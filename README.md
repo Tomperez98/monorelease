@@ -4,6 +4,8 @@
 
 `monorelease` does not know or care whether a package uses Rust, Node, Go, Make, Docker, a shell script, or a custom framework. Commands are the package's responsibility.
 
+A runnable workspace using only `echo` commands is available in [`examples/echo`](examples/echo/README.md).
+
 ## Quick start
 
 Create a root workspace:
@@ -58,7 +60,7 @@ depends_on = ["build", "shared:test"]
 
 No Rust source changes or central package registry are required when adding another package under a configured member pattern.
 
-The manifest schema is intentionally fixed and has no `version` header. Unknown fields are rejected so typos fail during `doctor` or `ci`. If the schema changes in the future, the tool will provide an explicit migration rather than accepting multiple implicit formats.
+The manifest schema is intentionally fixed and has no `version` header. Unknown fields are rejected so typos fail during `doctor` or `ci`. `doctor` validates all discovered manifests, task references, command inputs, and task working directories before execution. If the schema changes in the future, the tool will provide an explicit migration rather than accepting multiple implicit formats.
 
 ## Commands
 
@@ -148,7 +150,7 @@ command = ["./scripts/build"]
 depends_on = ["shared:build"]
 ```
 
-Task commands are structured executable/argument arrays rather than shell strings. The runner passes arguments without shell interpolation and inherits the command's standard IO.
+Task commands are structured executable/argument arrays rather than shell strings. The runner passes arguments without shell interpolation, captures stdout/stderr, and presents task output after completion.
 
 Optional task execution context:
 
@@ -157,14 +159,16 @@ Optional task execution context:
 command = ["make", "docs"]
 cwd = "site"
 env = { MODE = "check" }
+timeout_seconds = 600
+resource_group = "documentation"
 ```
 
-`cwd` is relative to the package directory and cannot escape it. Environment values are applied only to the child process.
+`cwd` must be an existing relative directory inside the package. The resolved path is checked after symlink resolution, so a symlink cannot escape the package. Environment values are applied only to the child process. Command arrays are executed directly without a shell; shell syntax such as pipes or redirects is not interpreted. Tasks time out after ten minutes by default; set `timeout_seconds` to change the limit. Tasks sharing a `resource_group` never run concurrently. Output is captured without a configured size limit and presented after the task completes.
 
 ## Discovery and ordering
 
 `workspace.members` is evaluated relative to the root manifest. Literal directories, `*` path segments, and `**` recursive path segments are supported. A matching directory must contain a package `monorepo.toml`.
 
-The planner creates a DAG of `package:task` nodes. It validates missing packages, missing tasks, duplicate package names, invalid references, cycles, and commands before execution. Tasks execute dependency-first using a deterministic topological order. Independent tasks can run concurrently with `--jobs N`; task output is emitted in scheduler order after each command completes.
+The planner creates a DAG of `package:task` nodes. It validates missing packages, missing tasks, duplicate package names, invalid references, cycles, commands, environment values, working directories, timeouts, and resource groups before execution. Task working directories must exist and resolve inside their package, including after symlink resolution. Tasks execute dependency-first using a deterministic topological order. Independent tasks can run concurrently with `--jobs N`; newly unblocked tasks are scheduled immediately, up to the worker limit. Parallel task output is captured and presented in deterministic plan order so logs and CI sections do not interleave. A task failure or timeout prevents new dependent work from being scheduled.
 
 Selecting a package with `--package` selects that package's pipeline roots and automatically includes their transitive task dependencies. Unrelated packages are excluded.

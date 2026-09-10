@@ -1,0 +1,17 @@
+[package]
+name = "shared"
+
+[tasks.build]
+command = ["echo", "[shared] build"]
+timeout_seconds = 30
+
+[tasks.test]
+command = ["echo", "[shared] test"]
+depends_on = ["build"]
+resource_group = "checks"
+timeout_seconds = 30
+
+[tasks.package]
+command = ["echo", "[shared] package"]
+depends_on = ["test"]
+timeout_seconds = 30

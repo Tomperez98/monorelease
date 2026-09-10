@@ -1,12 +1,16 @@
-//! Discovery, validation, and task-graph planning for a manifest-driven monorepo.
+//! Manifest validation and task-graph planning for a manifest-driven monorepo.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error as StdError;
 use std::fmt;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
+use std::time::Duration;
 
-use crate::config::{MonorepoConfig, PackageConfig, PipelineConfig, TaskConfig, config_path};
+use crate::config::{
+    PackageConfig, PipelineConfig, TaskConfig, config_path, validate_process_value,
+};
+use crate::discovery::{expand_member_pattern, find_root, read_manifest};
 
 /// A validated package in a workspace.
 #[derive(Debug, Clone)]
@@ -17,7 +21,7 @@ pub struct Package {
 }
 
 /// A task node uniquely identifies one package task.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TaskNode {
     pub package: String,
     pub task: String,
@@ -36,13 +40,15 @@ pub struct Workspace {
 /// One executable task in a deterministic task-DAG plan.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlannedTask {
-    pub package: String,
-    pub package_path: PathBuf,
-    pub task: String,
-    pub command: Vec<String>,
-    pub cwd: PathBuf,
-    pub env: BTreeMap<String, String>,
-    pub depends_on: Vec<TaskNode>,
+    package: String,
+    package_path: PathBuf,
+    task: String,
+    command: Vec<String>,
+    cwd: PathBuf,
+    env: BTreeMap<String, String>,
+    timeout: Duration,
+    resource_group: Option<String>,
+    depends_on: Vec<TaskNode>,
 }
 
 impl PlannedTask {
@@ -51,6 +57,42 @@ impl PlannedTask {
             package: self.package.clone(),
             task: self.task.clone(),
         }
+    }
+
+    pub fn package(&self) -> &str {
+        &self.package
+    }
+
+    pub fn package_path(&self) -> &Path {
+        &self.package_path
+    }
+
+    pub fn task(&self) -> &str {
+        &self.task
+    }
+
+    pub fn command(&self) -> &[String] {
+        &self.command
+    }
+
+    pub fn cwd(&self) -> &Path {
+        &self.cwd
+    }
+
+    pub fn env(&self) -> &BTreeMap<String, String> {
+        &self.env
+    }
+
+    pub fn timeout(&self) -> Duration {
+        self.timeout
+    }
+
+    pub fn resource_group(&self) -> Option<&str> {
+        self.resource_group.as_deref()
+    }
+
+    pub fn depends_on(&self) -> &[TaskNode] {
+        &self.depends_on
     }
 }
 
@@ -65,6 +107,35 @@ impl Workspace {
                     path: config_path(&root),
                     message: "root manifest is missing [workspace]".to_owned(),
                 })?;
+
+        validate_identifier(
+            &config_path(&root),
+            "workspace name",
+            &workspace_config.name,
+        )?;
+        validate_identifier(
+            &config_path(&root),
+            "default pipeline",
+            &workspace_config.default_pipeline,
+        )?;
+        for pipeline_name in root_config.pipelines.keys() {
+            validate_identifier(&config_path(&root), "pipeline name", pipeline_name)?;
+        }
+        for (pipeline_name, pipeline) in &root_config.pipelines {
+            if pipeline.tasks.is_empty() {
+                return Err(WorkspaceError::InvalidWorkspace {
+                    message: format!("pipeline '{pipeline_name}' has no tasks"),
+                });
+            }
+            for task_name in &pipeline.tasks {
+                validate_task_reference(task_name).map_err(|message| {
+                    WorkspaceError::InvalidManifest {
+                        path: config_path(&root),
+                        message: format!("pipeline '{pipeline_name}': {message}"),
+                    }
+                })?;
+            }
+        }
 
         if root_config.package.is_some() || !root_config.tasks.is_empty() {
             return Err(WorkspaceError::InvalidManifest {
@@ -130,7 +201,12 @@ impl Workspace {
                     });
                 }
 
-                validate_package_config(&manifest_path, &package_config, &config.tasks)?;
+                validate_package_config(
+                    &manifest_path,
+                    &package_path,
+                    &package_config,
+                    &config.tasks,
+                )?;
                 let package = Package::from_config(package_path, package_config, config.tasks);
                 let package_name = package.name.clone();
                 if packages.insert(package_name.clone(), package).is_some() {
@@ -188,8 +264,13 @@ impl Workspace {
         let mut roots = BTreeSet::new();
         for task_name in task_names {
             if let Some((package, task)) = split_task_ref(task_name) {
-                if !package_names.contains(package) && selected_package.is_some() {
-                    continue;
+                if let Some(selected) = selected_package
+                    && package != selected
+                {
+                    return Err(WorkspaceError::TaskOutsideSelectedPackage {
+                        package: package.to_owned(),
+                        selected: selected.to_owned(),
+                    });
                 }
                 roots.insert(TaskNode {
                     package: package.to_owned(),
@@ -211,8 +292,9 @@ impl Workspace {
 
         let mut state = BTreeMap::new();
         let mut ordered_nodes = Vec::new();
+        let mut stack = Vec::new();
         for root in roots {
-            self.visit_task(&root, &mut state, &mut ordered_nodes)?;
+            self.visit_task(&root, &mut state, &mut stack, &mut ordered_nodes)?;
         }
 
         ordered_nodes
@@ -268,26 +350,37 @@ impl Workspace {
         &self,
         node: &TaskNode,
         state: &mut BTreeMap<TaskNode, VisitState>,
+        stack: &mut Vec<TaskNode>,
         order: &mut Vec<TaskNode>,
     ) -> Result<(), WorkspaceError> {
         match state.get(node) {
             Some(VisitState::Visited) => return Ok(()),
             Some(VisitState::Visiting) => {
-                return Err(WorkspaceError::TaskCycle { node: node.clone() });
+                let start = stack
+                    .iter()
+                    .position(|current| current == node)
+                    .unwrap_or(0);
+                let mut path = stack[start..].to_vec();
+                path.push(node.clone());
+                return Err(WorkspaceError::TaskCycle { path });
             }
             None => {}
         }
 
         let task = self.task_config(node)?;
         state.insert(node.clone(), VisitState::Visiting);
+        stack.push(node.clone());
         let dependencies = task
             .depends_on
             .iter()
             .map(|dependency| self.resolve_task_ref(node, dependency))
             .collect::<Result<Vec<_>, _>>()?;
         for dependency in &dependencies {
-            self.visit_task(dependency, state, order)?;
+            self.visit_task(dependency, state, stack, order)?;
         }
+        stack
+            .pop()
+            .expect("visiting task is present on the DFS stack");
         state.insert(node.clone(), VisitState::Visited);
         order.push(node.clone());
         Ok(())
@@ -308,11 +401,18 @@ impl Workspace {
                 task: node.task.clone(),
             })?;
         let cwd = task.cwd.as_deref().unwrap_or(".");
-        let cwd_path = if cwd == "." {
-            package.path.clone()
-        } else {
-            package.path.join(cwd)
-        };
+        let cwd_path =
+            fs::canonicalize(package.path.join(cwd)).map_err(|source| WorkspaceError::Io {
+                path: package.path.join(cwd),
+                source,
+            })?;
+        if !cwd_path.starts_with(&package.path) || !cwd_path.is_dir() {
+            return Err(WorkspaceError::InvalidTask {
+                package: package.name.clone(),
+                task: node.task.clone(),
+                message: "cwd must resolve to a directory inside the package".to_owned(),
+            });
+        }
         let depends_on = task
             .depends_on
             .iter()
@@ -326,6 +426,8 @@ impl Workspace {
             command: task.command.clone(),
             cwd: cwd_path,
             env: task.env.clone(),
+            timeout: Duration::from_secs(task.timeout_seconds),
+            resource_group: task.resource_group.clone(),
             depends_on,
         })
     }
@@ -351,7 +453,7 @@ impl Workspace {
         current: &TaskNode,
         reference: &str,
     ) -> Result<TaskNode, WorkspaceError> {
-        if reference.is_empty() {
+        if validate_task_reference(reference).is_err() {
             return Err(WorkspaceError::InvalidTaskReference {
                 reference: reference.to_owned(),
                 from: current.clone(),
@@ -394,17 +496,18 @@ impl Package {
 
 fn validate_package_config(
     manifest_path: &Path,
+    package_path: &Path,
     config: &PackageConfig,
     tasks: &BTreeMap<String, TaskConfig>,
 ) -> Result<(), WorkspaceError> {
-    if config.name.is_empty() || config.name.contains(':') {
-        return Err(WorkspaceError::InvalidManifest {
-            path: manifest_path.to_path_buf(),
-            message: "package name must be non-empty and cannot contain ':'".to_owned(),
-        });
-    }
+    validate_identifier(manifest_path, "package name", &config.name)?;
 
     for (task_name, task) in tasks {
+        validate_identifier(
+            manifest_path,
+            &format!("task name in package '{}'", config.name),
+            task_name,
+        )?;
         if task_name.is_empty() || task_name.contains(':') {
             return Err(WorkspaceError::InvalidTaskName {
                 package: config.name.clone(),
@@ -418,27 +521,102 @@ fn validate_package_config(
                 message: "command must contain an executable".to_owned(),
             });
         }
-        if task
-            .cwd
-            .as_deref()
-            .is_some_and(|cwd| !valid_relative_path(cwd))
-        {
+        for (index, argument) in task.command.iter().enumerate() {
+            validate_process_value(argument, &format!("command argument {index}")).map_err(
+                |message| WorkspaceError::InvalidTask {
+                    package: config.name.clone(),
+                    task: task_name.clone(),
+                    message,
+                },
+            )?;
+        }
+        for (key, value) in &task.env {
+            validate_process_value(key, "environment key")
+                .and_then(|_| validate_process_value(value, "environment value"))
+                .map_err(|message| WorkspaceError::InvalidTask {
+                    package: config.name.clone(),
+                    task: task_name.clone(),
+                    message,
+                })?;
+        }
+        if task.timeout_seconds == 0 {
             return Err(WorkspaceError::InvalidTask {
                 package: config.name.clone(),
                 task: task_name.clone(),
-                message: "cwd must be a relative path without '..'".to_owned(),
+                message: "timeout_seconds must be greater than zero".to_owned(),
             });
+        }
+        if let Some(resource_group) = task.resource_group.as_deref() {
+            if resource_group.is_empty() || resource_group.contains(':') {
+                return Err(WorkspaceError::InvalidTask {
+                    package: config.name.clone(),
+                    task: task_name.clone(),
+                    message: "resource_group must be non-empty and cannot contain ':'".to_owned(),
+                });
+            }
+            validate_process_value(resource_group, "resource_group").map_err(|message| {
+                WorkspaceError::InvalidTask {
+                    package: config.name.clone(),
+                    task: task_name.clone(),
+                    message,
+                }
+            })?;
+        }
+        if let Some(cwd) = task.cwd.as_deref() {
+            if !valid_relative_path(cwd) {
+                return Err(WorkspaceError::InvalidTask {
+                    package: config.name.clone(),
+                    task: task_name.clone(),
+                    message: "cwd must be an existing relative directory without '..'".to_owned(),
+                });
+            }
+            let cwd_path = package_path.join(cwd);
+            let canonical_cwd =
+                fs::canonicalize(&cwd_path).map_err(|source| WorkspaceError::Io {
+                    path: cwd_path.clone(),
+                    source,
+                })?;
+            if !canonical_cwd.starts_with(package_path) || !canonical_cwd.is_dir() {
+                return Err(WorkspaceError::InvalidTask {
+                    package: config.name.clone(),
+                    task: task_name.clone(),
+                    message: "cwd must resolve to a directory inside the package".to_owned(),
+                });
+            }
         }
     }
     Ok(())
 }
 
+fn validate_identifier(path: &Path, label: &str, value: &str) -> Result<(), WorkspaceError> {
+    if value.is_empty() || value.contains(':') || value.contains('\0') {
+        return Err(WorkspaceError::InvalidManifest {
+            path: path.to_path_buf(),
+            message: format!("{label} must be non-empty and cannot contain ':' or NUL"),
+        });
+    }
+    Ok(())
+}
+
+fn validate_task_reference(reference: &str) -> Result<(), String> {
+    if reference.is_empty() || reference.contains('\0') {
+        return Err("task reference must be non-empty and cannot contain NUL".to_owned());
+    }
+    match split_task_ref(reference) {
+        Some((package, task)) if !package.is_empty() && !task.is_empty() && !task.contains(':') => {
+            Ok(())
+        }
+        Some(_) => Err(format!("invalid task reference '{reference}'")),
+        None => Ok(()),
+    }
+}
+
 fn valid_relative_path(path: &str) -> bool {
     let path = Path::new(path);
-    !path.is_absolute()
+    !path.as_os_str().is_empty()
         && path
             .components()
-            .all(|component| !matches!(component, Component::ParentDir | Component::RootDir))
+            .all(|component| matches!(component, Component::Normal(_) | Component::CurDir))
 }
 
 fn split_task_ref(reference: &str) -> Option<(&str, &str)> {
@@ -449,166 +627,6 @@ fn split_task_ref(reference: &str) -> Option<(&str, &str)> {
 enum VisitState {
     Visiting,
     Visited,
-}
-
-fn find_root(start: &Path) -> Result<(PathBuf, MonorepoConfig), WorkspaceError> {
-    let start = fs::canonicalize(start).map_err(|source| WorkspaceError::Io {
-        path: start.to_path_buf(),
-        source,
-    })?;
-    let start_for_error = start.clone();
-    let mut current = if start.is_dir() {
-        start
-    } else {
-        start.parent().unwrap_or(Path::new("/")).to_path_buf()
-    };
-
-    loop {
-        let manifest_path = config_path(&current);
-        if manifest_path.is_file() {
-            let config = read_manifest(&manifest_path)?;
-            if config.workspace.is_some() {
-                return Ok((current, config));
-            }
-        }
-
-        if !current.pop() {
-            break;
-        }
-    }
-
-    Err(WorkspaceError::MissingRoot {
-        start: start_for_error,
-    })
-}
-
-fn read_manifest(path: &Path) -> Result<MonorepoConfig, WorkspaceError> {
-    let contents = fs::read_to_string(path).map_err(|source| WorkspaceError::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    MonorepoConfig::parse(&contents).map_err(|source| WorkspaceError::Parse {
-        path: path.to_path_buf(),
-        source,
-    })
-}
-
-fn expand_member_pattern(root: &Path, pattern: &str) -> Result<Vec<PathBuf>, WorkspaceError> {
-    if pattern.is_empty() || pattern.starts_with('/') {
-        return Err(WorkspaceError::InvalidMemberPattern {
-            pattern: pattern.to_owned(),
-        });
-    }
-
-    let segments: Vec<&str> = pattern
-        .split('/')
-        .filter(|segment| !segment.is_empty())
-        .collect();
-    if segments.is_empty() || segments.contains(&"..") {
-        return Err(WorkspaceError::InvalidMemberPattern {
-            pattern: pattern.to_owned(),
-        });
-    }
-
-    let mut matches = Vec::new();
-    expand_segments(root, &segments, 0, &mut matches)?;
-    matches.sort();
-    matches.dedup();
-    Ok(matches)
-}
-
-fn expand_segments(
-    current: &Path,
-    segments: &[&str],
-    index: usize,
-    matches: &mut Vec<PathBuf>,
-) -> Result<(), WorkspaceError> {
-    if index == segments.len() {
-        if current.is_dir() {
-            matches.push(current.to_path_buf());
-        }
-        return Ok(());
-    }
-
-    let segment = segments[index];
-    if segment == "**" {
-        expand_segments(current, segments, index + 1, matches)?;
-        for entry in read_directories(current)? {
-            expand_segments(&entry, segments, index, matches)?;
-        }
-        return Ok(());
-    }
-
-    if segment.contains('*') {
-        for entry in read_directories(current)? {
-            let name = entry
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("");
-            if wildcard_matches(segment, name) {
-                expand_segments(&entry, segments, index + 1, matches)?;
-            }
-        }
-    } else {
-        let next = current.join(segment);
-        if next.is_dir() {
-            expand_segments(&next, segments, index + 1, matches)?;
-        }
-    }
-    Ok(())
-}
-
-fn read_directories(path: &Path) -> Result<Vec<PathBuf>, WorkspaceError> {
-    let entries = match fs::read_dir(path) {
-        Ok(entries) => entries,
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(source) => {
-            return Err(WorkspaceError::Io {
-                path: path.to_path_buf(),
-                source,
-            });
-        }
-    };
-    let mut directories = Vec::new();
-    for entry in entries {
-        let entry = entry.map_err(|source| WorkspaceError::Io {
-            path: path.to_path_buf(),
-            source,
-        })?;
-        if entry
-            .file_type()
-            .map_err(|source| WorkspaceError::Io {
-                path: entry.path(),
-                source,
-            })?
-            .is_dir()
-        {
-            directories.push(entry.path());
-        }
-    }
-    directories.sort();
-    Ok(directories)
-}
-
-fn wildcard_matches(pattern: &str, value: &str) -> bool {
-    fn matches(pattern: &[u8], value: &[u8]) -> bool {
-        match pattern.split_first() {
-            None => value.is_empty(),
-            Some((b'*', rest)) => {
-                matches(rest, value)
-                    || value
-                        .split_first()
-                        .is_some_and(|(_, value_rest)| matches(pattern, value_rest))
-            }
-            Some((pattern_char, rest)) => {
-                value.split_first().is_some_and(|(value_char, value_rest)| {
-                    pattern_char == value_char && matches(rest, value_rest)
-                })
-            }
-        }
-    }
-
-    matches(pattern.as_bytes(), value.as_bytes())
 }
 
 /// Expected failures while discovering or planning a workspace.
@@ -664,8 +682,12 @@ pub enum WorkspaceError {
         reference: String,
         from: TaskNode,
     },
+    TaskOutsideSelectedPackage {
+        package: String,
+        selected: String,
+    },
     TaskCycle {
-        node: TaskNode,
+        path: Vec<TaskNode>,
     },
 }
 
@@ -710,12 +732,17 @@ impl fmt::Display for WorkspaceError {
                 "invalid task reference '{reference}' from '{}:{}'",
                 from.package, from.task
             ),
-            Self::TaskCycle { node } => {
-                write!(
-                    f,
-                    "task dependency cycle detected at '{}:{}'",
-                    node.package, node.task
-                )
+            Self::TaskOutsideSelectedPackage { package, selected } => write!(
+                f,
+                "task root belongs to package '{package}', but package selection is '{selected}'"
+            ),
+            Self::TaskCycle { path } => {
+                let cycle = path
+                    .iter()
+                    .map(|node| format!("{}:{}", node.package, node.task))
+                    .collect::<Vec<_>>()
+                    .join(" -> ");
+                write!(f, "task dependency cycle detected: {cycle}")
             }
         }
     }
@@ -831,16 +858,60 @@ mod tests {
         let workspace = Workspace::load(&root).expect("workspace loads");
         let plan = workspace.plan(None, None, &[]).expect("plan succeeds");
 
-        assert_eq!(plan[0].task, "generate");
+        assert_eq!(plan[0].task(), "generate");
         assert_eq!(
-            plan[0].cwd,
+            plan[0].cwd(),
             fs::canonicalize(root.join("packages/docs/site")).expect("canonical task cwd")
         );
-        assert_eq!(plan[0].env["MODE"], "check");
+        assert_eq!(plan[0].env()["MODE"], "check");
+        assert_eq!(plan[0].timeout(), Duration::from_secs(600));
+        assert_eq!(plan[0].resource_group(), None);
     }
 
     #[test]
-    fn rejects_task_cycles() {
+    fn plans_timeout_and_resource_group_settings() {
+        let temp = TempDir::new();
+        let root = root_with_members(&temp, "\"packages/*\"");
+        write_manifest(
+            &root.join("packages/app"),
+            "[package]\nname = \"app\"\n\n[tasks.build]\ncommand = [\"echo\", \"app\"]\ntimeout_seconds = 30\nresource_group = \"integration\"\n",
+        );
+
+        let workspace = Workspace::load(&root).expect("workspace loads");
+        let plan = workspace.plan(None, None, &[]).expect("plan succeeds");
+
+        assert_eq!(plan[0].timeout(), Duration::from_secs(30));
+        assert_eq!(plan[0].resource_group(), Some("integration"));
+    }
+
+    #[test]
+    fn rejects_zero_timeout() {
+        let temp = TempDir::new();
+        let root = root_with_members(&temp, "\"packages/*\"");
+        write_manifest(
+            &root.join("packages/app"),
+            "[package]\nname = \"app\"\n\n[tasks.build]\ncommand = [\"echo\", \"app\"]\ntimeout_seconds = 0\n",
+        );
+
+        let error = Workspace::load(&root).expect_err("zero timeout must be rejected");
+        assert!(error.to_string().contains("timeout_seconds"));
+    }
+
+    #[test]
+    fn rejects_empty_resource_group() {
+        let temp = TempDir::new();
+        let root = root_with_members(&temp, "\"packages/*\"");
+        write_manifest(
+            &root.join("packages/app"),
+            "[package]\nname = \"app\"\n\n[tasks.build]\ncommand = [\"echo\", \"app\"]\nresource_group = \"\"\n",
+        );
+
+        let error = Workspace::load(&root).expect_err("empty resource group must be rejected");
+        assert!(error.to_string().contains("resource_group"));
+    }
+
+    #[test]
+    fn rejects_task_cycles_with_the_cycle_path() {
         let temp = TempDir::new();
         let root = root_with_members(&temp, "\"packages/*\"");
         write_manifest(
@@ -848,9 +919,61 @@ mod tests {
             "[package]\nname = \"app\"\n\n[tasks.build]\ncommand = [\"echo\", \"app\"]\ndepends_on = [\"test\"]\n\n[tasks.test]\ncommand = [\"echo\", \"app\"]\ndepends_on = [\"build\"]\n",
         );
 
+        let error = Workspace::load(&root).expect_err("cycle must be rejected");
+        assert!(matches!(error, WorkspaceError::TaskCycle { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("app:build -> app:test -> app:build")
+        );
+    }
+
+    #[test]
+    fn rejects_a_missing_task_working_directory_during_load() {
+        let temp = TempDir::new();
+        let root = root_with_members(&temp, "\"packages/*\"");
+        write_manifest(
+            &root.join("packages/app"),
+            "[package]\nname = \"app\"\n\n[tasks.build]\ncommand = [\"echo\", \"app\"]\ncwd = \"missing\"\n",
+        );
+
+        let error = Workspace::load(&root).expect_err("missing cwd must be rejected");
+        assert!(error.to_string().contains("missing"));
+    }
+
+    #[test]
+    fn rejects_process_values_containing_nul() {
+        let temp = TempDir::new();
+        let root = root_with_members(&temp, "\"packages/*\"");
+        write_manifest(
+            &root.join("packages/app"),
+            "[package]\nname = \"app\"\n\n[tasks.build]\ncommand = [\"echo\", \"bad\\u0000value\"]\n",
+        );
+
+        let error = Workspace::load(&root).expect_err("NUL command argument must be rejected");
+        assert!(error.to_string().contains("NUL"));
+    }
+
+    #[test]
+    fn rejects_a_qualified_root_outside_package_selection() {
+        let temp = TempDir::new();
+        let root = root_with_members(&temp, "\"packages/*\"");
+        write_manifest(
+            &root.join("packages/shared"),
+            "[package]\nname = \"shared\"\n\n[tasks.build]\ncommand = [\"echo\", \"shared\"]\n",
+        );
+        write_manifest(
+            &root.join("packages/app"),
+            "[package]\nname = \"app\"\n\n[tasks.build]\ncommand = [\"echo\", \"app\"]\n",
+        );
+        let workspace = Workspace::load(&root).expect("workspace loads");
+
+        let error = workspace
+            .plan(Some("app"), None, &["shared:build".to_owned()])
+            .expect_err("selection conflict must be explicit");
         assert!(matches!(
-            Workspace::load(&root),
-            Err(WorkspaceError::TaskCycle { .. })
+            error,
+            WorkspaceError::TaskOutsideSelectedPackage { .. }
         ));
     }
 }

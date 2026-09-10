@@ -8,7 +8,10 @@
 
 mod commands;
 mod config;
+mod discovery;
+mod output;
 mod runner;
+mod scheduler;
 #[cfg(test)]
 mod testing;
 mod workspace;

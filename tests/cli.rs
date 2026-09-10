@@ -108,6 +108,47 @@ fn ci_dry_run_discovers_a_package_manifest() {
 }
 
 #[test]
+fn doctor_rejects_a_missing_task_working_directory() {
+    let temp = TempDir::new("doctor-missing-cwd");
+    assert!(monore(&["init"], temp.path()).status.success());
+
+    let package = temp.path().join("packages").join("api");
+    fs::create_dir_all(&package).expect("create package directory");
+    fs::write(
+        package.join("monorepo.toml"),
+        "[package]\nname = \"api\"\n\n[tasks.build]\ncommand = [\"echo\", \"build\"]\ncwd = \"missing\"\n\n[tasks.test]\ncommand = [\"echo\", \"test\"]\n",
+    )
+    .expect("write package manifest");
+
+    let output = monore(&["doctor"], temp.path());
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stderr(&output).contains("missing"));
+}
+
+#[cfg(unix)]
+#[test]
+fn ci_reports_failed_task_output_and_context() {
+    let temp = TempDir::new("ci-failure");
+    assert!(monore(&["init"], temp.path()).status.success());
+
+    let package = temp.path().join("packages").join("api");
+    fs::create_dir_all(&package).expect("create package directory");
+    fs::write(
+        package.join("monorepo.toml"),
+        "[package]\nname = \"api\"\n\n[tasks.build]\ncommand = [\"sh\", \"-c\", \"printf boom >&2; exit 3\"]\n\n[tasks.test]\ncommand = [\"sh\", \"-c\", \"printf should-not-run\"]\n",
+    )
+    .expect("write package manifest");
+
+    let output = monore(&["ci"], temp.path());
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stderr(&output).contains("boom"));
+    assert!(stderr(&output).contains("api/build"));
+    assert!(!stderr(&output).contains("should-not-run"));
+}
+
+#[test]
 fn plan_and_graph_commands_expose_task_dependencies() {
     let temp = TempDir::new("plan-graph");
     assert!(monore(&["init"], temp.path()).status.success());

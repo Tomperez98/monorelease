@@ -5,8 +5,10 @@ use std::fmt;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::config::{MonorepoConfig, config_path, render_config};
+use crate::config::{CONFIG_FILE_NAME, MonorepoConfig, config_path, render_config};
 
 /// Create `dir` if needed and write a fresh [`MonorepoConfig`] into it.
 ///
@@ -21,28 +23,48 @@ pub fn init(dir: &Path) -> Result<PathBuf, InitError> {
     let path = config_path(dir);
     let contents = render_config(&MonorepoConfig::template());
 
-    // `create_new` makes "already initialized" atomic with the create: the
-    // check and the open are a single syscall, so an existing config is never
-    // opened, truncated, or raced by a concurrent `init`.
+    // Write to a unique sibling first. Hard-linking the completed file into
+    // place gives us publication after the write while still refusing to
+    // replace an existing destination on platforms supported by std::fs.
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock is after the epoch")
+        .as_nanos();
+    let temporary_path = dir.join(format!(
+        ".{CONFIG_FILE_NAME}.{}.{}.{}.tmp",
+        std::process::id(),
+        timestamp,
+        COUNTER.fetch_add(1, Ordering::Relaxed),
+    ));
     let mut file = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
-        .open(&path)
-        .map_err(|source| match source.kind() {
-            io::ErrorKind::AlreadyExists => InitError::AlreadyInitialized(path.clone()),
-            _ => InitError::WriteConfig {
-                path: path.clone(),
-                source,
-            },
+        .open(&temporary_path)
+        .map_err(|source| InitError::WriteConfig {
+            path: path.clone(),
+            source,
         })?;
 
     if let Err(source) = file.write_all(contents.as_bytes()) {
-        // A half-written config would block every later `init` with
-        // `AlreadyInitialized`, so drop it. If the cleanup itself fails the
-        // write error is still the one worth reporting.
-        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(&temporary_path);
         return Err(InitError::WriteConfig { path, source });
     }
+    if let Err(source) = file.sync_all() {
+        let _ = fs::remove_file(&temporary_path);
+        return Err(InitError::WriteConfig { path, source });
+    }
+    drop(file);
+
+    let result = fs::hard_link(&temporary_path, &path);
+    let _ = fs::remove_file(&temporary_path);
+    result.map_err(|source| match source.kind() {
+        io::ErrorKind::AlreadyExists => InitError::AlreadyInitialized(path.clone()),
+        _ => InitError::WriteConfig {
+            path: path.clone(),
+            source,
+        },
+    })?;
 
     Ok(path)
 }
