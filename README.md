@@ -99,6 +99,19 @@ No Rust source changes or central package registry are required when adding anot
 
 The manifest schema is intentionally fixed and has no `version` header. Unknown fields are rejected so typos fail during `check` or execution. `check` validates all discovered manifests, task references, command inputs, and task working directories before execution. If the schema changes in the future, the tool will provide an explicit migration rather than accepting multiple implicit formats.
 
+## CI/CD
+
+GitHub Actions runs `cargo run --locked -- ci --no-cache` for pull requests and pushes to `main`. The pipeline is defined by the root `monorepo.toml`, so local and hosted checks use the same task graph. It also runs `cargo package --locked` to verify the crate can be packaged.
+
+To publish CLI binaries, update `Cargo.toml`'s version, commit the change, and push a matching tag:
+
+```bash
+git tag v0.1.1
+git push origin v0.1.1
+```
+
+The release workflow validates the source, builds native archives for Linux x86_64, macOS Apple Silicon, macOS Intel, and Windows x86_64, generates `SHA256SUMS`, and publishes them to a GitHub Release. The tag must match the package version exactly (for example, `v0.1.1` for `version = "0.1.1"`). Publishing uses GitHub's built-in `GITHUB_TOKEN`; no package registry secret is required.
+
 ## Commands
 
 Run the default pipeline:
