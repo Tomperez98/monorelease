@@ -1,17 +1,47 @@
 # monorelease
 
-`monorelease` is a manifest-driven project and monorepo orchestrator. A standalone project has one root `monorepo.toml`; a monorepo has one root manifest and one manifest per application or package. The CLI discovers the appropriate root, validates a task dependency graph, and runs arbitrary commands in dependency order.
+Run every package's tasks in dependency order, from one `monorepo.toml` — in any language.
 
-`monorelease` does not know or care whether a package uses Rust, Node, Go, Make, Docker, a shell script, or a custom framework. Commands are the package's responsibility.
+[![CI](https://github.com/Tomperez98/monorelease/actions/workflows/ci.yml/badge.svg)](https://github.com/Tomperez98/monorelease/actions/workflows/ci.yml)
+[![Release](https://github.com/Tomperez98/monorelease/actions/workflows/release.yml/badge.svg)](https://github.com/Tomperez98/monorelease/actions/workflows/release.yml)
+![License](https://img.shields.io/badge/license-Apache--2.0-blue)
 
-Runnable examples are available in [`examples/standalone`](examples/standalone/README.md), [`examples/echo`](examples/echo/README.md), [`examples/cache`](examples/cache/README.md), and [`examples/release-gate`](examples/release-gate/README.md).
+`monorelease` reads your manifests, builds one task graph across every package, and runs the commands. It does not know whether a package is Rust, Node, Go, Make, Docker, or a shell script: a task is an argv array, executed directly with no shell in between.
+
+```console
+$ monorelease --dir examples/echo task build --jobs 2
+▶ docs:build
+▶ shared:build
+▶ app:build
+[shared] build
+shared:build: completed in 4ms
+[app] build after shared:build
+app:build: completed in 4ms
+[docs] build from site with MODE=check
+docs:build: completed in 4ms
+summary: 3 completed, 0 cached, 0 failed, 0 blocked across 3 package(s)
+```
+
+`app:build` waited for `shared:build`. `docs:build` ran alongside them in its own directory with its own environment. No central registry of packages, no language plugins, no build backend.
+
+## Install
+
+```bash
+cargo install --path .
+```
+
+Building requires Rust 1.85+ (edition 2024). Prebuilt binaries for Linux x86_64, macOS arm64, macOS x86_64, and Windows x86_64 are attached to each [GitHub release](https://github.com/Tomperez98/monorelease/releases) together with a `SHA256SUMS` file:
+
+```bash
+sha256sum -c SHA256SUMS
+```
 
 ## Quick start
 
-A project can use `monorelease` without a monorepo layout. Create one root
-`monorepo.toml` with a `[package]` section and local tasks:
+A project does not need to be a monorepo. One root manifest is enough:
 
 ```toml
+# monorepo.toml
 [package]
 name = "my-project"
 
@@ -26,175 +56,82 @@ command = ["cargo", "test"]
 depends_on = ["build"]
 ```
 
-Standalone mode does not require `apps/*`, `packages/*`, or child
-`monorepo.toml` files. The root project is represented as one package, so its
-planned tasks are `my-project:build` and `my-project:test`. Invoke commands
-from the project root or a nested directory such as `src/`; task `cwd` values
-remain relative to the project root.
-
 ```bash
-monorelease check
-monorelease
+monorelease check    # validate manifests and the task graph
+monorelease          # run the default pipeline (ci)
+monorelease plan     # print the resolved order without running anything
 ```
 
-To scaffold a standalone project, provide its initial build command. Repeat
-`--command` once per argument:
+Scaffold that file instead of writing it by hand. The generated package is named `project`; rename it in the manifest afterward:
 
 ```bash
-monorelease init --standalone \
-  --command cargo --command build
+monorelease init --standalone --command cargo --command build
 ```
 
-For a monorepo, create a root workspace instead:
+For a monorepo, `monorelease init` writes a root workspace with member patterns instead:
 
 ```bash
 monorelease init
 ```
 
-The generated root manifest looks like this:
-
 ```toml
 [workspace]
 name = "monorepo"
-members = [
-    "apps/*",
-    "packages/*",
-]
+members = ["apps/*", "packages/*"]
 default_pipeline = "ci"
 
 [pipelines.ci]
 tasks = ["build", "test"]
 ```
 
-Add a package manifest at `packages/shared/monorepo.toml`:
+Then add one manifest per package. `apps/web` can depend on `packages/shared` without either package knowing about the other:
 
 ```toml
-[package]
-name = "shared"
-
-[tasks.build]
-command = ["make", "build"]
-
-[tasks.test]
-command = ["make", "test"]
-depends_on = ["build"]
-```
-
-Add an application manifest at `apps/web/monorepo.toml`:
-
-```toml
+# apps/web/monorepo.toml
 [package]
 name = "web"
 
 [tasks.build]
 command = ["npm", "run", "build"]
 depends_on = ["shared:build"]
-
-[tasks.test]
-command = ["npm", "test"]
-depends_on = ["build", "shared:test"]
 ```
-
-No Rust source changes or central package registry are required when adding another package under a configured member pattern.
-
-The manifest schema is intentionally fixed and has no `version` header. Unknown fields are rejected so typos fail during `check` or execution. `check` validates all discovered manifests, task references, command inputs, and task working directories before execution. If the schema changes in the future, the tool will provide an explicit migration rather than accepting multiple implicit formats.
-
-## CI/CD
-
-GitHub Actions runs `cargo run --locked -- ci --no-cache --output github-actions` for pull requests and pushes to `main`. The pipeline is defined by the root `monorepo.toml`, so local and hosted checks use the same task graph. Local runs default to terminal output; use `--output github-actions` only when GitHub log groups are desired. It also runs `cargo package --locked` to verify the crate can be packaged.
-
-To publish CLI binaries, update `Cargo.toml`'s version, commit the change, and push a matching tag:
-
-```bash
-git tag v0.1.1
-git push origin v0.1.1
-```
-
-The release workflow validates the source, builds native archives for Linux x86_64, macOS Apple Silicon, macOS Intel, and Windows x86_64, generates `SHA256SUMS`, and publishes them to a GitHub Release. The tag must match the package version exactly (for example, `v0.1.1` for `version = "0.1.1"`). Publishing uses GitHub's built-in `GITHUB_TOKEN`; no package registry secret is required.
 
 ## Commands
 
-Run the default pipeline:
+`--dir <PATH>` is global and defaults to `.`; root discovery walks up from there, so commands work from any nested directory.
+
+| Command | What it does |
+| --- | --- |
+| `monorelease` | Run the default pipeline. |
+| `monorelease run [PIPELINE]` | Run the default or a named pipeline (alias: `ci`). |
+| `monorelease task TASK...` | Run one or more tasks and their transitive dependencies. |
+| `monorelease check` | Validate manifests, references, and working directories (alias: `doctor`). |
+| `monorelease plan [PIPELINE]` | Print the dependency-first execution plan. |
+| `monorelease graph [PIPELINE]` | Print the dependency edges. |
+| `monorelease list` | List pipelines, tasks, and common commands. |
+| `monorelease init [--standalone] [--command CMD]` | Write a fresh manifest; refuses to overwrite an existing one. |
+| `monorelease cache clean` | Delete all local cache entries. |
+
+`run` and `task` accept:
+
+| Flag | Default | Effect |
+| --- | --- | --- |
+| `--package NAME` | all packages | Restrict the run to one package, keeping its transitive dependencies. |
+| `--jobs N` | machine CPUs | Maximum independent tasks to execute concurrently. Defaults to this machine's available parallelism. |
+| `--dry-run` | off | Resolve and print the plan; run nothing and touch no cache. |
+| `--no-cache` | off | Skip reading and writing the cache for this run. |
+| `--force` | off | Ignore cache hits and refresh successful entries. |
+| `--output terminal\|github-actions` | `terminal` | Select the output contract. |
 
 ```bash
-monorelease
-```
-
-Validate the selected project or monorepo:
-
-```bash
-monorelease check
-```
-
-List available pipelines, packages, tasks, and examples:
-
-```bash
-monorelease list
-```
-
-Run a named pipeline:
-
-```bash
-monorelease run release
-```
-
-Run one or more tasks and their transitive dependencies:
-
-```bash
-monorelease task test
-monorelease task build test
-```
-
-Preview execution without running commands:
-
-```bash
-monorelease task test --dry-run
-monorelease plan
-monorelease plan release
-```
-
-Print the task dependency graph:
-
-```bash
-monorelease graph
-monorelease graph release
-```
-
-Select a package and run its task graph:
-
-```bash
-monorelease task test --package web
-```
-
-Run independent task branches concurrently:
-
-```bash
-monorelease run --jobs 4
-```
-
-Skip or refresh cache entries:
-
-```bash
-monorelease --no-cache
-monorelease --force
-```
-
-Use a project directory consistently with `--dir`:
-
-```bash
-monorelease --dir examples/echo check
-monorelease --dir examples/echo task test
-```
-
-Remove all local cache entries:
-
-```bash
-monorelease cache clean
+monorelease task test --package web --jobs 4
+monorelease run release --dry-run
+monorelease --dir examples/echo task build --jobs 2
 ```
 
 ## Manifest model
 
-The root workspace declares package discovery and named pipelines:
+A root manifest is either a workspace or a standalone project — never both. Package manifests declare identity and tasks only.
 
 ```toml
 [workspace]
@@ -208,65 +145,72 @@ tasks = ["build", "test"]
 [pipelines.release]
 tasks = ["workspace:release-verify"]
 
+# Root tasks run once, from the workspace root, and are addressed as
+# `workspace:<name>`. Use them for cross-package coordination such as
+# release validation.
 [tasks.release-verify]
 command = ["./automation/release-verify"]
 depends_on = ["web:package", "api:package"]
+cwd = "automation"
 timeout_seconds = 1800
 ```
 
-Workspace tasks are declared in the root manifest and run once from the workspace root. They are useful for checks that coordinate multiple packages, such as release validation. The reserved `workspace:` namespace is used when referring to them.
-
-Each package declares only its identity and commands:
-
 ```toml
 [package]
-name = "documentation"
+name = "web"
 
-[tasks.generate]
-command = ["./scripts/generate-docs"]
-
-[tasks.publish]
-command = ["./scripts/publish-docs"]
-depends_on = ["generate"]
-```
-
-Task dependencies are local by default. Use `package:task` for a task in another package:
-
-```toml
 [tasks.build]
-command = ["./scripts/build"]
+command = ["npm", "run", "build"]
 depends_on = ["shared:build"]
+
+[tasks.test]
+command = ["npm", "test"]
+depends_on = ["build", "shared:test"]
+resource_group = "checks"
 ```
 
-Task commands are structured executable/argument arrays rather than shell strings. The runner passes arguments without shell interpolation and captures stdout/stderr. During execution, monorelease announces each task when it starts, presents captured task output in deterministic plan order, reports a semantic status and duration, and prints a final summary.
+Every task accepts the same fields:
 
-A run uses one concise output model:
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `command` | — (required) | Executable and arguments as an array. No shell, so pipes and redirects are not interpreted. |
+| `depends_on` | `[]` | Task references: `build` (same package), `shared:build` (another package), `workspace:verify` (root task). |
+| `cwd` | package root | Relative directory inside the package. Must exist and resolve inside the package after symlinks. |
+| `env` | `{}` | Extra child-process environment. Values are redacted in plan output. |
+| `cache` | `false` | Allow a successful result to be reused from the local cache. |
+| `inputs` | `[]` | Globs whose contents are hashed into the cache key. |
+| `outputs` | `[]` | Globs copied into the cache and restored on a hit. |
+| `cache_env` | `[]` | Environment variable names that affect the cache key; `["*"]` means the whole environment. |
+| `timeout_seconds` | `600` | Wall-clock limit for one invocation. Must be greater than zero. |
+| `max_output_bytes` | `16777216` | Per-stream capture limit. A task that exceeds it is killed and reports its partial output. |
+| `resource_group` | unset | Tasks sharing a group never run concurrently. |
 
-```text
-▶ shared:build
-[shared] build
-shared:build: completed in 14ms
-summary: 6 completed, 0 cached, 0 failed, 0 blocked across 3 package(s)
+Names must be non-empty and cannot contain `:`. `workspace` is reserved for root tasks.
+
+The schema is fixed: there is no `version` header, and unknown fields are rejected, so typos fail in `check` instead of being ignored.
+
+## Execution model
+
+- The plan is a dependency-first topological order. Cycles, unknown packages, unknown tasks, and unresolvable references are rejected before anything runs; near-misses get a "did you mean" suggestion.
+- With `--jobs N`, a task starts as soon as its dependencies finish and a worker is free. Independent branches overlap; `resource_group` and dependencies hold back only what they must. `N` defaults to this machine's available parallelism (cgroup quotas and CPU affinity included), so pass `--jobs 1` for strictly serial execution. The default is a dispatch limit, not a promise about the commands themselves: a task that starts its own workers, such as a compiler, can oversubscribe the machine.
+- Every task's stdout and stderr are captured. Task output and status lines are presented in deterministic plan order, so parallel logs never interleave. In `terminal` mode status goes to stderr and task output to stdout; `github-actions` mode wraps each task in `::group::` on stdout.
+- A failure or timeout stops new work from being scheduled while in-flight tasks finish. The summary reports `completed`, `cached`, `failed`, and `blocked`, and the process exits `1`.
+- Nothing is implicit: no shell, no hidden environment merging, no working-directory mutation.
+
+```console
+$ monorelease --dir examples/release-gate plan release
+monorepo release-gate (/path/to/examples/release-gate)
+would run api:build in .../packages/api: echo '[api] build' [timeout=30s] [max_output_bytes=16777216]
+would run api:test in .../packages/api: echo '[api] test' [timeout=30s] [max_output_bytes=16777216] [resource_group=checks]
+would run api:package in .../packages/api: echo '[api] package' [timeout=30s] [max_output_bytes=16777216]
+...
+would run workspace:release-verify in .../automation: echo '[workspace] verify artifacts, installability, and versions' [timeout=60s] [max_output_bytes=16777216] [resource_group=release-gate]
+would run workspace:release-summary in .../automation: echo '[workspace] release gate passed once for all packages' [timeout=60s] [max_output_bytes=16777216]
 ```
 
-Cached, failed, timed-out, and blocked tasks are identified explicitly. CI runs use grouped sections while preserving the same task statuses. `plan` and `--dry-run` show declared input/output patterns, but task environment values are always redacted.
+## Caching
 
-Optional task execution context:
-
-```toml
-[tasks.generate]
-command = ["make", "docs"]
-cwd = "site"
-env = { MODE = "check" }
-timeout_seconds = 600
-resource_group = "documentation"
-```
-
-`cwd` must be an existing relative directory inside the package. The resolved path is checked after symlink resolution, so a symlink cannot escape the package. Environment values are applied only to the child process and are redacted in plan output. Command arrays are executed directly without a shell; shell syntax such as pipes or redirects is not interpreted. Tasks time out after ten minutes by default; set `timeout_seconds` to change the limit. Tasks sharing a `resource_group` never run concurrently. Output is captured without a configured size limit and presented after the task completes.
-
-### Local task caching
-
-Caching is opt-in because tasks may have external side effects. A cacheable task must declare the files that affect it and the files that can be restored:
+Caching is opt-in, because a task's side effects are yours to declare. A cacheable task must declare at least one positive input pattern:
 
 ```toml
 [tasks.build]
@@ -274,19 +218,69 @@ command = ["cargo", "build", "--release"]
 cache = true
 inputs = ["src/**", "Cargo.toml", "Cargo.lock"]
 outputs = ["target/release/my-binary"]
-cache_env = ["RUSTFLAGS", "CARGO_BUILD_TARGET"]
+cache_env = ["RUSTFLAGS"]
 ```
 
-Successful cache entries are stored under `.monorelease/cache`. The `.monorelease/.gitignore` keeps those entries out of Git. Cache keys include the task command/configuration, declared input contents, declared environment values, and dependency task keys. Use `cache_env = ["*"]` when a task depends on the complete inherited environment; this is more conservative and usually produces fewer cache hits. Cache hits restore declared output files and replay captured output. Tasks with `cache = false` always execute; failed or timed-out tasks are never cached.
+A cache hit replays the captured stdout/stderr and restores the declared outputs, so downstream tasks see the same artifacts as a real run:
 
-Use `--force` to execute cacheable tasks and refresh their entries, or `--no-cache` to bypass caching for a run. `--dry-run` never reads or writes the cache. Use `monorelease cache clean` to remove all local cache entries. Remote caching is not included yet.
+```console
+$ monorelease --dir examples/cache run
+▶ app:build
+[build] generated artifact from input: hello from the cache example
+app:build: cache hit in 0ms
+▶ app:verify
+[verify] artifact: hello from the cache example
+app:verify: completed in 9ms
+summary: 1 completed, 1 cached, 0 failed, 0 blocked across 1 package(s)
+```
 
-Output patterns must match regular files; symlink outputs and output patterns that match no files are rejected when the task is cached. Do not cache deployment, publishing, migration, time-dependent, network-dependent, or otherwise nondeterministic tasks. An undeclared input can produce a stale cache hit, while an overbroad input can cause unnecessary misses.
+The key covers the task's package, name, cwd, command, timeout, output limit, resource group, input/output patterns, declared environment values, dependency keys, and the workspace and package manifest contents. Changing a declared input changes the key.
 
-## Discovery and ordering
+Patterns select files with `*` (within a path segment), `**` (across segments), and a leading `!` to exclude; the last matching pattern wins. `.git` and `.monorelease` are never walked. A positive pattern that matches no files is an error, and symlink matches are rejected because content addressing cannot represent them. `.monorelease/.gitignore` keeps the store out of Git.
 
-`workspace.members` is evaluated relative to the root manifest. Literal directories, `*` path segments, and `**` recursive path segments are supported. A matching directory must contain a package `monorepo.toml`.
+Failed and timed-out tasks are never cached. `--force` re-runs cacheable tasks and refreshes their entries, `--no-cache` bypasses the cache for a run, and `--dry-run` never reads or writes it. `cache_env = ["*"]` hashes the complete inherited environment: more correct for environment-sensitive tasks, fewer hits.
 
-The planner creates a DAG of `package:task` and `workspace:task` nodes. Workspace tasks run once from the root; package tasks run from their package directories. It validates missing packages, missing tasks, duplicate package names, invalid references, cycles, commands, environment values, working directories, timeouts, and resource groups before execution. Task working directories must exist and resolve inside their package, including after symlink resolution. Tasks execute dependency-first using a deterministic topological order. Independent tasks can run concurrently with `--jobs N`; newly unblocked tasks are scheduled immediately, up to the worker limit. Task starts are reported immediately, while captured task output is presented in deterministic plan order so logs and CI sections do not interleave. A task failure or timeout prevents new dependent work from being scheduled, and the final summary reports completed, cached, failed, and blocked tasks.
+Do not cache publishing, deployment, migration, time-dependent, network-dependent, or otherwise nondeterministic tasks. Caching is local only; there is no remote cache.
 
-Selecting a package with `--package` selects that package's pipeline roots and automatically includes their transitive task dependencies. Unrelated packages are excluded. A pipeline root in the reserved `workspace:` namespace cannot be combined with `--package`; run the pipeline without package selection or select a package task explicitly.
+## Discovery
+
+`workspace.members` is evaluated relative to the root manifest. Literal segments, `*`, and `**` are supported, and every match must be a directory containing a package manifest.
+
+Root discovery walks up from `--dir` until it finds a manifest: the nearest `[workspace]` wins, otherwise the nearest `[package]`. A manifest containing both sections is rejected. A package manifest may contain only `[package]` and `[tasks]`; pipelines live in the root.
+
+`monorelease` plans and schedules work. It does not fetch dependencies, bump versions, or publish artifacts — a task does that by running the command your package already uses.
+
+## Examples
+
+Runnable workspaces under [`examples/`](examples), each with its own README:
+
+| Example | Demonstrates |
+| --- | --- |
+| [`examples/standalone`](examples/standalone/README.md) | One manifest, one package, tasks with a nested `cwd`. |
+| [`examples/echo`](examples/echo/README.md) | Package discovery, local and cross-package dependencies, pipelines, package selection, timeouts, resource groups, dry runs, and parallel scheduling. |
+| [`examples/cache`](examples/cache/README.md) | Cache hits, output restoration, and invalidation when an input changes. |
+| [`examples/release-gate`](examples/release-gate/README.md) | A `workspace:` task that coordinates a release once after every package is ready. |
+
+```bash
+cargo run -- check --dir examples/echo
+cargo run -- run --dir examples/echo --jobs 2
+```
+
+## CI and releases
+
+The project dogfoods itself: `.github/workflows/ci.yml` runs the pipeline defined in its own root `monorepo.toml`, so local and hosted checks use the same task graph.
+
+```bash
+cargo run --locked -- ci --no-cache --output github-actions
+```
+
+To cut a release, bump `Cargo.toml`, commit, and push a matching tag. The `Release` workflow checks that the tag equals the package version, builds the four targets, generates `SHA256SUMS`, and publishes a GitHub Release; `Release (validate)` re-downloads a published release, verifies the checksums, and smoke-tests the Linux binary.
+
+```bash
+git tag v0.1.1
+git push origin v0.1.1
+```
+
+## License
+
+Apache-2.0. See [LICENSE](LICENSE).

@@ -268,6 +268,7 @@ fn format_plan(workspace: &Workspace, plan: &[PlannedTask]) -> String {
             format_command(task.command())
         ));
         output.push_str(&format!(" [timeout={}s]", task.timeout().as_secs()));
+        output.push_str(&format!(" [max_output_bytes={}]", task.max_output_bytes()));
         if let Some(group) = task.resource_group() {
             output.push_str(&format!(" [resource_group={group}]"));
         }

@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error as StdError;
 use std::fmt;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
@@ -14,8 +15,10 @@ use sha2::{Digest, Sha256};
 use crate::runner::{CapturedOutput, TaskResult};
 use crate::workspace::PlannedTask;
 
-const CACHE_FORMAT_VERSION: u32 = 1;
+const CACHE_FORMAT_VERSION: u32 = 2;
 const CACHE_GITIGNORE: &str = "*\n!.gitignore\n";
+const HASH_BUFFER_SIZE: usize = 64 * 1024;
+const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CacheMode {
@@ -27,6 +30,16 @@ pub enum CacheMode {
 #[derive(Debug, Clone)]
 pub(crate) struct CacheStore {
     root: PathBuf,
+}
+
+/// Immutable cache state shared by every task in one execution.
+///
+/// Manifests and cache-directory setup are workspace state, not task state. Keeping
+/// them here prevents every cacheable task from repeating the same filesystem work.
+#[derive(Debug, Clone)]
+pub(crate) struct CacheSession {
+    workspace_manifest: Vec<u8>,
+    package_manifests: BTreeMap<PathBuf, Vec<u8>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -50,13 +63,52 @@ impl CacheStore {
         }
     }
 
+    pub(crate) fn prepare(
+        &self,
+        workspace_root: &Path,
+        plan: &[PlannedTask],
+    ) -> Result<CacheSession, CacheError> {
+        self.ensure_gitignore()?;
+        let workspace_manifest = read_file(&workspace_root.join("monorepo.toml"))?;
+        let mut package_manifests = BTreeMap::new();
+        for task in plan.iter().filter(|task| task.cache()) {
+            if task.package_path() == workspace_root {
+                continue;
+            }
+            let package_path = task.package_path().to_path_buf();
+            if package_manifests.contains_key(&package_path) {
+                continue;
+            }
+            package_manifests.insert(
+                package_path.clone(),
+                read_file(&package_path.join("monorepo.toml"))?,
+            );
+        }
+        Ok(CacheSession {
+            workspace_manifest,
+            package_manifests,
+        })
+    }
+
+    /// Compatibility helper for tests and callers that key one task outside a run.
+    #[cfg(test)]
     pub(crate) fn task_key(
         &self,
         workspace_root: &Path,
         task: &PlannedTask,
         dependency_keys: &[String],
     ) -> Result<String, CacheError> {
-        self.ensure_gitignore()?;
+        let session = self.prepare(workspace_root, std::slice::from_ref(task))?;
+        self.task_key_with_session(&session, workspace_root, task, dependency_keys)
+    }
+
+    pub(crate) fn task_key_with_session(
+        &self,
+        session: &CacheSession,
+        workspace_root: &Path,
+        task: &PlannedTask,
+        dependency_keys: &[String],
+    ) -> Result<String, CacheError> {
         let mut hasher = Sha256::new();
         hash_string(&mut hasher, "monorelease-cache");
         hash_string(&mut hasher, &CACHE_FORMAT_VERSION.to_string());
@@ -78,23 +130,24 @@ impl CacheStore {
         );
         hash_strings(&mut hasher, task.command());
         hash_string(&mut hasher, &task.timeout().as_secs().to_string());
+        hash_string(&mut hasher, &task.max_output_bytes().to_string());
         hash_string(&mut hasher, task.resource_group().unwrap_or(""));
         hash_strings(&mut hasher, task.inputs());
         hash_strings(&mut hasher, task.outputs());
         hash_strings(&mut hasher, task.cache_env());
         hash_strings(&mut hasher, dependency_keys);
 
-        hash_file(
+        hash_bytes(
             &mut hasher,
             "workspace-manifest",
-            &workspace_root.join("monorepo.toml"),
-        )?;
+            &session.workspace_manifest,
+        );
         if task.package_path() != workspace_root {
-            hash_file(
-                &mut hasher,
-                "package-manifest",
-                &task.package_path().join("monorepo.toml"),
-            )?;
+            let package_manifest = session
+                .package_manifests
+                .get(task.package_path())
+                .expect("cache session contains every planned package manifest");
+            hash_bytes(&mut hasher, "package-manifest", package_manifest);
         }
 
         let mut environment = BTreeMap::new();
@@ -118,12 +171,11 @@ impl CacheStore {
             hash_string(&mut hasher, &value);
         }
 
-        let input_files = collect_files(task.package_path(), task.inputs())?;
-        ensure_patterns_match(task.inputs(), &input_files, "input")?;
-        reject_symlink_matches(task.package_path(), task.inputs(), "input")?;
+        let input_files = collect_files(task.package_path(), task.inputs(), "input")?;
+        let outputs = CachePatterns::compile(task.outputs());
         let input_files = input_files
             .into_iter()
-            .filter(|path| !matches_patterns(path, task.outputs()))
+            .filter(|path| !outputs.matches(path))
             .collect::<Vec<_>>();
         for relative_path in input_files {
             hash_string(&mut hasher, &relative_path);
@@ -213,7 +265,6 @@ impl CacheStore {
         key: &str,
         result: &TaskResult,
     ) -> Result<(), CacheError> {
-        self.ensure_gitignore()?;
         static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
         fs::create_dir_all(&self.root)
@@ -256,9 +307,7 @@ impl CacheStore {
         fs::write(directory.join("stderr"), &result.output.stderr)
             .map_err(|source| CacheError::io(directory.join("stderr"), source))?;
 
-        let output_paths = collect_files(task.package_path(), task.outputs())?;
-        ensure_patterns_match(task.outputs(), &output_paths, "output")?;
-        reject_symlink_matches(task.package_path(), task.outputs(), "output")?;
+        let output_paths = collect_files(task.package_path(), task.outputs(), "output")?;
         let mut outputs = Vec::new();
         for relative_path in output_paths {
             let source = task.package_path().join(&relative_path);
@@ -317,51 +366,120 @@ impl CacheStore {
 
 #[derive(Debug, Default)]
 struct CollectedPaths {
-    files: BTreeSet<String>,
-    symlinks: BTreeSet<String>,
+    files: Vec<String>,
+    first_symlink: Option<String>,
+    matched_positive_patterns: BTreeSet<usize>,
 }
 
-fn collect_files(root: &Path, patterns: &[String]) -> Result<Vec<String>, CacheError> {
-    let mut paths = CollectedPaths::default();
-    walk_paths(root, root, &mut paths)?;
-    Ok(paths
-        .files
-        .into_iter()
-        .filter(|path| matches_patterns(path, patterns))
-        .collect())
+/// Cache patterns compiled into path segments once, so a walk never re-splits
+/// them for every entry it visits.
+struct CachePatterns<'a> {
+    patterns: Vec<CachePattern<'a>>,
 }
 
-fn reject_symlink_matches(root: &Path, patterns: &[String], kind: &str) -> Result<(), CacheError> {
-    let mut paths = CollectedPaths::default();
-    walk_paths(root, root, &mut paths)?;
-    if let Some(path) = paths
-        .symlinks
-        .into_iter()
-        .find(|path| matches_patterns(path, patterns))
-    {
-        return Err(CacheError::Invalid {
-            message: format!("{kind} pattern matches unsupported symlink '{path}'"),
-        });
+struct CachePattern<'a> {
+    source: &'a str,
+    exclude: bool,
+    segments: Vec<&'a str>,
+}
+
+impl<'a> CachePatterns<'a> {
+    fn compile(patterns: &'a [String]) -> Self {
+        let patterns = patterns
+            .iter()
+            .map(|pattern| match pattern.strip_prefix('!') {
+                Some(source) => CachePattern {
+                    source,
+                    exclude: true,
+                    segments: source.split('/').collect(),
+                },
+                None => CachePattern {
+                    source: pattern.as_str(),
+                    exclude: false,
+                    segments: pattern.split('/').collect(),
+                },
+            })
+            .collect();
+        Self { patterns }
     }
-    Ok(())
+
+    /// Select a path the same way the manifest's ordered pattern list does.
+    fn matches(&self, path: &str) -> bool {
+        let path = path.split('/').collect::<Vec<_>>();
+        let mut selected = false;
+        for pattern in &self.patterns {
+            if match_segments(&path, &pattern.segments) {
+                selected = !pattern.exclude;
+            }
+        }
+        selected
+    }
+
+    fn matches_and_record(
+        &self,
+        path: &str,
+        matched_positive_patterns: &mut BTreeSet<usize>,
+    ) -> bool {
+        let path = path.split('/').collect::<Vec<_>>();
+        let mut selected = false;
+        for (index, pattern) in self.patterns.iter().enumerate() {
+            if match_segments(&path, &pattern.segments) {
+                selected = !pattern.exclude;
+                if !pattern.exclude {
+                    matched_positive_patterns.insert(index);
+                }
+            }
+        }
+        selected
+    }
+
+    /// Whether any positive pattern can still match a path below `directory`.
+    ///
+    /// Reaching a path requires every one of its leading segments to line up
+    /// with a pattern, so a directory no positive pattern can reach is never
+    /// walked. A package full of unrelated build output then costs one
+    /// `read_dir` per pattern prefix instead of a full-tree traversal.
+    fn could_match_below(&self, directory: &str) -> bool {
+        let directory = directory.split('/').collect::<Vec<_>>();
+        self.patterns
+            .iter()
+            .any(|pattern| !pattern.exclude && prefix_matches(&pattern.segments, &directory))
+    }
 }
 
-fn ensure_patterns_match(
-    patterns: &[String],
-    files: &[String],
-    kind: &str,
-) -> Result<(), CacheError> {
-    for pattern in patterns.iter().filter(|pattern| !pattern.starts_with('!')) {
-        if !files.iter().any(|path| pattern_matches(path, pattern)) {
+/// Collect every file under `root` that `patterns` select, rejecting the
+/// symlink matches that content addressing cannot represent.
+///
+/// One traversal enforces the whole pattern contract: the same "matched no
+/// files" error and the same "matched a symlink" error a caller would get
+/// from collecting, checking, and rejecting separately.
+fn collect_files(root: &Path, patterns: &[String], kind: &str) -> Result<Vec<String>, CacheError> {
+    let patterns = CachePatterns::compile(patterns);
+    let mut paths = CollectedPaths::default();
+    walk_matched(root, root, &patterns, &mut paths)?;
+    paths.files.sort_unstable();
+    paths.files.dedup();
+    for (index, pattern) in patterns.patterns.iter().enumerate() {
+        if !pattern.exclude && !paths.matched_positive_patterns.contains(&index) {
             return Err(CacheError::Invalid {
-                message: format!("{kind} pattern '{pattern}' matched no files"),
+                message: format!("{kind} pattern '{}' matched no files", pattern.source),
             });
         }
     }
-    Ok(())
+    if let Some(symlink) = paths.first_symlink {
+        return Err(CacheError::Invalid {
+            message: format!("{kind} pattern matches unsupported symlink '{symlink}'"),
+        });
+    }
+    Ok(paths.files)
 }
 
-fn walk_paths(root: &Path, current: &Path, paths: &mut CollectedPaths) -> Result<(), CacheError> {
+fn walk_matched(
+    root: &Path,
+    current: &Path,
+    patterns: &CachePatterns<'_>,
+    paths: &mut CollectedPaths,
+) -> Result<(), CacheError> {
     let entries =
         fs::read_dir(current).map_err(|source| CacheError::io(current.to_path_buf(), source))?;
     for entry in entries {
@@ -380,71 +498,105 @@ fn walk_paths(root: &Path, current: &Path, paths: &mut CollectedPaths) -> Result
             .file_type()
             .map_err(|source| CacheError::io(path.clone(), source))?;
         if file_type.is_dir() {
-            walk_paths(root, &path, paths)?;
+            let directory = relative_path(relative);
+            if patterns.could_match_below(&directory) {
+                walk_matched(root, &path, patterns, paths)?;
+            }
         } else if file_type.is_file() {
-            paths.files.insert(relative_path(relative));
+            let relative = relative_path(relative);
+            let selected =
+                patterns.matches_and_record(&relative, &mut paths.matched_positive_patterns);
+            if selected {
+                paths.files.push(relative);
+            }
         } else if file_type.is_symlink() {
-            paths.symlinks.insert(relative_path(relative));
+            let relative = relative_path(relative);
+            if patterns.matches(&relative)
+                && paths
+                    .first_symlink
+                    .as_ref()
+                    .is_none_or(|current| relative.as_str() < current.as_str())
+            {
+                paths.first_symlink = Some(relative);
+            }
         }
     }
     Ok(())
 }
 
-fn matches_patterns(path: &str, patterns: &[String]) -> bool {
-    let mut selected = false;
-    for pattern in patterns {
-        let (exclude, pattern) = pattern
-            .strip_prefix('!')
-            .map_or((false, pattern.as_str()), |pattern| (true, pattern));
-        if pattern_matches(path, pattern) {
-            selected = !exclude;
-        }
-    }
-    selected
-}
-
-fn pattern_matches(path: &str, pattern: &str) -> bool {
-    let path = path.split('/').collect::<Vec<_>>();
-    let pattern = pattern.split('/').collect::<Vec<_>>();
-    match_segments(&path, &pattern)
+/// Whether `directory` can be the leading part of a path `pattern` matches.
+fn prefix_matches(pattern: &[&str], directory: &[&str]) -> bool {
+    match_path_segments(directory, pattern, true)
 }
 
 fn match_segments(path: &[&str], pattern: &[&str]) -> bool {
-    match pattern.split_first() {
-        None => path.is_empty(),
-        Some((segment, rest)) if *segment == "**" => {
-            match_segments(path, rest)
-                || path
-                    .split_first()
-                    .is_some_and(|(_, remaining)| match_segments(remaining, pattern))
+    match_path_segments(path, pattern, false)
+}
+
+/// Match path segments with `**` using greedy backtracking rather than
+/// recursive branching. `prefix` allows a directory to end before the pattern
+/// does, because the remaining pattern may match descendants.
+fn match_path_segments(path: &[&str], pattern: &[&str], prefix: bool) -> bool {
+    let mut path_index = 0;
+    let mut pattern_index = 0;
+    let mut star_pattern = None;
+    let mut star_path = 0;
+
+    while path_index < path.len() {
+        if pattern_index < pattern.len()
+            && pattern[pattern_index] != "**"
+            && segment_matches(path[path_index], pattern[pattern_index])
+        {
+            path_index += 1;
+            pattern_index += 1;
+        } else if pattern_index < pattern.len() && pattern[pattern_index] == "**" {
+            star_pattern = Some(pattern_index);
+            star_path = path_index;
+            pattern_index += 1;
+        } else if let Some(star_pattern_index) = star_pattern {
+            star_path += 1;
+            path_index = star_path;
+            pattern_index = star_pattern_index + 1;
+        } else {
+            return false;
         }
-        Some((segment, rest)) => path.split_first().is_some_and(|(value, remaining)| {
-            segment_matches(value, segment) && match_segments(remaining, rest)
-        }),
     }
+
+    prefix
+        || pattern_index == pattern.len()
+        || pattern[pattern_index..]
+            .iter()
+            .all(|segment| *segment == "**")
 }
 
 fn segment_matches(value: &str, pattern: &str) -> bool {
-    fn matches(value: &[u8], pattern: &[u8]) -> bool {
-        match pattern.split_first() {
-            None => value.is_empty(),
-            Some((b'*', rest)) => {
-                matches(value, rest)
-                    || value
-                        .split_first()
-                        .is_some_and(|(_, remaining)| matches(remaining, pattern))
-            }
-            Some((character, rest)) => {
-                value
-                    .split_first()
-                    .is_some_and(|(value_character, remaining)| {
-                        character == value_character && matches(remaining, rest)
-                    })
-            }
+    let value = value.as_bytes();
+    let pattern = pattern.as_bytes();
+    let mut value_index = 0;
+    let mut pattern_index = 0;
+    let mut star_pattern = None;
+    let mut star_value = 0;
+
+    while value_index < value.len() {
+        if pattern_index < pattern.len() && pattern[pattern_index] == value[value_index] {
+            value_index += 1;
+            pattern_index += 1;
+        } else if pattern_index < pattern.len() && pattern[pattern_index] == b'*' {
+            star_pattern = Some(pattern_index);
+            star_value = value_index;
+            pattern_index += 1;
+        } else if let Some(star_pattern_index) = star_pattern {
+            star_value += 1;
+            value_index = star_value;
+            pattern_index = star_pattern_index + 1;
+        } else {
+            return false;
         }
     }
 
-    matches(value.as_bytes(), pattern.as_bytes())
+    pattern[pattern_index..]
+        .iter()
+        .all(|character| *character == b'*')
 }
 
 fn relative_path(path: &Path) -> String {
@@ -494,16 +646,48 @@ fn hash_string(hasher: &mut Sha256, value: &str) {
     hasher.update(value.as_bytes());
 }
 
+/// Stream a file into the hasher so an oversized input never has to fit in
+/// memory at once.
 fn hash_file(hasher: &mut Sha256, label: &str, path: &Path) -> Result<(), CacheError> {
-    let contents = fs::read(path).map_err(|source| CacheError::io(path.to_path_buf(), source))?;
+    let mut file =
+        fs::File::open(path).map_err(|source| CacheError::io(path.to_path_buf(), source))?;
+    let length = file
+        .metadata()
+        .map_err(|source| CacheError::io(path.to_path_buf(), source))?
+        .len();
     hash_string(hasher, label);
-    hasher.update((contents.len() as u64).to_le_bytes());
-    hasher.update(contents);
+    hasher.update(length.to_le_bytes());
+
+    let mut buffer = vec![0u8; HASH_BUFFER_SIZE];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|source| CacheError::io(path.to_path_buf(), source))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
     Ok(())
 }
 
+fn read_file(path: &Path) -> Result<Vec<u8>, CacheError> {
+    fs::read(path).map_err(|source| CacheError::io(path.to_path_buf(), source))
+}
+
+fn hash_bytes(hasher: &mut Sha256, label: &str, bytes: &[u8]) {
+    hash_string(hasher, label);
+    hasher.update((bytes.len() as u64).to_le_bytes());
+    hasher.update(bytes);
+}
+
 fn hex_digest(digest: &[u8]) -> String {
-    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        hex.push(HEX_DIGITS[usize::from(byte >> 4)] as char);
+        hex.push(HEX_DIGITS[usize::from(byte & 0x0f)] as char);
+    }
+    hex
 }
 
 fn file_mode(path: &Path) -> Result<Option<u32>, CacheError> {
@@ -678,5 +862,207 @@ mod tests {
             .task_key(&workspace.root, &task, &[])
             .expect("key succeeds");
         assert_ne!(first, second);
+    }
+
+    fn workspace_with_manifest(temp: &TempDir, manifest: &str) -> Workspace {
+        fs::write(
+            config_path(temp.path()),
+            "[workspace]\nname = \"fixture\"\nmembers = [\"packages/*\"]\n\n[pipelines.ci]\ntasks = [\"build\"]\n",
+        )
+        .expect("write root manifest");
+        let package = temp.path().join("packages/app");
+        fs::create_dir_all(&package).expect("create package");
+        fs::write(config_path(&package), manifest).expect("write package manifest");
+        Workspace::load(temp.path()).expect("workspace loads")
+    }
+
+    fn only_task(workspace: &Workspace) -> PlannedTask {
+        workspace
+            .plan(None, None, &[])
+            .expect("plan succeeds")
+            .remove(0)
+    }
+
+    #[test]
+    fn changing_the_output_limit_changes_the_key() {
+        let temp = TempDir::new();
+        let mut workspace = workspace_with_task(&temp);
+        let task = only_task(&workspace);
+        let store = CacheStore::new(&workspace.root);
+        let session = store
+            .prepare(&workspace.root, std::slice::from_ref(&task))
+            .expect("cache session prepares");
+        let first = store
+            .task_key_with_session(&session, &workspace.root, &task, &[])
+            .expect("key succeeds");
+        workspace
+            .packages
+            .get_mut("app")
+            .expect("fixture package exists")
+            .tasks
+            .get_mut("build")
+            .expect("fixture task exists")
+            .max_output_bytes += 1;
+        let changed_task = only_task(&workspace);
+        let second = store
+            .task_key_with_session(&session, &workspace.root, &changed_task, &[])
+            .expect("key succeeds");
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn ignores_files_outside_the_input_patterns() {
+        let temp = TempDir::new();
+        let workspace = workspace_with_manifest(
+            &temp,
+            "[package]\nname = \"app\"\n\n[tasks.build]\ncommand = [\"echo\", \"app\"]\ncache = true\ninputs = [\"src/**\"]\noutputs = [\"dist/**\"]\n",
+        );
+        let task = only_task(&workspace);
+        let package = task.package_path().to_path_buf();
+        fs::create_dir_all(package.join("src")).expect("create src");
+        fs::create_dir_all(package.join("dist")).expect("create dist");
+        fs::create_dir_all(package.join("target/build")).expect("create unrelated tree");
+        fs::write(package.join("src/input.txt"), "input").expect("write input");
+        fs::write(package.join("dist/output.txt"), "output").expect("write output");
+        let store = CacheStore::new(&workspace.root);
+        let first = store
+            .task_key(&workspace.root, &task, &[])
+            .expect("key succeeds");
+
+        fs::write(package.join("target/build/object.o"), "unrelated")
+            .expect("write unrelated file");
+
+        let second = store
+            .task_key(&workspace.root, &task, &[])
+            .expect("key succeeds");
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn honours_negated_input_patterns() {
+        let temp = TempDir::new();
+        let workspace = workspace_with_manifest(
+            &temp,
+            "[package]\nname = \"app\"\n\n[tasks.build]\ncommand = [\"echo\", \"app\"]\ncache = true\ninputs = [\"src/**\", \"!src/skip.txt\"]\noutputs = [\"dist/**\"]\n",
+        );
+        let task = only_task(&workspace);
+        let package = task.package_path().to_path_buf();
+        fs::create_dir_all(package.join("src")).expect("create src");
+        fs::create_dir_all(package.join("dist")).expect("create dist");
+        fs::write(package.join("src/kept.txt"), "kept").expect("write input");
+        fs::write(package.join("src/skip.txt"), "first").expect("write excluded input");
+        let store = CacheStore::new(&workspace.root);
+        let first = store
+            .task_key(&workspace.root, &task, &[])
+            .expect("key succeeds");
+
+        fs::write(package.join("src/skip.txt"), "second").expect("change excluded input");
+
+        let second = store
+            .task_key(&workspace.root, &task, &[])
+            .expect("key succeeds");
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn excludes_outputs_from_the_input_fingerprint() {
+        let temp = TempDir::new();
+        let workspace = workspace_with_manifest(
+            &temp,
+            "[package]\nname = \"app\"\n\n[tasks.build]\ncommand = [\"echo\", \"app\"]\ncache = true\ninputs = [\"**\"]\noutputs = [\"dist/**\"]\n",
+        );
+        let task = only_task(&workspace);
+        let package = task.package_path().to_path_buf();
+        fs::create_dir_all(package.join("src")).expect("create src");
+        fs::create_dir_all(package.join("dist")).expect("create dist");
+        fs::write(package.join("src/input.txt"), "input").expect("write input");
+        fs::write(package.join("dist/output.txt"), "first").expect("write output");
+        let store = CacheStore::new(&workspace.root);
+        let first = store
+            .task_key(&workspace.root, &task, &[])
+            .expect("key succeeds");
+
+        fs::write(package.join("dist/output.txt"), "second").expect("rewrite output");
+
+        let second = store
+            .task_key(&workspace.root, &task, &[])
+            .expect("key succeeds");
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn reports_an_input_pattern_that_matches_no_files() {
+        let temp = TempDir::new();
+        let workspace = workspace_with_manifest(
+            &temp,
+            "[package]\nname = \"app\"\n\n[tasks.build]\ncommand = [\"echo\", \"app\"]\ncache = true\ninputs = [\"src/**\", \"missing/**\"]\noutputs = [\"dist/**\"]\n",
+        );
+        let task = only_task(&workspace);
+        let package = task.package_path().to_path_buf();
+        fs::create_dir_all(package.join("src")).expect("create src");
+        fs::create_dir_all(package.join("dist")).expect("create dist");
+        fs::write(package.join("src/input.txt"), "input").expect("write input");
+        let store = CacheStore::new(&workspace.root);
+
+        let error = store
+            .task_key(&workspace.root, &task, &[])
+            .expect_err("an unmatched pattern must fail");
+        assert!(error.to_string().contains("missing/**"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_a_symlink_input_match() {
+        let temp = TempDir::new();
+        let workspace = workspace_with_manifest(
+            &temp,
+            "[package]\nname = \"app\"\n\n[tasks.build]\ncommand = [\"echo\", \"app\"]\ncache = true\ninputs = [\"src/**\"]\noutputs = [\"dist/**\"]\n",
+        );
+        let task = only_task(&workspace);
+        let package = task.package_path().to_path_buf();
+        fs::create_dir_all(package.join("src")).expect("create src");
+        fs::create_dir_all(package.join("dist")).expect("create dist");
+        fs::write(package.join("src/input.txt"), "input").expect("write input");
+        std::os::unix::fs::symlink("input.txt", package.join("src/link.txt"))
+            .expect("create symlink");
+        let store = CacheStore::new(&workspace.root);
+
+        let error = store
+            .task_key(&workspace.root, &task, &[])
+            .expect_err("symlinks cannot be fingerprinted");
+        assert!(error.to_string().contains("unsupported symlink"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stores_and_restores_nested_outputs() {
+        let temp = TempDir::new();
+        let workspace = workspace_with_manifest(
+            &temp,
+            "[package]\nname = \"app\"\n\n[tasks.build]\ncommand = [\"sh\", \"-c\", \"mkdir -p dist/nested && cp src/input.txt dist/nested/artifact.txt\"]\ncache = true\ninputs = [\"src/**\"]\noutputs = [\"dist/**\"]\n",
+        );
+        let task = only_task(&workspace);
+        let package = task.package_path().to_path_buf();
+        fs::create_dir_all(package.join("src")).expect("create src");
+        fs::write(package.join("src/input.txt"), "nested").expect("write input");
+        let store = CacheStore::new(&workspace.root);
+        let key = store
+            .task_key(&workspace.root, &task, &[])
+            .expect("key succeeds");
+        let result = Runner::new()
+            .run(&workspace.root, &task)
+            .expect("task succeeds");
+        store.store(&task, &key, &result).expect("store succeeds");
+        fs::remove_dir_all(package.join("dist")).expect("remove outputs");
+
+        store
+            .lookup(&task, &key)
+            .expect("lookup succeeds")
+            .expect("cache hit");
+
+        assert_eq!(
+            fs::read_to_string(package.join("dist/nested/artifact.txt")).expect("read output"),
+            "nested"
+        );
     }
 }
