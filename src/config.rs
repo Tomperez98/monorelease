@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 
 /// Name of the configuration file, relative to a repository or package root.
 pub const CONFIG_FILE_NAME: &str = "monorepo.toml";
+/// Namespace used by task references for tasks declared in the root manifest.
+pub const WORKSPACE_PACKAGE_NAME: &str = "workspace";
 
 /// The fixed on-disk `monorepo.toml` schema.
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -16,6 +18,7 @@ pub struct MonorepoConfig {
     pub workspace: Option<WorkspaceConfig>,
     #[serde(default)]
     pub package: Option<PackageConfig>,
+    /// Tasks declared at the workspace root run once from the workspace root.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub tasks: BTreeMap<String, TaskConfig>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]

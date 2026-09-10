@@ -108,6 +108,29 @@ fn ci_dry_run_discovers_a_package_manifest() {
 }
 
 #[test]
+fn plan_includes_a_workspace_task_after_package_dependencies() {
+    let temp = TempDir::new("workspace-task");
+    fs::write(
+        temp.path().join("monorepo.toml"),
+        "[workspace]\nname = \"fixture\"\nmembers = [\"packages/*\"]\ndefault_pipeline = \"release\"\n\n[pipelines.release]\ntasks = [\"workspace:release-verify\"]\n\n[tasks.release-verify]\ncommand = [\"echo\", \"release\"]\ndepends_on = [\"api:package\"]\n",
+    )
+    .expect("write root manifest");
+    let package = temp.path().join("packages").join("api");
+    fs::create_dir_all(&package).expect("create package directory");
+    fs::write(
+        package.join("monorepo.toml"),
+        "[package]\nname = \"api\"\n\n[tasks.package]\ncommand = [\"echo\", \"package\"]\n",
+    )
+    .expect("write package manifest");
+
+    let output = monore(&["plan"], temp.path());
+
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    let output = stdout(&output);
+    assert!(output.find("api:package").unwrap() < output.find("workspace:release-verify").unwrap());
+}
+
+#[test]
 fn doctor_rejects_a_missing_task_working_directory() {
     let temp = TempDir::new("doctor-missing-cwd");
     assert!(monore(&["init"], temp.path()).status.success());

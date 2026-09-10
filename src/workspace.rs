@@ -8,7 +8,8 @@ use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 use crate::config::{
-    PackageConfig, PipelineConfig, TaskConfig, config_path, validate_process_value,
+    PackageConfig, PipelineConfig, TaskConfig, WORKSPACE_PACKAGE_NAME, config_path,
+    validate_process_value,
 };
 use crate::discovery::{expand_member_pattern, find_root, read_manifest};
 
@@ -34,6 +35,7 @@ pub struct Workspace {
     pub name: String,
     pub default_pipeline: String,
     pub pipelines: BTreeMap<String, PipelineConfig>,
+    pub workspace_tasks: BTreeMap<String, TaskConfig>,
     pub packages: BTreeMap<String, Package>,
 }
 
@@ -137,12 +139,22 @@ impl Workspace {
             }
         }
 
-        if root_config.package.is_some() || !root_config.tasks.is_empty() {
+        if root_config.package.is_some() {
             return Err(WorkspaceError::InvalidManifest {
                 path: config_path(&root),
-                message: "root manifests may only contain [workspace] and [pipelines]".to_owned(),
+                message: "root manifests may only contain [workspace], [tasks], and [pipelines]"
+                    .to_owned(),
             });
         }
+        let workspace_package_config = PackageConfig {
+            name: WORKSPACE_PACKAGE_NAME.to_owned(),
+        };
+        validate_package_config(
+            &config_path(&root),
+            &root,
+            &workspace_package_config,
+            &root_config.tasks,
+        )?;
         if root_config.pipelines.is_empty() {
             return Err(WorkspaceError::InvalidWorkspace {
                 message: "workspace must define at least one pipeline".to_owned(),
@@ -201,6 +213,16 @@ impl Workspace {
                     });
                 }
 
+                if package_config.name == WORKSPACE_PACKAGE_NAME {
+                    return Err(WorkspaceError::InvalidManifest {
+                        path: manifest_path,
+                        message: format!(
+                            "package name '{}' is reserved for workspace tasks",
+                            WORKSPACE_PACKAGE_NAME
+                        ),
+                    });
+                }
+
                 validate_package_config(
                     &manifest_path,
                     &package_path,
@@ -220,6 +242,7 @@ impl Workspace {
             name: workspace_config.name,
             default_pipeline: workspace_config.default_pipeline,
             pipelines: root_config.pipelines,
+            workspace_tasks: root_config.tasks,
             packages,
         };
         workspace.validate_graph()?;
@@ -318,11 +341,17 @@ impl Workspace {
     }
 
     fn validate_graph(&self) -> Result<(), WorkspaceError> {
-        for package in self.packages.values() {
-            for task_name in package.tasks.keys() {
+        for (package, tasks) in std::iter::once((WORKSPACE_PACKAGE_NAME, &self.workspace_tasks))
+            .chain(
+                self.packages
+                    .values()
+                    .map(|package| (package.name.as_str(), &package.tasks)),
+            )
+        {
+            for task_name in tasks.keys() {
                 if task_name.is_empty() || task_name.contains(':') {
                     return Err(WorkspaceError::InvalidTaskName {
-                        package: package.name.clone(),
+                        package: package.to_owned(),
                         task: task_name.clone(),
                     });
                 }
@@ -387,28 +416,38 @@ impl Workspace {
     }
 
     fn planned_task(&self, node: TaskNode) -> Result<PlannedTask, WorkspaceError> {
-        let package =
-            self.packages
-                .get(&node.package)
-                .ok_or_else(|| WorkspaceError::UnknownPackage {
-                    name: node.package.clone(),
-                })?;
-        let task = package
-            .tasks
-            .get(&node.task)
-            .ok_or_else(|| WorkspaceError::MissingTask {
-                package: node.package.clone(),
-                task: node.task.clone(),
-            })?;
+        let (package_name, package_path, task) = if node.package == WORKSPACE_PACKAGE_NAME {
+            (
+                WORKSPACE_PACKAGE_NAME,
+                &self.root,
+                self.workspace_tasks.get(&node.task),
+            )
+        } else {
+            let package =
+                self.packages
+                    .get(&node.package)
+                    .ok_or_else(|| WorkspaceError::UnknownPackage {
+                        name: node.package.clone(),
+                    })?;
+            (
+                package.name.as_str(),
+                &package.path,
+                package.tasks.get(&node.task),
+            )
+        };
+        let task = task.ok_or_else(|| WorkspaceError::MissingTask {
+            package: node.package.clone(),
+            task: node.task.clone(),
+        })?;
         let cwd = task.cwd.as_deref().unwrap_or(".");
         let cwd_path =
-            fs::canonicalize(package.path.join(cwd)).map_err(|source| WorkspaceError::Io {
-                path: package.path.join(cwd),
+            fs::canonicalize(package_path.join(cwd)).map_err(|source| WorkspaceError::Io {
+                path: package_path.join(cwd),
                 source,
             })?;
-        if !cwd_path.starts_with(&package.path) || !cwd_path.is_dir() {
+        if !cwd_path.starts_with(package_path) || !cwd_path.is_dir() {
             return Err(WorkspaceError::InvalidTask {
-                package: package.name.clone(),
+                package: package_name.to_owned(),
                 task: node.task.clone(),
                 message: "cwd must resolve to a directory inside the package".to_owned(),
             });
@@ -420,8 +459,8 @@ impl Workspace {
             .collect::<Result<Vec<_>, _>>()?;
 
         Ok(PlannedTask {
-            package: package.name.clone(),
-            package_path: package.path.clone(),
+            package: package_name.to_owned(),
+            package_path: package_path.clone(),
             task: node.task,
             command: task.command.clone(),
             cwd: cwd_path,
@@ -433,6 +472,15 @@ impl Workspace {
     }
 
     fn task_config(&self, node: &TaskNode) -> Result<&TaskConfig, WorkspaceError> {
+        if node.package == WORKSPACE_PACKAGE_NAME {
+            return self.workspace_tasks.get(&node.task).ok_or_else(|| {
+                WorkspaceError::MissingTask {
+                    package: node.package.clone(),
+                    task: node.task.clone(),
+                }
+            });
+        }
+
         let package =
             self.packages
                 .get(&node.package)
@@ -808,6 +856,81 @@ mod tests {
                 }
             ]
         );
+    }
+
+    #[test]
+    fn plans_workspace_tasks_once_after_package_dependencies() {
+        let temp = TempDir::new();
+        fs::write(
+            config_path(temp.path()),
+            "[workspace]\nname = \"test\"\nmembers = [\"packages/*\"]\ndefault_pipeline = \"release\"\n\n[pipelines.release]\ntasks = [\"workspace:release-verify\"]\n\n[tasks.release-verify]\ncommand = [\"echo\", \"release\"]\ndepends_on = [\"app:package\"]\n",
+        )
+        .expect("write root manifest");
+        write_manifest(
+            &temp.path().join("packages/app"),
+            "[package]\nname = \"app\"\n\n[tasks.package]\ncommand = [\"echo\", \"package\"]\n",
+        );
+
+        let workspace = Workspace::load(temp.path()).expect("workspace loads");
+        let plan = workspace.plan(None, None, &[]).expect("plan succeeds");
+
+        assert_eq!(
+            plan.iter().map(|task| task.node()).collect::<Vec<_>>(),
+            vec![
+                TaskNode {
+                    package: "app".to_owned(),
+                    task: "package".to_owned(),
+                },
+                TaskNode {
+                    package: WORKSPACE_PACKAGE_NAME.to_owned(),
+                    task: "release-verify".to_owned(),
+                },
+            ]
+        );
+        assert_eq!(
+            plan[1].cwd(),
+            &fs::canonicalize(temp.path()).expect("workspace root canonicalizes")
+        );
+    }
+
+    #[test]
+    fn workspace_task_dependencies_are_local_by_default() {
+        let temp = TempDir::new();
+        fs::write(
+            config_path(temp.path()),
+            "[workspace]\nname = \"test\"\nmembers = []\n\n[pipelines.ci]\ntasks = [\"workspace:release-verify\"]\n\n[tasks.generate]\ncommand = [\"echo\", \"generate\"]\n\n[tasks.release-verify]\ncommand = [\"echo\", \"release\"]\ndepends_on = [\"generate\"]\n",
+        )
+        .expect("write root manifest");
+
+        let workspace = Workspace::load(temp.path()).expect("workspace loads");
+        let plan = workspace.plan(None, None, &[]).expect("plan succeeds");
+
+        assert_eq!(
+            plan.iter().map(|task| task.node()).collect::<Vec<_>>(),
+            vec![
+                TaskNode {
+                    package: WORKSPACE_PACKAGE_NAME.to_owned(),
+                    task: "generate".to_owned(),
+                },
+                TaskNode {
+                    package: WORKSPACE_PACKAGE_NAME.to_owned(),
+                    task: "release-verify".to_owned(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_a_package_named_workspace() {
+        let temp = TempDir::new();
+        let root = root_with_members(&temp, "\"packages/*\"");
+        write_manifest(
+            &root.join("packages/reserved"),
+            "[package]\nname = \"workspace\"\n\n[tasks.build]\ncommand = [\"echo\", \"build\"]\n",
+        );
+
+        let error = Workspace::load(&root).expect_err("workspace namespace must be reserved");
+        assert!(error.to_string().contains("reserved for workspace tasks"));
     }
 
     #[test]

@@ -25,8 +25,8 @@ pub use commands::ci::{
 pub use commands::doctor::{DoctorError, doctor};
 pub use commands::init::{InitError, init};
 pub use config::{
-    CONFIG_FILE_NAME, MonorepoConfig, PackageConfig, PipelineConfig, TaskConfig, WorkspaceConfig,
-    config_path, render_config,
+    CONFIG_FILE_NAME, MonorepoConfig, PackageConfig, PipelineConfig, TaskConfig,
+    WORKSPACE_PACKAGE_NAME, WorkspaceConfig, config_path, render_config,
 };
 pub use workspace::{Package, PlannedTask, TaskNode, Workspace, WorkspaceError};
 

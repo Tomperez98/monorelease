@@ -1,0 +1,25 @@
+[workspace]
+name = "release-gate"
+members = ["packages/*"]
+default_pipeline = "ci"
+
+[pipelines.ci]
+tasks = ["build", "test"]
+
+[pipelines.release]
+tasks = ["workspace:release-summary"]
+
+# Workspace tasks run once from the repository root. They can coordinate
+# package tasks without belonging to any individual package.
+[tasks.release-verify]
+command = ["echo", "[workspace] verify artifacts, installability, and versions"]
+depends_on = ["api:package", "web:package", "docs:package"]
+cwd = "automation"
+timeout_seconds = 60
+resource_group = "release-gate"
+
+[tasks.release-summary]
+command = ["echo", "[workspace] release gate passed once for all packages"]
+depends_on = ["release-verify"]
+cwd = "automation"
+timeout_seconds = 60

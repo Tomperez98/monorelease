@@ -125,8 +125,15 @@ default_pipeline = "ci"
 tasks = ["build", "test"]
 
 [pipelines.release]
-tasks = ["build", "package", "publish"]
+tasks = ["workspace:release-verify"]
+
+[tasks.release-verify]
+command = ["./automation/release-verify"]
+depends_on = ["web:package", "api:package"]
+timeout_seconds = 1800
 ```
+
+Workspace tasks are declared in the root manifest and run once from the workspace root. They are useful for checks that coordinate multiple packages, such as release validation. The reserved `workspace:` namespace is used when referring to them.
 
 Each package declares only its identity and commands:
 
@@ -169,6 +176,6 @@ resource_group = "documentation"
 
 `workspace.members` is evaluated relative to the root manifest. Literal directories, `*` path segments, and `**` recursive path segments are supported. A matching directory must contain a package `monorepo.toml`.
 
-The planner creates a DAG of `package:task` nodes. It validates missing packages, missing tasks, duplicate package names, invalid references, cycles, commands, environment values, working directories, timeouts, and resource groups before execution. Task working directories must exist and resolve inside their package, including after symlink resolution. Tasks execute dependency-first using a deterministic topological order. Independent tasks can run concurrently with `--jobs N`; newly unblocked tasks are scheduled immediately, up to the worker limit. Parallel task output is captured and presented in deterministic plan order so logs and CI sections do not interleave. A task failure or timeout prevents new dependent work from being scheduled.
+The planner creates a DAG of `package:task` and `workspace:task` nodes. Workspace tasks run once from the root; package tasks run from their package directories. It validates missing packages, missing tasks, duplicate package names, invalid references, cycles, commands, environment values, working directories, timeouts, and resource groups before execution. Task working directories must exist and resolve inside their package, including after symlink resolution. Tasks execute dependency-first using a deterministic topological order. Independent tasks can run concurrently with `--jobs N`; newly unblocked tasks are scheduled immediately, up to the worker limit. Parallel task output is captured and presented in deterministic plan order so logs and CI sections do not interleave. A task failure or timeout prevents new dependent work from being scheduled.
 
 Selecting a package with `--package` selects that package's pipeline roots and automatically includes their transitive task dependencies. Unrelated packages are excluded.
