@@ -109,6 +109,15 @@ monorelease ci --task build --task test
 
 # Run independent task branches concurrently
 monorelease ci --jobs 4
+
+# Skip cache reads and writes for one run
+monorelease ci --no-cache
+
+# Re-run cached tasks and refresh their successful entries
+monorelease ci --force
+
+# Remove all local cache entries
+monorelease cache clean
 ```
 
 ## Manifest model
@@ -172,10 +181,29 @@ resource_group = "documentation"
 
 `cwd` must be an existing relative directory inside the package. The resolved path is checked after symlink resolution, so a symlink cannot escape the package. Environment values are applied only to the child process. Command arrays are executed directly without a shell; shell syntax such as pipes or redirects is not interpreted. Tasks time out after ten minutes by default; set `timeout_seconds` to change the limit. Tasks sharing a `resource_group` never run concurrently. Output is captured without a configured size limit and presented after the task completes.
 
+### Local task caching
+
+Caching is opt-in because tasks may have external side effects. A cacheable task must declare the files that affect it and the files that can be restored:
+
+```toml
+[tasks.build]
+command = ["cargo", "build", "--release"]
+cache = true
+inputs = ["src/**", "Cargo.toml", "Cargo.lock"]
+outputs = ["target/release/my-binary"]
+cache_env = ["RUSTFLAGS", "CARGO_BUILD_TARGET"]
+```
+
+Successful cache entries are stored under `.monorelease/cache`. The `.monorelease/.gitignore` keeps those entries out of Git. Cache keys include the task command/configuration, declared input contents, declared environment values, and dependency task keys. Use `cache_env = ["*"]` when a task depends on the complete inherited environment; this is more conservative and usually produces fewer cache hits. Cache hits restore declared output files and replay captured output. Tasks with `cache = false` always execute; failed or timed-out tasks are never cached.
+
+Use `--force` to execute cacheable tasks and refresh their entries, or `--no-cache` to bypass caching for a run. `--dry-run` never reads or writes the cache. Use `monorelease cache clean` to remove all local cache entries. Remote caching is not included yet.
+
+Output patterns must match regular files; symlink outputs and output patterns that match no files are rejected when the task is cached. Do not cache deployment, publishing, migration, time-dependent, network-dependent, or otherwise nondeterministic tasks. An undeclared input can produce a stale cache hit, while an overbroad input can cause unnecessary misses.
+
 ## Discovery and ordering
 
 `workspace.members` is evaluated relative to the root manifest. Literal directories, `*` path segments, and `**` recursive path segments are supported. A matching directory must contain a package `monorepo.toml`.
 
 The planner creates a DAG of `package:task` and `workspace:task` nodes. Workspace tasks run once from the root; package tasks run from their package directories. It validates missing packages, missing tasks, duplicate package names, invalid references, cycles, commands, environment values, working directories, timeouts, and resource groups before execution. Task working directories must exist and resolve inside their package, including after symlink resolution. Tasks execute dependency-first using a deterministic topological order. Independent tasks can run concurrently with `--jobs N`; newly unblocked tasks are scheduled immediately, up to the worker limit. Parallel task output is captured and presented in deterministic plan order so logs and CI sections do not interleave. A task failure or timeout prevents new dependent work from being scheduled.
 
-Selecting a package with `--package` selects that package's pipeline roots and automatically includes their transitive task dependencies. Unrelated packages are excluded.
+Selecting a package with `--package` selects that package's pipeline roots and automatically includes their transitive task dependencies. Unrelated packages are excluded. A pipeline root in the reserved `workspace:` namespace cannot be combined with `--package`; run the pipeline without package selection or select a package task explicitly.

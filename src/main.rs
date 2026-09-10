@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use monorelease::Error;
+use monorelease::{CacheMode, Error};
 
 #[derive(Parser)]
 #[command(
@@ -43,6 +43,12 @@ enum Commands {
         tasks: Vec<String>,
         #[arg(long)]
         dry_run: bool,
+        /// Skip reading and writing the local task cache.
+        #[arg(long, conflicts_with = "force")]
+        no_cache: bool,
+        /// Ignore cache hits and refresh successful cache entries.
+        #[arg(long, conflicts_with = "no_cache")]
+        force: bool,
         /// Maximum number of independent tasks to execute concurrently.
         #[arg(long, default_value_t = 1)]
         jobs: usize,
@@ -58,9 +64,20 @@ enum Commands {
         tasks: Vec<String>,
         #[arg(long)]
         dry_run: bool,
+        /// Skip reading and writing the local task cache.
+        #[arg(long, conflicts_with = "force")]
+        no_cache: bool,
+        /// Ignore cache hits and refresh successful cache entries.
+        #[arg(long, conflicts_with = "no_cache")]
+        force: bool,
         /// Maximum number of independent tasks to execute concurrently.
         #[arg(long, default_value_t = 1)]
         jobs: usize,
+    },
+    /// Manage the local task cache.
+    Cache {
+        #[command(subcommand)]
+        command: CacheCommands,
     },
     /// Print the resolved task plan.
     Plan {
@@ -86,6 +103,15 @@ enum Commands {
     },
 }
 
+#[derive(Subcommand)]
+enum CacheCommands {
+    /// Remove all local cache entries for a workspace.
+    Clean {
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
+}
+
 fn main() -> ExitCode {
     let Cli { command } = Cli::parse();
 
@@ -98,6 +124,16 @@ fn main() -> ExitCode {
             eprintln!("monore: {error}");
             ExitCode::FAILURE
         }
+    }
+}
+
+fn cache_mode(no_cache: bool, force: bool) -> CacheMode {
+    if no_cache {
+        CacheMode::NoCache
+    } else if force {
+        CacheMode::Force
+    } else {
+        CacheMode::ReadWrite
     }
 }
 
@@ -120,25 +156,41 @@ fn run(command: Commands) -> Result<String, Error> {
             package,
             tasks,
             dry_run,
+            no_cache,
+            force,
             jobs,
-        } => monorelease::ci_with_jobs(&path, package.as_deref(), &tasks, dry_run, jobs)
-            .map_err(Error::from),
+        } => monorelease::run_pipeline_with_cache(
+            &path,
+            None,
+            package.as_deref(),
+            &tasks,
+            dry_run,
+            jobs,
+            cache_mode(no_cache, force),
+        )
+        .map_err(Error::from),
         Commands::Run {
             pipeline,
             path,
             package,
             tasks,
             dry_run,
+            no_cache,
+            force,
             jobs,
-        } => monorelease::run_pipeline_with_jobs(
+        } => monorelease::run_pipeline_with_cache(
             &path,
             Some(&pipeline),
             package.as_deref(),
             &tasks,
             dry_run,
             jobs,
+            cache_mode(no_cache, force),
         )
         .map_err(Error::from),
+        Commands::Cache { command } => match command {
+            CacheCommands::Clean { path } => monorelease::clean_cache(&path).map_err(Error::from),
+        },
         Commands::Plan {
             path,
             pipeline,

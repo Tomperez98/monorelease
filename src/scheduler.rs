@@ -6,6 +6,7 @@ use std::fmt;
 use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
 
+use crate::cache::{CacheError, CacheMode, CacheStore};
 use crate::output::OutputSink;
 use crate::runner::{Runner, RunnerError, TaskResult};
 use crate::workspace::{PlannedTask, TaskNode, Workspace};
@@ -17,6 +18,7 @@ pub(crate) fn execute_plan(
     jobs: usize,
     runner: &Runner,
     output: &OutputSink,
+    cache_mode: CacheMode,
 ) -> Result<(), SchedulerError> {
     if plan.is_empty() {
         return Ok(());
@@ -54,8 +56,12 @@ pub(crate) fn execute_plan(
     let mut active = HashMap::<TaskNode, JoinHandle<()>>::new();
     let mut active_groups = HashSet::<String>::new();
     let mut results = BTreeMap::<TaskNode, Result<TaskResult, RunnerError>>::new();
+    let mut task_keys = BTreeMap::<TaskNode, String>::new();
+    let mut cacheable = BTreeMap::<TaskNode, bool>::new();
+    let mut cache_error = None;
     let mut stopping = false;
     let root = workspace.root.clone();
+    let cache = CacheStore::new(&root);
 
     while !active.is_empty() || (!stopping && !ready.is_empty()) {
         while !stopping && active.len() < jobs {
@@ -76,6 +82,68 @@ pub(crate) fn execute_plan(
                 .get(&node)
                 .expect("ready task must exist in the validated plan")
                 .clone();
+            let dependencies_cacheable = task
+                .depends_on()
+                .iter()
+                .all(|dependency| cacheable.get(dependency).copied().unwrap_or(false));
+            let can_cache =
+                task.cache() && dependencies_cacheable && !matches!(cache_mode, CacheMode::NoCache);
+            let key = if can_cache {
+                let dependency_keys = task
+                    .depends_on()
+                    .iter()
+                    .map(|dependency| {
+                        task_keys
+                            .get(dependency)
+                            .expect("cacheable dependency must have a task key")
+                            .clone()
+                    })
+                    .collect::<Vec<_>>();
+                match cache.task_key(&root, &task, &dependency_keys) {
+                    Ok(key) => Some(key),
+                    Err(error) => {
+                        cache_error = Some(error);
+                        stopping = true;
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            if stopping {
+                break;
+            }
+            cacheable.insert(node.clone(), can_cache);
+            if let Some(key) = key.as_ref() {
+                task_keys.insert(node.clone(), key.clone());
+            }
+
+            if let Some(key) = key {
+                if matches!(cache_mode, CacheMode::Force) {
+                    // Force still refreshes successful cache entries after execution.
+                } else {
+                    match cache.lookup(&task, &key) {
+                        Ok(Some(result)) => {
+                            let sender = sender.clone();
+                            let worker_node = node.clone();
+                            let handle = thread::spawn(move || {
+                                sender
+                                .send((worker_node, Ok(result)))
+                                .expect("scheduler receiver remains alive while cache results are processed");
+                            });
+                            active.insert(node, handle);
+                            continue;
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            cache_error = Some(error);
+                            stopping = true;
+                            break;
+                        }
+                    }
+                }
+            }
+
             let resource_group = task.resource_group().map(str::to_owned);
             let sender = sender.clone();
             let runner = runner.clone();
@@ -94,6 +162,9 @@ pub(crate) fn execute_plan(
         }
 
         if active.is_empty() {
+            if cache_error.is_some() {
+                break;
+            }
             return Err(SchedulerError::NoReadyWork);
         }
 
@@ -110,7 +181,28 @@ pub(crate) fn execute_plan(
             active_groups.remove(group);
         }
 
-        if result.is_err() {
+        if result.is_ok()
+            && cacheable.get(&node).copied().unwrap_or(false)
+            && !matches!(cache_mode, CacheMode::NoCache)
+        {
+            let key = task_keys
+                .get(&node)
+                .expect("cacheable task must have a task key");
+            if let Ok(task_result) = &result
+                && let Err(error) = cache.store(
+                    tasks
+                        .get(&node)
+                        .expect("completed task must exist in the validated plan"),
+                    key,
+                    task_result,
+                )
+            {
+                cache_error = Some(error);
+                stopping = true;
+            }
+        }
+
+        if result.is_err() || cache_error.is_some() {
             stopping = true;
         } else if let Some(children) = dependents.get(&node) {
             for child in children {
@@ -145,12 +237,16 @@ pub(crate) fn execute_plan(
         }
     }
 
+    if let Some(error) = cache_error {
+        return Err(SchedulerError::Cache(error));
+    }
     first_error.map_or(Ok(()), |error| Err(SchedulerError::Task(Box::new(error))))
 }
 
 #[derive(Debug)]
 pub enum SchedulerError {
     Task(Box<RunnerError>),
+    Cache(CacheError),
     UnresolvedDependency {
         task: TaskNode,
         dependency: TaskNode,
@@ -163,6 +259,7 @@ impl fmt::Display for SchedulerError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Task(error) => error.fmt(f),
+            Self::Cache(error) => error.fmt(f),
             Self::UnresolvedDependency { task, dependency } => write!(
                 f,
                 "scheduler could not resolve '{}:{}' for '{}:{}'",
@@ -178,6 +275,7 @@ impl StdError for SchedulerError {
     fn source(&self) -> Option<&(dyn StdError + 'static)> {
         match self {
             Self::Task(error) => Some(error.as_ref()),
+            Self::Cache(error) => Some(error),
             Self::UnresolvedDependency { .. } | Self::NoReadyWork => None,
             Self::Output(error) => Some(error),
         }

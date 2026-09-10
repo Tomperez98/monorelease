@@ -22,6 +22,7 @@ pub struct CapturedOutput {
 pub struct TaskResult {
     pub output: CapturedOutput,
     pub elapsed: Duration,
+    pub cached: bool,
 }
 
 /// Executes package tasks without changing the process-global working directory.
@@ -128,7 +129,11 @@ impl Runner {
             })));
         }
 
-        Ok(TaskResult { output, elapsed })
+        Ok(TaskResult {
+            output,
+            elapsed,
+            cached: false,
+        })
     }
 }
 

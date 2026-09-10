@@ -48,6 +48,10 @@ pub struct PlannedTask {
     command: Vec<String>,
     cwd: PathBuf,
     env: BTreeMap<String, String>,
+    cache: bool,
+    inputs: Vec<String>,
+    outputs: Vec<String>,
+    cache_env: Vec<String>,
     timeout: Duration,
     resource_group: Option<String>,
     depends_on: Vec<TaskNode>,
@@ -83,6 +87,22 @@ impl PlannedTask {
 
     pub fn env(&self) -> &BTreeMap<String, String> {
         &self.env
+    }
+
+    pub fn cache(&self) -> bool {
+        self.cache
+    }
+
+    pub fn inputs(&self) -> &[String] {
+        &self.inputs
+    }
+
+    pub fn outputs(&self) -> &[String] {
+        &self.outputs
+    }
+
+    pub fn cache_env(&self) -> &[String] {
+        &self.cache_env
     }
 
     pub fn timeout(&self) -> Duration {
@@ -465,6 +485,10 @@ impl Workspace {
             command: task.command.clone(),
             cwd: cwd_path,
             env: task.env.clone(),
+            cache: task.cache,
+            inputs: task.inputs.clone(),
+            outputs: task.outputs.clone(),
+            cache_env: task.cache_env.clone(),
             timeout: Duration::from_secs(task.timeout_seconds),
             resource_group: task.resource_group.clone(),
             depends_on,
@@ -587,6 +611,48 @@ fn validate_package_config(
                     message,
                 })?;
         }
+        if task.cache
+            && (task.inputs.is_empty()
+                || !task.inputs.iter().any(|pattern| !pattern.starts_with('!')))
+        {
+            return Err(WorkspaceError::InvalidTask {
+                package: config.name.clone(),
+                task: task_name.clone(),
+                message: "cacheable tasks must declare at least one positive input pattern"
+                    .to_owned(),
+            });
+        }
+        if !task.outputs.is_empty() && !task.outputs.iter().any(|pattern| !pattern.starts_with('!'))
+        {
+            return Err(WorkspaceError::InvalidTask {
+                package: config.name.clone(),
+                task: task_name.clone(),
+                message: "outputs must declare at least one positive pattern".to_owned(),
+            });
+        }
+        for pattern in task.inputs.iter().chain(task.outputs.iter()) {
+            validate_cache_pattern(pattern).map_err(|message| WorkspaceError::InvalidTask {
+                package: config.name.clone(),
+                task: task_name.clone(),
+                message,
+            })?;
+        }
+        for variable in &task.cache_env {
+            if variable.is_empty() || variable.contains('=') {
+                return Err(WorkspaceError::InvalidTask {
+                    package: config.name.clone(),
+                    task: task_name.clone(),
+                    message: "cache_env names must be non-empty and cannot contain '='".to_owned(),
+                });
+            }
+            validate_process_value(variable, "cache environment name").map_err(|message| {
+                WorkspaceError::InvalidTask {
+                    package: config.name.clone(),
+                    task: task_name.clone(),
+                    message,
+                }
+            })?;
+        }
         if task.timeout_seconds == 0 {
             return Err(WorkspaceError::InvalidTask {
                 package: config.name.clone(),
@@ -665,6 +731,20 @@ fn valid_relative_path(path: &str) -> bool {
         && path
             .components()
             .all(|component| matches!(component, Component::Normal(_) | Component::CurDir))
+}
+
+fn validate_cache_pattern(pattern: &str) -> Result<(), String> {
+    let pattern = pattern.strip_prefix('!').unwrap_or(pattern);
+    if pattern.is_empty() || pattern.contains('\0') || Path::new(pattern).is_absolute() {
+        return Err("cache patterns must be non-empty and relative".to_owned());
+    }
+    if pattern
+        .split('/')
+        .any(|segment| segment.is_empty() || segment == "..")
+    {
+        return Err("cache patterns cannot contain empty or '..' path segments".to_owned());
+    }
+    Ok(())
 }
 
 fn split_task_ref(reference: &str) -> Option<(&str, &str)> {
@@ -782,7 +862,7 @@ impl fmt::Display for WorkspaceError {
             ),
             Self::TaskOutsideSelectedPackage { package, selected } => write!(
                 f,
-                "task root belongs to package '{package}', but package selection is '{selected}'"
+                "task root belongs to package '{package}', but package selection is '{selected}'; omit --package for workspace tasks or select a package task"
             ),
             Self::TaskCycle { path } => {
                 let cycle = path
@@ -1005,6 +1085,19 @@ mod tests {
 
         assert_eq!(plan[0].timeout(), Duration::from_secs(30));
         assert_eq!(plan[0].resource_group(), Some("integration"));
+    }
+
+    #[test]
+    fn rejects_cacheable_tasks_without_inputs() {
+        let temp = TempDir::new();
+        let root = root_with_members(&temp, "\"packages/*\"");
+        write_manifest(
+            &root.join("packages/app"),
+            "[package]\nname = \"app\"\n\n[tasks.build]\ncommand = [\"echo\", \"app\"]\ncache = true\noutputs = [\"dist/**\"]\n",
+        );
+
+        let error = Workspace::load(&root).expect_err("cacheable task needs inputs");
+        assert!(error.to_string().contains("input pattern"));
     }
 
     #[test]

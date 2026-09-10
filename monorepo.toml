@@ -1,0 +1,13 @@
+[workspace]
+name = "monorepo"
+members = [
+    "apps/*",
+    "packages/*",
+]
+default_pipeline = "ci"
+
+[pipelines.ci]
+tasks = [
+    "build",
+    "test",
+]

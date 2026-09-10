@@ -84,6 +84,18 @@ pub struct TaskConfig {
     pub cwd: Option<String>,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+    /// Whether successful task results may be reused from the local cache.
+    #[serde(default)]
+    pub cache: bool,
+    /// Relative file globs included in the task fingerprint.
+    #[serde(default)]
+    pub inputs: Vec<String>,
+    /// Relative file globs copied into and restored from the cache.
+    #[serde(default)]
+    pub outputs: Vec<String>,
+    /// Environment variables whose values affect the task fingerprint.
+    #[serde(default)]
+    pub cache_env: Vec<String>,
     /// Maximum runtime for one invocation, in seconds.
     #[serde(default = "default_timeout_seconds")]
     pub timeout_seconds: u64,
@@ -168,6 +180,10 @@ mod tests {
                 depends_on: Vec::new(),
                 cwd: None,
                 env: BTreeMap::new(),
+                cache: false,
+                inputs: Vec::new(),
+                outputs: Vec::new(),
+                cache_env: Vec::new(),
                 timeout_seconds: 600,
                 resource_group: None,
             }

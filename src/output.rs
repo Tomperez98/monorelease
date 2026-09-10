@@ -25,6 +25,9 @@ impl OutputSink {
     pub(crate) fn present_success(&self, node: &TaskNode, result: &TaskResult) -> io::Result<()> {
         let _guard = self.lock.lock().expect("output lock is not poisoned");
         self.start_section(node)?;
+        if result.cached {
+            self.write_cache_hit(node)?;
+        }
         write_bytes(&result.output.stdout, false)?;
         write_bytes(&result.output.stderr, true)?;
         self.finish_section(node, result.elapsed)
@@ -38,6 +41,12 @@ impl OutputSink {
             write_bytes(&output.stderr, true)?;
         }
         self.finish_section(node, error.elapsed().unwrap_or_default())
+    }
+
+    fn write_cache_hit(&self, node: &TaskNode) -> io::Result<()> {
+        let mut stderr = io::stderr().lock();
+        writeln!(stderr, "{}:{}: cache hit", node.package, node.task)?;
+        stderr.flush()
     }
 
     fn start_section(&self, node: &TaskNode) -> io::Result<()> {

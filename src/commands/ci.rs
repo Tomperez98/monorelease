@@ -5,6 +5,7 @@ use std::error::Error as StdError;
 use std::fmt;
 use std::path::Path;
 
+use crate::cache::CacheMode;
 use crate::output::OutputSink;
 use crate::runner::Runner;
 use crate::runner::format_command;
@@ -18,7 +19,15 @@ pub fn ci(
     requested_tasks: &[String],
     dry_run: bool,
 ) -> Result<String, CiError> {
-    ci_with_jobs(path, selected_package, requested_tasks, dry_run, 1)
+    run_pipeline_with_options(
+        path,
+        None,
+        selected_package,
+        requested_tasks,
+        dry_run,
+        1,
+        CacheMode::ReadWrite,
+    )
 }
 
 /// Run the workspace's default pipeline with a bounded worker count.
@@ -29,7 +38,15 @@ pub fn ci_with_jobs(
     dry_run: bool,
     jobs: usize,
 ) -> Result<String, CiError> {
-    run_pipeline_with_jobs(path, None, selected_package, requested_tasks, dry_run, jobs)
+    run_pipeline_with_options(
+        path,
+        None,
+        selected_package,
+        requested_tasks,
+        dry_run,
+        jobs,
+        CacheMode::ReadWrite,
+    )
 }
 
 /// Run a named pipeline with one worker.
@@ -40,13 +57,14 @@ pub fn run_pipeline(
     requested_tasks: &[String],
     dry_run: bool,
 ) -> Result<String, CiError> {
-    run_pipeline_with_jobs(
+    run_pipeline_with_options(
         path,
         pipeline,
         selected_package,
         requested_tasks,
         dry_run,
         1,
+        CacheMode::ReadWrite,
     )
 }
 
@@ -58,6 +76,46 @@ pub fn run_pipeline_with_jobs(
     requested_tasks: &[String],
     dry_run: bool,
     jobs: usize,
+) -> Result<String, CiError> {
+    run_pipeline_with_options(
+        path,
+        pipeline,
+        selected_package,
+        requested_tasks,
+        dry_run,
+        jobs,
+        CacheMode::ReadWrite,
+    )
+}
+
+pub fn run_pipeline_with_cache(
+    path: &Path,
+    pipeline: Option<&str>,
+    selected_package: Option<&str>,
+    requested_tasks: &[String],
+    dry_run: bool,
+    jobs: usize,
+    cache_mode: CacheMode,
+) -> Result<String, CiError> {
+    run_pipeline_with_options(
+        path,
+        pipeline,
+        selected_package,
+        requested_tasks,
+        dry_run,
+        jobs,
+        cache_mode,
+    )
+}
+
+pub(crate) fn run_pipeline_with_options(
+    path: &Path,
+    pipeline: Option<&str>,
+    selected_package: Option<&str>,
+    requested_tasks: &[String],
+    dry_run: bool,
+    jobs: usize,
+    cache_mode: CacheMode,
 ) -> Result<String, CiError> {
     if jobs == 0 {
         return Err(CiError::InvalidJobs);
@@ -72,7 +130,7 @@ pub fn run_pipeline_with_jobs(
 
     let runner = Runner::new();
     let output = OutputSink::new();
-    execute_plan(&workspace, &plan, jobs, &runner, &output)?;
+    execute_plan(&workspace, &plan, jobs, &runner, &output, cache_mode)?;
 
     let package_count = plan
         .iter()
@@ -95,6 +153,22 @@ pub fn plan(
     let workspace = Workspace::load(path)?;
     let plan = workspace.plan(selected_package, pipeline, requested_tasks)?;
     Ok(format_plan(&workspace, &plan))
+}
+
+/// Remove local cache entries while preserving the workspace and ignore file.
+pub fn clean_cache(path: &Path) -> Result<String, CiError> {
+    let workspace = Workspace::load(path)?;
+    let cache_path = workspace.root.join(".monorelease").join("cache");
+    match std::fs::remove_dir_all(&cache_path) {
+        Ok(()) => Ok(format!("removed cache {}", cache_path.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(format!("cache is already empty {}", cache_path.display()))
+        }
+        Err(source) => Err(CiError::Workspace(WorkspaceError::Io {
+            path: cache_path,
+            source,
+        })),
+    }
 }
 
 /// Return task-DAG edges without running commands.

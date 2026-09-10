@@ -6,6 +6,7 @@
 //! invariant; nothing knows about `clap`, stdout, or exit codes — that
 //! translation happens once, in `main.rs`.
 
+mod cache;
 mod commands;
 mod config;
 mod discovery;
@@ -19,8 +20,10 @@ mod workspace;
 use std::error::Error as StdError;
 use std::fmt;
 
+pub use cache::CacheMode;
 pub use commands::ci::{
-    CiError, ci, ci_with_jobs, graph, plan, run_pipeline, run_pipeline_with_jobs,
+    CiError, ci, ci_with_jobs, clean_cache, graph, plan, run_pipeline, run_pipeline_with_cache,
+    run_pipeline_with_jobs,
 };
 pub use commands::doctor::{DoctorError, doctor};
 pub use commands::init::{InitError, init};

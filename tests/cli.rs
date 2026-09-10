@@ -56,6 +56,21 @@ fn init_succeeds_with_exit_code_zero() {
 }
 
 #[test]
+fn cache_clean_removes_local_entries_without_removing_the_workspace() {
+    let temp = TempDir::new("cache-clean");
+    assert!(monore(&["init"], temp.path()).status.success());
+    let cache_entry = temp.path().join(".monorelease").join("cache").join("entry");
+    fs::create_dir_all(&cache_entry).expect("create cache entry");
+    fs::write(cache_entry.join("metadata.json"), "cache").expect("write cache metadata");
+
+    let output = monore(&["cache", "clean"], temp.path());
+
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    assert!(!temp.path().join(".monorelease/cache").exists());
+    assert!(temp.path().join("monorepo.toml").is_file());
+}
+
+#[test]
 fn reinitializing_fails_with_a_nonzero_exit_code() {
     let temp = TempDir::new("reinit");
     assert!(monore(&["init"], temp.path()).status.success());
@@ -105,6 +120,63 @@ fn ci_dry_run_discovers_a_package_manifest() {
     assert!(output.status.success(), "stderr: {}", stderr(&output));
     assert!(stdout(&output).contains("would run api:build"));
     assert!(stdout(&output).contains("echo building-api"));
+}
+
+#[cfg(unix)]
+#[test]
+fn ci_reuses_cached_outputs_and_supports_cache_bypass_flags() {
+    let temp = TempDir::new("ci-cache");
+    fs::write(
+        temp.path().join("monorepo.toml"),
+        "[workspace]\nname = \"fixture\"\nmembers = [\"packages/*\"]\ndefault_pipeline = \"ci\"\n\n[pipelines.ci]\ntasks = [\"build\"]\n",
+    )
+    .expect("write root manifest");
+    let package = temp.path().join("packages").join("app");
+    fs::create_dir_all(&package).expect("create package directory");
+    fs::write(
+        package.join("monorepo.toml"),
+        "[package]\nname = \"app\"\n\n[tasks.build]\ncommand = [\"sh\", \"-c\", \"n=$(cat count 2>/dev/null || echo 0); echo $((n + 1)) > count; cat seed > artifact\"]\ncache = true\ninputs = [\"seed\"]\noutputs = [\"artifact\"]\n",
+    )
+    .expect("write package manifest");
+    fs::write(package.join("seed"), "hello").expect("write input");
+
+    let first = monore(&["ci"], temp.path());
+    assert!(first.status.success(), "stderr: {}", stderr(&first));
+    let second = monore(&["ci"], temp.path());
+    assert!(second.status.success(), "stderr: {}", stderr(&second));
+    assert!(stderr(&second).contains("cache hit"));
+    assert_eq!(
+        fs::read_to_string(package.join("count")).expect("read count"),
+        "1\n"
+    );
+
+    let forced = monore(&["ci", "--force"], temp.path());
+    assert!(forced.status.success(), "stderr: {}", stderr(&forced));
+    assert_eq!(
+        fs::read_to_string(package.join("count")).expect("read count"),
+        "2\n"
+    );
+
+    let without_cache = monore(&["ci", "--no-cache"], temp.path());
+    assert!(
+        without_cache.status.success(),
+        "stderr: {}",
+        stderr(&without_cache)
+    );
+    assert!(!stderr(&without_cache).contains("cache hit"));
+    assert_eq!(
+        fs::read_to_string(package.join("count")).expect("read count"),
+        "3\n"
+    );
+
+    fs::remove_file(package.join("artifact")).expect("remove output");
+    let restored = monore(&["ci"], temp.path());
+    assert!(restored.status.success(), "stderr: {}", stderr(&restored));
+    assert!(stderr(&restored).contains("cache hit"));
+    assert_eq!(
+        fs::read_to_string(package.join("artifact")).expect("read artifact"),
+        "hello"
+    );
 }
 
 #[test]
