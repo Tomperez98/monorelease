@@ -1,0 +1,24 @@
+[package]
+name = "monorelease"
+
+[pipelines.ci]
+tasks = ["fmt", "check", "test", "clippy"]
+
+[tasks.fmt]
+command = ["cargo", "fmt", "--check"]
+timeout_seconds = 30
+
+[tasks.check]
+command = ["cargo", "check", "--all-targets", "--all-features"]
+depends_on = ["fmt"]
+timeout_seconds = 120
+
+[tasks.test]
+command = ["cargo", "test", "--all-targets", "--all-features"]
+depends_on = ["check"]
+timeout_seconds = 120
+
+[tasks.clippy]
+command = ["cargo", "clippy", "--all-targets", "--all-features", "--", "-D", "warnings"]
+depends_on = ["test"]
+timeout_seconds = 120

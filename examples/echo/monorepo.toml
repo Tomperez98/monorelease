@@ -1,0 +1,10 @@
+[workspace]
+name = "echo-demo"
+members = ["packages/*"]
+default_pipeline = "ci"
+
+[pipelines.ci]
+tasks = ["build", "test"]
+
+[pipelines.release]
+tasks = ["package"]
