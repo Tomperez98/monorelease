@@ -25,6 +25,12 @@ struct Cli {
 enum Commands {
     /// Write a fresh monorepo.toml into a directory.
     Init {
+        /// Create a standalone project instead of a monorepo workspace.
+        #[arg(long)]
+        standalone: bool,
+        /// Command used by the generated standalone build task.
+        #[arg(long = "command", num_args = 1, requires = "standalone")]
+        command: Vec<String>,
         #[arg(default_value = ".")]
         path: PathBuf,
     },
@@ -143,8 +149,16 @@ fn cache_mode(no_cache: bool, force: bool) -> CacheMode {
 /// failure, and the return type records the whole failure space.
 fn run(command: Commands) -> Result<String, Error> {
     match command {
-        Commands::Init { path } => {
-            let written = monorelease::init(&path)?;
+        Commands::Init {
+            path,
+            standalone,
+            command,
+        } => {
+            let written = if standalone {
+                monorelease::init_standalone(&path, command)?
+            } else {
+                monorelease::init(&path)?
+            };
             Ok(format!("initialized {}", written.display()))
         }
         Commands::Doctor { path } => {

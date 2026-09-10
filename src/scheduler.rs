@@ -20,14 +20,19 @@ pub(crate) fn execute_plan(
     output: &OutputSink,
     cache_mode: CacheMode,
 ) -> Result<ExecutionSummary, SchedulerError> {
+    assert!(jobs > 0, "scheduler requires at least one worker");
     if plan.is_empty() {
         return Ok(ExecutionSummary::default());
     }
 
-    let tasks = plan
-        .iter()
-        .map(|task| (task.node(), task.clone()))
-        .collect::<BTreeMap<_, _>>();
+    let mut tasks = BTreeMap::new();
+    for task in plan {
+        let node = task.node();
+        assert!(
+            tasks.insert(node, task.clone()).is_none(),
+            "validated plan contains duplicate task nodes"
+        );
+    }
     let mut remaining_dependencies = tasks
         .iter()
         .map(|(node, task)| (node.clone(), task.depends_on().len()))
@@ -65,6 +70,7 @@ pub(crate) fn execute_plan(
     let cache = CacheStore::new(&root);
 
     while !active.is_empty() || (!stopping && !ready.is_empty()) {
+        assert!(active.len() <= jobs, "scheduler exceeded its worker limit");
         while !stopping && active.len() < jobs {
             let Some(node) = ready.iter().find_map(|node| {
                 let task = tasks
@@ -138,6 +144,7 @@ pub(crate) fn execute_plan(
                                 .expect("scheduler receiver remains alive while cache results are processed");
                             });
                             active.insert(node, handle);
+                            assert!(active.len() <= jobs, "scheduler exceeded its worker limit");
                             continue;
                         }
                         Ok(None) => {}
@@ -165,6 +172,7 @@ pub(crate) fn execute_plan(
                 active_groups.insert(group);
             }
             active.insert(node, handle);
+            assert!(active.len() <= jobs, "scheduler exceeded its worker limit");
         }
 
         if active.is_empty() {
@@ -254,6 +262,11 @@ pub(crate) fn execute_plan(
             }
         }
     }
+    assert_eq!(
+        summary.completed + summary.cached + summary.failed + summary.blocked,
+        plan.len(),
+        "scheduler result accounting must cover the entire plan"
+    );
 
     if let Some(error) = output_error {
         output

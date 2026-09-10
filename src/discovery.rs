@@ -6,12 +6,26 @@ use std::path::{Path, PathBuf};
 use crate::config::{MonorepoConfig, config_path};
 use crate::workspace::WorkspaceError;
 
-pub(crate) fn find_root(start: &Path) -> Result<(PathBuf, MonorepoConfig), WorkspaceError> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RootKind {
+    Workspace,
+    Standalone,
+}
+
+#[derive(Debug)]
+pub(crate) struct DiscoveredRoot {
+    pub(crate) root: PathBuf,
+    pub(crate) config: MonorepoConfig,
+    pub(crate) kind: RootKind,
+}
+
+pub(crate) fn find_root(start: &Path) -> Result<DiscoveredRoot, WorkspaceError> {
     let start = fs::canonicalize(start).map_err(|source| WorkspaceError::Io {
         path: start.to_path_buf(),
         source,
     })?;
     let start_for_error = start.clone();
+    let mut standalone_root = None;
     let mut current = if start.is_dir() {
         start
     } else {
@@ -22,8 +36,29 @@ pub(crate) fn find_root(start: &Path) -> Result<(PathBuf, MonorepoConfig), Works
         let manifest_path = config_path(&current);
         if manifest_path.is_file() {
             let config = read_manifest(&manifest_path)?;
-            if config.workspace.is_some() {
-                return Ok((current, config));
+            match (config.workspace.is_some(), config.package.is_some()) {
+                (true, true) => {
+                    return Err(WorkspaceError::InvalidManifest {
+                        path: manifest_path,
+                        message: "root manifest cannot contain both [workspace] and [package]"
+                            .to_owned(),
+                    });
+                }
+                (true, false) => {
+                    return Ok(DiscoveredRoot {
+                        root: current,
+                        config,
+                        kind: RootKind::Workspace,
+                    });
+                }
+                (false, true) if standalone_root.is_none() => {
+                    standalone_root = Some(DiscoveredRoot {
+                        root: current.clone(),
+                        config,
+                        kind: RootKind::Standalone,
+                    });
+                }
+                (false, true) | (false, false) => {}
             }
         }
 
@@ -32,7 +67,7 @@ pub(crate) fn find_root(start: &Path) -> Result<(PathBuf, MonorepoConfig), Works
         }
     }
 
-    Err(WorkspaceError::MissingRoot {
+    standalone_root.ok_or(WorkspaceError::MissingRoot {
         start: start_for_error,
     })
 }

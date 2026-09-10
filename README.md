@@ -1,14 +1,51 @@
 # monorelease
 
-`monorelease` is a manifest-driven monorepo orchestrator. A repository has one root `monorepo.toml`; each application or package adds its own `monorepo.toml`. The CLI discovers those manifests, validates a task dependency graph, and runs arbitrary commands in dependency order.
+`monorelease` is a manifest-driven project and monorepo orchestrator. A standalone project has one root `monorepo.toml`; a monorepo has one root manifest and one manifest per application or package. The CLI discovers the appropriate root, validates a task dependency graph, and runs arbitrary commands in dependency order.
 
 `monorelease` does not know or care whether a package uses Rust, Node, Go, Make, Docker, a shell script, or a custom framework. Commands are the package's responsibility.
 
-Runnable workspaces are available in [`examples/echo`](examples/echo/README.md), [`examples/cache`](examples/cache/README.md), and [`examples/release-gate`](examples/release-gate/README.md).
+Runnable examples are available in [`examples/standalone`](examples/standalone/README.md), [`examples/echo`](examples/echo/README.md), [`examples/cache`](examples/cache/README.md), and [`examples/release-gate`](examples/release-gate/README.md).
 
 ## Quick start
 
-Create a root workspace:
+A project can use `monorelease` without a monorepo layout. Create one root
+`monorepo.toml` with a `[package]` section and local tasks:
+
+```toml
+[package]
+name = "my-project"
+
+[pipelines.ci]
+tasks = ["build", "test"]
+
+[tasks.build]
+command = ["cargo", "build"]
+
+[tasks.test]
+command = ["cargo", "test"]
+depends_on = ["build"]
+```
+
+Standalone mode does not require `apps/*`, `packages/*`, or child
+`monorepo.toml` files. The root project is represented as one package, so its
+planned tasks are `my-project:build` and `my-project:test`. Invoke commands
+from the project root or a nested directory such as `src/`; task `cwd` values
+remain relative to the project root.
+
+```bash
+monorelease doctor
+monorelease ci
+```
+
+To scaffold a standalone project, provide its initial build command. Repeat
+`--command` once per argument:
+
+```bash
+monorelease init --standalone \
+  --command cargo --command build
+```
+
+For a monorepo, create a root workspace instead:
 
 ```bash
 monorelease init .

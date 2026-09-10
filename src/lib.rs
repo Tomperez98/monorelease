@@ -26,7 +26,7 @@ pub use commands::ci::{
     run_pipeline_with_jobs,
 };
 pub use commands::doctor::{DoctorError, doctor};
-pub use commands::init::{InitError, init};
+pub use commands::init::{InitError, init, init_standalone};
 pub use config::{
     CONFIG_FILE_NAME, MonorepoConfig, PackageConfig, PipelineConfig, TaskConfig,
     WORKSPACE_PACKAGE_NAME, WorkspaceConfig, config_path, render_config,

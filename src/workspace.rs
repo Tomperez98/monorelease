@@ -8,10 +8,10 @@ use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 use crate::config::{
-    PackageConfig, PipelineConfig, TaskConfig, WORKSPACE_PACKAGE_NAME, config_path,
+    MonorepoConfig, PackageConfig, PipelineConfig, TaskConfig, WORKSPACE_PACKAGE_NAME, config_path,
     validate_process_value,
 };
-use crate::discovery::{expand_member_pattern, find_root, read_manifest};
+use crate::discovery::{RootKind, expand_member_pattern, find_root, read_manifest};
 
 /// A validated package in a workspace.
 #[derive(Debug, Clone)]
@@ -28,7 +28,13 @@ pub struct TaskNode {
     pub task: String,
 }
 
-/// A complete, validated workspace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScopeKind {
+    Workspace,
+    Standalone,
+}
+
+/// A complete, validated execution scope.
 #[derive(Debug, Clone)]
 pub struct Workspace {
     pub root: PathBuf,
@@ -37,6 +43,7 @@ pub struct Workspace {
     pub pipelines: BTreeMap<String, PipelineConfig>,
     pub workspace_tasks: BTreeMap<String, TaskConfig>,
     pub packages: BTreeMap<String, Package>,
+    kind: ScopeKind,
 }
 
 /// One executable task in a deterministic task-DAG plan.
@@ -121,7 +128,13 @@ impl PlannedTask {
 impl Workspace {
     /// Find and load the root workspace at `start` or one of its ancestors.
     pub fn load(start: &Path) -> Result<Self, WorkspaceError> {
-        let (root, root_config) = find_root(start)?;
+        let discovered = find_root(start)?;
+        let root = discovered.root;
+        let root_config = discovered.config;
+        if discovered.kind == RootKind::Standalone {
+            return Self::load_standalone(root, root_config);
+        }
+
         let workspace_config =
             root_config
                 .workspace
@@ -264,13 +277,139 @@ impl Workspace {
             pipelines: root_config.pipelines,
             workspace_tasks: root_config.tasks,
             packages,
+            kind: ScopeKind::Workspace,
         };
         workspace.validate_graph()?;
         let pipeline_names = workspace.pipelines.keys().cloned().collect::<Vec<_>>();
         for pipeline_name in pipeline_names {
             workspace.plan(None, Some(&pipeline_name), &[])?;
         }
+        workspace.assert_invariants();
         Ok(workspace)
+    }
+
+    fn load_standalone(root: PathBuf, root_config: MonorepoConfig) -> Result<Self, WorkspaceError> {
+        let package_config =
+            root_config
+                .package
+                .ok_or_else(|| WorkspaceError::InvalidManifest {
+                    path: config_path(&root),
+                    message: "standalone manifests require [package]".to_owned(),
+                })?;
+
+        validate_identifier(&config_path(&root), "package name", &package_config.name)?;
+        if package_config.name == WORKSPACE_PACKAGE_NAME {
+            return Err(WorkspaceError::InvalidManifest {
+                path: config_path(&root),
+                message: format!(
+                    "package name '{}' is reserved for workspace tasks",
+                    WORKSPACE_PACKAGE_NAME
+                ),
+            });
+        }
+        for pipeline_name in root_config.pipelines.keys() {
+            validate_identifier(&config_path(&root), "pipeline name", pipeline_name)?;
+        }
+        for (pipeline_name, pipeline) in &root_config.pipelines {
+            if pipeline.tasks.is_empty() {
+                return Err(WorkspaceError::InvalidWorkspace {
+                    message: format!("pipeline '{pipeline_name}' has no tasks"),
+                });
+            }
+            for task_name in &pipeline.tasks {
+                validate_task_reference(task_name).map_err(|message| {
+                    WorkspaceError::InvalidManifest {
+                        path: config_path(&root),
+                        message: format!("pipeline '{pipeline_name}': {message}"),
+                    }
+                })?;
+            }
+        }
+        if root_config.pipelines.is_empty() {
+            return Err(WorkspaceError::InvalidWorkspace {
+                message: "standalone project must define at least one pipeline".to_owned(),
+            });
+        }
+        if !root_config.pipelines.contains_key("ci") {
+            return Err(WorkspaceError::UnknownPipeline {
+                name: "ci".to_owned(),
+            });
+        }
+        validate_package_config(
+            &config_path(&root),
+            &root,
+            &package_config,
+            &root_config.tasks,
+        )?;
+
+        let package = Package::from_config(root.clone(), package_config, root_config.tasks);
+        let package_name = package.name.clone();
+        let workspace = Self {
+            root,
+            name: package_name.clone(),
+            default_pipeline: "ci".to_owned(),
+            pipelines: root_config.pipelines,
+            workspace_tasks: BTreeMap::new(),
+            packages: BTreeMap::from([(package_name, package)]),
+            kind: ScopeKind::Standalone,
+        };
+        workspace.validate_graph()?;
+        let pipeline_names = workspace.pipelines.keys().cloned().collect::<Vec<_>>();
+        for pipeline_name in pipeline_names {
+            workspace.plan(None, Some(&pipeline_name), &[])?;
+        }
+        workspace.assert_invariants();
+        Ok(workspace)
+    }
+
+    fn assert_invariants(&self) {
+        assert!(self.root.is_absolute(), "workspace root must be absolute");
+        assert!(self.root.is_dir(), "workspace root must be a directory");
+        assert!(!self.name.is_empty(), "workspace name must not be empty");
+        assert!(
+            self.pipelines.contains_key(&self.default_pipeline),
+            "default pipeline must exist"
+        );
+
+        for package in self.packages.values() {
+            assert!(!package.name.is_empty(), "package name must not be empty");
+            assert!(
+                package.path.starts_with(&self.root),
+                "package path must remain inside the workspace root"
+            );
+            assert!(package.path.is_absolute(), "package path must be absolute");
+        }
+
+        match self.kind {
+            ScopeKind::Standalone => {
+                assert_eq!(
+                    self.packages.len(),
+                    1,
+                    "standalone scope must have one package"
+                );
+                let package = self
+                    .packages
+                    .values()
+                    .next()
+                    .expect("singleton package exists");
+                assert_eq!(
+                    package.path, self.root,
+                    "standalone package must be rooted at scope root"
+                );
+                assert!(
+                    self.workspace_tasks.is_empty(),
+                    "standalone scope has no workspace tasks"
+                );
+            }
+            ScopeKind::Workspace => {
+                assert!(
+                    self.packages
+                        .values()
+                        .all(|package| package.name != WORKSPACE_PACKAGE_NAME),
+                    "workspace namespace cannot be a real package"
+                );
+            }
+        }
     }
 
     /// Produce a dependency-first task plan.
@@ -340,10 +479,16 @@ impl Workspace {
             self.visit_task(&root, &mut state, &mut stack, &mut ordered_nodes)?;
         }
 
-        ordered_nodes
-            .into_iter()
-            .map(|node| self.planned_task(node))
-            .collect()
+        let mut planned = Vec::with_capacity(ordered_nodes.len());
+        let mut planned_nodes = BTreeSet::new();
+        for node in ordered_nodes {
+            assert!(
+                planned_nodes.insert(node.clone()),
+                "task planner must not emit duplicate task nodes"
+            );
+            planned.push(self.planned_task(node)?);
+        }
+        Ok(planned)
     }
 
     /// Return graph edges for the selected pipeline, using the same plan as execution.
@@ -408,7 +553,7 @@ impl Workspace {
                 let start = stack
                     .iter()
                     .position(|current| current == node)
-                    .unwrap_or(0);
+                    .expect("visiting task must be present on the DFS stack");
                 let mut path = stack[start..].to_vec();
                 path.push(node.clone());
                 return Err(WorkspaceError::TaskCycle { path });
@@ -477,8 +622,7 @@ impl Workspace {
             .iter()
             .map(|dependency| self.resolve_task_ref(&node, dependency))
             .collect::<Result<Vec<_>, _>>()?;
-
-        Ok(PlannedTask {
+        let planned = PlannedTask {
             package: package_name.to_owned(),
             package_path: package_path.clone(),
             task: node.task,
@@ -492,7 +636,28 @@ impl Workspace {
             timeout: Duration::from_secs(task.timeout_seconds),
             resource_group: task.resource_group.clone(),
             depends_on,
-        })
+        };
+        assert!(
+            !planned.command.is_empty(),
+            "validated planned task command must not be empty"
+        );
+        assert!(
+            planned.package_path.starts_with(&self.root),
+            "planned task package must remain inside the workspace root"
+        );
+        assert!(
+            planned.cwd.is_absolute() && planned.cwd.starts_with(&planned.package_path),
+            "planned task cwd must be absolute and package-contained"
+        );
+        assert!(
+            planned.cwd.is_dir(),
+            "validated planned task cwd must remain a directory"
+        );
+        assert!(
+            planned.timeout > Duration::ZERO,
+            "validated planned task timeout must be positive"
+        );
+        Ok(planned)
     }
 
     fn task_config(&self, node: &TaskNode) -> Result<&TaskConfig, WorkspaceError> {
@@ -905,6 +1070,93 @@ mod tests {
         )
         .expect("write root manifest");
         temp.path().to_path_buf()
+    }
+
+    fn standalone_root(temp: &TempDir) -> PathBuf {
+        fs::write(
+            config_path(temp.path()),
+            "[package]\nname = \"app\"\n\n[pipelines.ci]\ntasks = [\"build\", \"test\"]\n\n[tasks.build]\ncommand = [\"echo\", \"build\"]\n\n[tasks.test]\ncommand = [\"echo\", \"test\"]\ndepends_on = [\"build\"]\n",
+        )
+        .expect("write standalone manifest");
+        temp.path().to_path_buf()
+    }
+
+    #[test]
+    fn loads_a_standalone_project_as_one_package() {
+        let temp = TempDir::new();
+        let root = standalone_root(&temp);
+        let nested = root.join("src");
+        fs::create_dir_all(&nested).expect("create nested source directory");
+
+        let scope = Workspace::load(&nested).expect("standalone project loads");
+
+        assert_eq!(scope.name, "app");
+        assert_eq!(scope.packages.len(), 1);
+        assert_eq!(scope.packages["app"].path, fs::canonicalize(root).unwrap());
+        assert!(scope.workspace_tasks.is_empty());
+    }
+
+    #[test]
+    fn workspace_root_wins_when_loaded_from_a_package_directory() {
+        let temp = TempDir::new();
+        let root = root_with_members(&temp, "\"packages/*\"");
+        let package = root.join("packages/app");
+        fs::create_dir_all(package.join("src")).expect("create package source directory");
+        fs::write(
+            config_path(&package),
+            "[package]\nname = \"app\"\n\n[tasks.build]\ncommand = [\"echo\", \"build\"]\n",
+        )
+        .expect("write package manifest");
+
+        let scope = Workspace::load(package.join("src").as_path())
+            .expect("workspace root is discovered from a package directory");
+
+        assert_eq!(scope.name, "test");
+        assert_eq!(scope.packages.len(), 1);
+        assert_eq!(
+            scope.packages["app"].path,
+            fs::canonicalize(package).unwrap()
+        );
+    }
+
+    #[test]
+    fn plans_standalone_tasks_as_package_tasks_in_dependency_order() {
+        let temp = TempDir::new();
+        let root = standalone_root(&temp);
+        let scope = Workspace::load(&root).expect("standalone project loads");
+
+        let plan = scope
+            .plan(None, None, &[])
+            .expect("standalone plan succeeds");
+
+        assert_eq!(
+            plan.iter().map(|task| task.node()).collect::<Vec<_>>(),
+            vec![
+                TaskNode {
+                    package: "app".to_owned(),
+                    task: "build".to_owned(),
+                },
+                TaskNode {
+                    package: "app".to_owned(),
+                    task: "test".to_owned(),
+                },
+            ]
+        );
+        assert!(plan.iter().all(|task| task.package() == "app"));
+    }
+
+    #[test]
+    fn rejects_a_manifest_that_declares_both_root_modes() {
+        let temp = TempDir::new();
+        fs::write(
+            config_path(temp.path()),
+            "[workspace]\nname = \"repo\"\n\n[package]\nname = \"app\"\n",
+        )
+        .expect("write ambiguous manifest");
+
+        let error = Workspace::load(temp.path()).expect_err("ambiguous root must fail");
+
+        assert!(error.to_string().contains("both [workspace] and [package]"));
     }
 
     #[test]

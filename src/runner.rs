@@ -50,6 +50,8 @@ impl Runner {
                 })?;
         assert!(planned.timeout() > Duration::ZERO);
         assert!(planned.package_path().starts_with(workspace_root));
+        assert!(planned.cwd().is_absolute());
+        assert!(planned.cwd().starts_with(planned.package_path()));
 
         let started = Instant::now();
         let mut child = Command::new(program)

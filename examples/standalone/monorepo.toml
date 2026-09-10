@@ -1,0 +1,14 @@
+[package]
+name = "standalone-demo"
+
+[pipelines.ci]
+tasks = ["build", "test"]
+
+[tasks.build]
+command = ["echo", "[standalone] build"]
+cwd = "src"
+
+[tasks.test]
+command = ["echo", "[standalone] test"]
+cwd = "src"
+depends_on = ["build"]

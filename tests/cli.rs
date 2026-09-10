@@ -56,6 +56,45 @@ fn init_succeeds_with_exit_code_zero() {
 }
 
 #[test]
+fn standalone_init_creates_a_valid_single_package_project() {
+    let temp = TempDir::new("standalone-init");
+
+    let output = monore(
+        &[
+            "init",
+            "--standalone",
+            "--command",
+            "echo",
+            "--command",
+            "build",
+        ],
+        temp.path(),
+    );
+
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    let manifest = fs::read_to_string(temp.path().join("monorepo.toml"))
+        .expect("standalone manifest is readable");
+    assert!(manifest.contains("[package]"));
+    assert!(!manifest.contains("[workspace]"));
+    assert!(!temp.path().join("apps").exists());
+    assert!(!temp.path().join("packages").exists());
+
+    let doctor = monore(&["doctor"], temp.path());
+    assert!(doctor.status.success(), "stderr: {}", stderr(&doctor));
+}
+
+#[test]
+fn standalone_init_requires_a_command() {
+    let temp = TempDir::new("standalone-init-missing-command");
+
+    let output = monore(&["init", "--standalone"], temp.path());
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stderr(&output).contains("requires a non-empty --command"));
+    assert!(!temp.path().join("monorepo.toml").exists());
+}
+
+#[test]
 fn cache_clean_removes_local_entries_without_removing_the_workspace() {
     let temp = TempDir::new("cache-clean");
     assert!(monore(&["init"], temp.path()).status.success());
@@ -100,6 +139,28 @@ fn doctor_accepts_the_manifest_created_by_init() {
 
     assert!(output.status.success(), "stderr: {}", stderr(&output));
     assert!(stdout(&output).contains("checked"));
+}
+
+#[test]
+fn standalone_project_runs_without_workspace_members() {
+    let temp = TempDir::new("standalone");
+    fs::create_dir_all(temp.path().join("src")).expect("create source directory");
+    fs::write(
+        temp.path().join("monorepo.toml"),
+        "[package]\nname = \"app\"\n\n[pipelines.ci]\ntasks = [\"build\", \"test\"]\n\n[tasks.build]\ncommand = [\"echo\", \"building\"]\n\n[tasks.test]\ncommand = [\"echo\", \"testing\"]\ndepends_on = [\"build\"]\n",
+    )
+    .expect("write standalone manifest");
+
+    let plan = monore(&["plan"], &temp.path().join("src"));
+
+    assert!(plan.status.success(), "stderr: {}", stderr(&plan));
+    let plan_output = stdout(&plan);
+    assert!(plan_output.find("app:build").unwrap() < plan_output.find("app:test").unwrap());
+    assert!(!plan_output.contains("workspace:build"));
+
+    let run = monore(&["ci"], temp.path());
+    assert!(run.status.success(), "stderr: {}", stderr(&run));
+    assert!(stdout(&run).contains("summary: 2 completed"));
 }
 
 #[test]

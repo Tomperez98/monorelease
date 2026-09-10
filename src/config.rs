@@ -39,6 +39,57 @@ impl MonorepoConfig {
         }
     }
 
+    /// A valid standalone project config using one caller-supplied command.
+    pub fn standalone_template(name: String, command: Vec<String>) -> Self {
+        assert!(
+            !name.is_empty(),
+            "standalone package name must not be empty"
+        );
+        assert!(
+            !name.contains(':'),
+            "standalone package name cannot contain ':'"
+        );
+        assert!(
+            !command.is_empty(),
+            "standalone build command must not be empty"
+        );
+        assert!(
+            !command[0].is_empty(),
+            "standalone build command executable must not be empty"
+        );
+
+        let mut tasks = BTreeMap::new();
+        tasks.insert(
+            "build".to_owned(),
+            TaskConfig {
+                command,
+                depends_on: Vec::new(),
+                cwd: None,
+                env: BTreeMap::new(),
+                cache: false,
+                inputs: Vec::new(),
+                outputs: Vec::new(),
+                cache_env: Vec::new(),
+                timeout_seconds: default_timeout_seconds(),
+                resource_group: None,
+            },
+        );
+        let mut pipelines = BTreeMap::new();
+        pipelines.insert(
+            "ci".to_owned(),
+            PipelineConfig {
+                tasks: vec!["build".to_owned()],
+            },
+        );
+
+        Self {
+            workspace: None,
+            package: Some(PackageConfig { name }),
+            tasks,
+            pipelines,
+        }
+    }
+
     /// Parse a manifest from TOML.
     pub fn parse(contents: &str) -> Result<Self, toml::de::Error> {
         toml::from_str(contents)
@@ -156,6 +207,18 @@ mod tests {
         let parsed = MonorepoConfig::parse(&rendered).expect("rendered config parses");
 
         assert_eq!(parsed, MonorepoConfig::template());
+    }
+
+    #[test]
+    fn standalone_template_round_trips_through_toml() {
+        let config = MonorepoConfig::standalone_template(
+            "app".to_owned(),
+            vec!["cargo".to_owned(), "build".to_owned()],
+        );
+        let rendered = render_config(&config);
+        let parsed = MonorepoConfig::parse(&rendered).expect("standalone config parses");
+
+        assert_eq!(parsed, config);
     }
 
     #[test]
