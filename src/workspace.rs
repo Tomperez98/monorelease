@@ -60,6 +60,7 @@ pub struct PlannedTask {
     outputs: Vec<String>,
     cache_env: Vec<String>,
     timeout: Duration,
+    max_output_bytes: usize,
     resource_group: Option<String>,
     depends_on: Vec<TaskNode>,
 }
@@ -114,6 +115,10 @@ impl PlannedTask {
 
     pub fn timeout(&self) -> Duration {
         self.timeout
+    }
+
+    pub fn max_output_bytes(&self) -> usize {
+        self.max_output_bytes
     }
 
     pub fn resource_group(&self) -> Option<&str> {
@@ -284,10 +289,7 @@ impl Workspace {
             kind: ScopeKind::Workspace,
         };
         workspace.validate_graph()?;
-        let pipeline_names = workspace.pipelines.keys().cloned().collect::<Vec<_>>();
-        for pipeline_name in pipeline_names {
-            workspace.plan(None, Some(&pipeline_name), &[])?;
-        }
+        workspace.validate_pipelines()?;
         workspace.assert_invariants();
         Ok(workspace)
     }
@@ -359,10 +361,7 @@ impl Workspace {
             kind: ScopeKind::Standalone,
         };
         workspace.validate_graph()?;
-        let pipeline_names = workspace.pipelines.keys().cloned().collect::<Vec<_>>();
-        for pipeline_name in pipeline_names {
-            workspace.plan(None, Some(&pipeline_name), &[])?;
-        }
+        workspace.validate_pipelines()?;
         workspace.assert_invariants();
         Ok(workspace)
     }
@@ -436,6 +435,28 @@ impl Workspace {
         pipeline: Option<&str>,
         requested_tasks: &[String],
     ) -> Result<Vec<PlannedTask>, WorkspaceError> {
+        let ordered_nodes = self.plan_nodes(selected_package, pipeline, requested_tasks)?;
+        let mut planned = Vec::with_capacity(ordered_nodes.len());
+        for node in ordered_nodes {
+            planned.push(self.planned_task(node)?);
+        }
+        Ok(planned)
+    }
+
+    /// Resolve the dependency-first task order for a selection without touching
+    /// the filesystem.
+    ///
+    /// This is the whole graph half of [`Workspace::plan`]: it reports unknown
+    /// pipelines, packages, tasks, and cycles, while leaving each task's
+    /// working directory unresolved. Load-time validation runs it for every
+    /// declared pipeline, so a workspace with many pipelines pays no repeated
+    /// path resolution to prove itself healthy.
+    fn plan_nodes(
+        &self,
+        selected_package: Option<&str>,
+        pipeline: Option<&str>,
+        requested_tasks: &[String],
+    ) -> Result<Vec<TaskNode>, WorkspaceError> {
         let task_names = if requested_tasks.is_empty() {
             let pipeline_name = pipeline.unwrap_or(&self.default_pipeline);
             &self
@@ -493,16 +514,22 @@ impl Workspace {
             self.visit_task(&root, &mut state, &mut stack, &mut ordered_nodes)?;
         }
 
-        let mut planned = Vec::with_capacity(ordered_nodes.len());
         let mut planned_nodes = BTreeSet::new();
-        for node in ordered_nodes {
+        for node in &ordered_nodes {
             assert!(
                 planned_nodes.insert(node.clone()),
                 "task planner must not emit duplicate task nodes"
             );
-            planned.push(self.planned_task(node)?);
         }
-        Ok(planned)
+        Ok(ordered_nodes)
+    }
+
+    /// Report every graph defect in every declared pipeline.
+    fn validate_pipelines(&self) -> Result<(), WorkspaceError> {
+        for pipeline_name in self.pipelines.keys() {
+            self.plan_nodes(None, Some(pipeline_name), &[])?;
+        }
+        Ok(())
     }
 
     /// Return graph edges for the selected pipeline, using the same plan as execution.
@@ -512,11 +539,19 @@ impl Workspace {
         pipeline: Option<&str>,
         requested_tasks: &[String],
     ) -> Result<Vec<(TaskNode, Vec<TaskNode>)>, WorkspaceError> {
-        Ok(self
-            .plan(selected_package, pipeline, requested_tasks)?
+        let ordered_nodes = self.plan_nodes(selected_package, pipeline, requested_tasks)?;
+        ordered_nodes
             .into_iter()
-            .map(|task| (task.node(), task.depends_on))
-            .collect())
+            .map(|node| {
+                let dependencies = self
+                    .task_config(&node)?
+                    .depends_on
+                    .iter()
+                    .map(|dependency| self.resolve_task_ref(&node, dependency))
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok((node, dependencies))
+            })
+            .collect()
     }
 
     fn validate_graph(&self) -> Result<(), WorkspaceError> {
@@ -649,6 +684,7 @@ impl Workspace {
             .iter()
             .map(|dependency| self.resolve_task_ref(&node, dependency))
             .collect::<Result<Vec<_>, _>>()?;
+        let task_name = node.task.clone();
         let planned = PlannedTask {
             package: package_name.to_owned(),
             package_path: package_path.clone(),
@@ -661,6 +697,13 @@ impl Workspace {
             outputs: task.outputs.clone(),
             cache_env: task.cache_env.clone(),
             timeout: Duration::from_secs(task.timeout_seconds),
+            max_output_bytes: usize::try_from(task.max_output_bytes).map_err(|_| {
+                WorkspaceError::InvalidTask {
+                    package: package_name.to_owned(),
+                    task: task_name.clone(),
+                    message: "max_output_bytes does not fit in the platform usize".to_owned(),
+                }
+            })?,
             resource_group: task.resource_group.clone(),
             depends_on,
         };
@@ -855,6 +898,20 @@ fn validate_package_config(
                 message: "timeout_seconds must be greater than zero".to_owned(),
             });
         }
+        if task.max_output_bytes == 0 {
+            return Err(WorkspaceError::InvalidTask {
+                package: config.name.clone(),
+                task: task_name.clone(),
+                message: "max_output_bytes must be greater than zero".to_owned(),
+            });
+        }
+        if usize::try_from(task.max_output_bytes).is_err() {
+            return Err(WorkspaceError::InvalidTask {
+                package: config.name.clone(),
+                task: task_name.clone(),
+                message: "max_output_bytes does not fit in the platform usize".to_owned(),
+            });
+        }
         if let Some(resource_group) = task.resource_group.as_deref() {
             if resource_group.is_empty() || resource_group.contains(':') {
                 return Err(WorkspaceError::InvalidTask {
@@ -956,7 +1013,11 @@ fn closest_name<'a>(
         .filter(|candidate| candidate.as_str() != name)
         .map(|candidate| (edit_distance(name, candidate), candidate))
         .filter(|(distance, _)| *distance <= max_distance)
-        .min_by_key(|(distance, candidate)| (*distance, (*candidate).clone()))
+        .min_by(|(left_distance, left), (right_distance, right)| {
+            left_distance
+                .cmp(right_distance)
+                .then_with(|| left.cmp(right))
+        })
         .map(|(_, candidate)| candidate.clone())
 }
 
@@ -1448,6 +1509,19 @@ mod tests {
     }
 
     #[test]
+    fn rejects_zero_output_limit() {
+        let temp = TempDir::new();
+        let root = root_with_members(&temp, "\"packages/*\"");
+        write_manifest(
+            &root.join("packages/app"),
+            "[package]\nname = \"app\"\n\n[tasks.build]\ncommand = [\"echo\", \"app\"]\nmax_output_bytes = 0\n",
+        );
+
+        let error = Workspace::load(&root).expect_err("zero output limit must be rejected");
+        assert!(error.to_string().contains("max_output_bytes"));
+    }
+
+    #[test]
     fn rejects_empty_resource_group() {
         let temp = TempDir::new();
         let root = root_with_members(&temp, "\"packages/*\"");
@@ -1476,6 +1550,24 @@ mod tests {
                 .to_string()
                 .contains("app:build -> app:test -> app:build")
         );
+    }
+
+    #[test]
+    fn rejects_a_broken_task_reference_in_a_non_default_pipeline() {
+        let temp = TempDir::new();
+        let root = root_with_members(&temp, "\"packages/*\"");
+        fs::write(
+            config_path(&root),
+            "[workspace]\nname = \"test\"\nmembers = [\"packages/*\"]\ndefault_pipeline = \"ci\"\n\n[pipelines.ci]\ntasks = [\"build\"]\n\n[pipelines.nightly]\ntasks = [\"missing\"]\n",
+        )
+        .expect("rewrite root manifest");
+        write_manifest(
+            &root.join("packages/app"),
+            "[package]\nname = \"app\"\n\n[tasks.build]\ncommand = [\"echo\", \"app\"]\n",
+        );
+
+        let error = Workspace::load(&root).expect_err("every pipeline is validated");
+        assert!(matches!(error, WorkspaceError::MissingTask { .. }));
     }
 
     #[test]

@@ -1,12 +1,14 @@
 //! Dependency-aware bounded task scheduling.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::error::Error as StdError;
 use std::fmt;
+use std::path::PathBuf;
 use std::sync::mpsc;
-use std::thread::{self, JoinHandle};
+use std::sync::{Arc, Mutex};
+use std::thread;
 
-use crate::cache::{CacheError, CacheMode, CacheStore};
+use crate::cache::{CacheError, CacheMode, CacheSession, CacheStore};
 use crate::output::OutputSink;
 use crate::runner::{Runner, RunnerError, TaskResult};
 use crate::workspace::{PlannedTask, TaskNode, Workspace};
@@ -29,7 +31,7 @@ pub(crate) fn execute_plan(
     for task in plan {
         let node = task.node();
         assert!(
-            tasks.insert(node, task.clone()).is_none(),
+            tasks.insert(node, Arc::new(task.clone())).is_none(),
             "validated plan contains duplicate task nodes"
         );
     }
@@ -57,8 +59,31 @@ pub(crate) fn execute_plan(
         .iter()
         .filter_map(|(node, count)| (*count == 0).then_some(node.clone()))
         .collect::<BTreeSet<_>>();
-    let (sender, receiver) = mpsc::channel::<(TaskNode, Result<TaskResult, RunnerError>)>();
-    let mut active = HashMap::<TaskNode, JoinHandle<()>>::new();
+    let root = Arc::new(workspace.root.clone());
+    let cache = CacheStore::new(&root);
+    let cache_session =
+        if !matches!(cache_mode, CacheMode::NoCache) && plan.iter().any(PlannedTask::cache) {
+            Some(Arc::new(
+                cache.prepare(&root, plan).map_err(SchedulerError::Cache)?,
+            ))
+        } else {
+            None
+        };
+    let force = matches!(cache_mode, CacheMode::Force);
+    let (sender, receiver) = mpsc::channel::<(TaskNode, WorkerReport)>();
+    let (job_sender, job_receiver) = mpsc::channel::<WorkerJob>();
+    let shared_job_receiver = Arc::new(Mutex::new(job_receiver));
+    let worker_count = jobs.min(plan.len());
+    let mut workers = Vec::with_capacity(worker_count);
+    for _ in 0..worker_count {
+        let job_receiver = Arc::clone(&shared_job_receiver);
+        let report_sender = sender.clone();
+        workers.push(thread::spawn(move || {
+            worker_loop(job_receiver, report_sender)
+        }));
+    }
+    drop(sender);
+    let mut active = HashSet::<TaskNode>::new();
     let mut active_groups = HashSet::<String>::new();
     let mut results = BTreeMap::<TaskNode, Result<TaskResult, RunnerError>>::new();
     let mut task_keys = BTreeMap::<TaskNode, String>::new();
@@ -66,29 +91,17 @@ pub(crate) fn execute_plan(
     let mut cache_error = None;
     let mut output_error = None;
     let mut stopping = false;
-    let root = workspace.root.clone();
-    let cache = CacheStore::new(&root);
 
     while !active.is_empty() || (!stopping && !ready.is_empty()) {
         assert!(active.len() <= jobs, "scheduler exceeded its worker limit");
         while !stopping && active.len() < jobs {
-            let Some(node) = ready.iter().find_map(|node| {
-                let task = tasks
-                    .get(node)
-                    .expect("ready task must exist in the validated plan");
-                let available = match task.resource_group() {
-                    Some(group) => !active_groups.contains(group),
-                    None => true,
-                };
-                available.then_some(node.clone())
-            }) else {
+            let Some(node) = next_ready(&ready, &tasks, &active_groups) else {
                 break;
             };
             ready.remove(&node);
             let task = tasks
                 .get(&node)
-                .expect("ready task must exist in the validated plan")
-                .clone();
+                .expect("ready task must exist in the validated plan");
             if let Err(error) = output.present_start(&node) {
                 output_error = Some(error);
                 stopping = true;
@@ -100,9 +113,8 @@ pub(crate) fn execute_plan(
                 .all(|dependency| cacheable.get(dependency).copied().unwrap_or(false));
             let can_cache =
                 task.cache() && dependencies_cacheable && !matches!(cache_mode, CacheMode::NoCache);
-            let key = if can_cache {
-                let dependency_keys = task
-                    .depends_on()
+            let dependency_keys = if can_cache {
+                task.depends_on()
                     .iter()
                     .map(|dependency| {
                         task_keys
@@ -110,68 +122,34 @@ pub(crate) fn execute_plan(
                             .expect("cacheable dependency must have a task key")
                             .clone()
                     })
-                    .collect::<Vec<_>>();
-                match cache.task_key(&root, &task, &dependency_keys) {
-                    Ok(key) => Some(key),
-                    Err(error) => {
-                        cache_error = Some(error);
-                        stopping = true;
-                        None
-                    }
-                }
+                    .collect::<Vec<_>>()
             } else {
-                None
+                Vec::new()
             };
-            if stopping {
-                break;
-            }
             cacheable.insert(node.clone(), can_cache);
-            if let Some(key) = key.as_ref() {
-                task_keys.insert(node.clone(), key.clone());
+            if let Some(group) = task.resource_group() {
+                active_groups.insert(group.to_owned());
             }
 
-            if let Some(key) = key {
-                if matches!(cache_mode, CacheMode::Force) {
-                    // Force still refreshes successful cache entries after execution.
-                } else {
-                    match cache.lookup(&task, &key) {
-                        Ok(Some(result)) => {
-                            let sender = sender.clone();
-                            let worker_node = node.clone();
-                            let handle = thread::spawn(move || {
-                                sender
-                                .send((worker_node, Ok(result)))
-                                .expect("scheduler receiver remains alive while cache results are processed");
-                            });
-                            active.insert(node, handle);
-                            assert!(active.len() <= jobs, "scheduler exceeded its worker limit");
-                            continue;
-                        }
-                        Ok(None) => {}
-                        Err(error) => {
-                            cache_error = Some(error);
-                            stopping = true;
-                            break;
-                        }
-                    }
-                }
-            }
-
-            let resource_group = task.resource_group().map(str::to_owned);
-            let sender = sender.clone();
-            let runner = runner.clone();
-            let root = root.clone();
-            let worker_node = node.clone();
-            let handle = thread::spawn(move || {
-                let result = runner.run(&root, &task);
-                sender
-                    .send((worker_node, result))
-                    .expect("scheduler receiver remains alive while workers run");
-            });
-            if let Some(group) = resource_group {
-                active_groups.insert(group);
-            }
-            active.insert(node, handle);
+            // Fingerprinting inputs, replaying a cache hit, and copying
+            // artifacts all happen in the worker. The scheduling loop stays
+            // cheap, so `--jobs` parallelizes the work that costs real time
+            // instead of serializing it behind task dispatch.
+            let task = Arc::clone(task);
+            job_sender
+                .send(WorkerJob {
+                    node: node.clone(),
+                    task: Arc::clone(&task),
+                    cache: cache.clone(),
+                    cache_session: cache_session.clone(),
+                    root: Arc::clone(&root),
+                    can_cache,
+                    force,
+                    dependency_keys,
+                    runner: runner.clone(),
+                })
+                .expect("worker pool remains alive while tasks are dispatched");
+            active.insert(node);
             assert!(active.len() <= jobs, "scheduler exceeded its worker limit");
         }
 
@@ -179,14 +157,13 @@ pub(crate) fn execute_plan(
             if cache_error.is_some() || output_error.is_some() {
                 break;
             }
-            return Err(SchedulerError::NoReadyWork);
+            break;
         }
 
-        let (node, result) = receiver
+        let (node, report) = receiver
             .recv()
             .expect("scheduler workers always send one completion result");
-        let handle = active.remove(&node).expect("completed task must be active");
-        handle.join().expect("task worker panicked");
+        assert!(active.remove(&node), "completed task must be active");
         if let Some(group) = tasks
             .get(&node)
             .expect("completed task must exist in the validated plan")
@@ -195,25 +172,24 @@ pub(crate) fn execute_plan(
             active_groups.remove(group);
         }
 
-        if result.is_ok()
-            && cacheable.get(&node).copied().unwrap_or(false)
-            && !matches!(cache_mode, CacheMode::NoCache)
-        {
-            let key = task_keys
-                .get(&node)
-                .expect("cacheable task must have a task key");
-            if let Ok(task_result) = &result
-                && let Err(error) = cache.store(
-                    tasks
-                        .get(&node)
-                        .expect("completed task must exist in the validated plan"),
-                    key,
-                    task_result,
-                )
-            {
+        let (result, key, store_error) = match report {
+            WorkerReport::Finished {
+                result,
+                key,
+                cache_error,
+            } => (result, key, cache_error),
+            WorkerReport::CacheFailed(error) => {
                 cache_error = Some(error);
                 stopping = true;
+                continue;
             }
+        };
+        if let Some(key) = key {
+            task_keys.insert(node.clone(), key);
+        }
+        if let Some(error) = store_error {
+            cache_error = Some(error);
+            stopping = true;
         }
 
         if result.is_err() || cache_error.is_some() {
@@ -230,6 +206,15 @@ pub(crate) fn execute_plan(
             }
         }
         results.insert(node, result);
+    }
+
+    drop(job_sender);
+    for worker in workers {
+        worker.join().expect("scheduler worker panicked");
+    }
+
+    if active.is_empty() && !stopping && ready.is_empty() && results.len() < plan.len() {
+        return Err(SchedulerError::NoReadyWork);
     }
 
     let mut first_error = None;
@@ -287,6 +272,136 @@ pub(crate) fn execute_plan(
         return Err(SchedulerError::Task(Box::new(error)));
     }
     Ok(summary)
+}
+
+/// Pick the lowest-numbered ready task that no active resource group blocks.
+///
+/// Every ready task is available while no group is held, which is the common
+/// case, so the scan only runs to find work that a held group is holding back.
+fn next_ready(
+    ready: &BTreeSet<TaskNode>,
+    tasks: &BTreeMap<TaskNode, Arc<PlannedTask>>,
+    active_groups: &HashSet<String>,
+) -> Option<TaskNode> {
+    if active_groups.is_empty() {
+        return ready.iter().next().cloned();
+    }
+    ready.iter().find_map(|node| {
+        let task = tasks
+            .get(node)
+            .expect("ready task must exist in the validated plan");
+        let available = match task.resource_group() {
+            Some(group) => !active_groups.contains(group),
+            None => true,
+        };
+        available.then_some(node.clone())
+    })
+}
+
+struct WorkerJob {
+    node: TaskNode,
+    task: Arc<PlannedTask>,
+    cache: CacheStore,
+    cache_session: Option<Arc<CacheSession>>,
+    root: Arc<PathBuf>,
+    can_cache: bool,
+    force: bool,
+    dependency_keys: Vec<String>,
+    runner: Runner,
+}
+
+fn worker_loop(
+    receiver: Arc<Mutex<mpsc::Receiver<WorkerJob>>>,
+    sender: mpsc::Sender<(TaskNode, WorkerReport)>,
+) {
+    loop {
+        let job = match receiver
+            .lock()
+            .expect("worker queue lock is not poisoned")
+            .recv()
+        {
+            Ok(job) => job,
+            Err(_) => break,
+        };
+        let node = job.node.clone();
+        let report = execute_task(job);
+        if sender.send((node, report)).is_err() {
+            break;
+        }
+    }
+}
+
+/// One worker's whole lifecycle: fingerprint inputs, replay a cache hit, run
+/// the task, and refresh the cache entry.
+fn execute_task(job: WorkerJob) -> WorkerReport {
+    let WorkerJob {
+        node: _,
+        task,
+        cache,
+        cache_session,
+        root,
+        can_cache,
+        force,
+        dependency_keys,
+        runner,
+    } = job;
+    let mut key = None;
+    if can_cache {
+        let session = cache_session.expect("cacheable tasks require a prepared cache session");
+        match cache.task_key_with_session(session.as_ref(), &root, &task, &dependency_keys) {
+            Ok(computed) => key = Some(computed),
+            Err(error) => return WorkerReport::CacheFailed(error),
+        }
+    }
+
+    // A hit replays the stored result; `Force` deliberately skips this so the
+    // task runs and refreshes its entry.
+    let replayed = match (key.as_deref(), can_cache && !force) {
+        (Some(computed), true) => match cache.lookup(&task, computed) {
+            Ok(hit) => hit,
+            Err(error) => return WorkerReport::CacheFailed(error),
+        },
+        _ => None,
+    };
+    if let Some(result) = replayed {
+        return WorkerReport::Finished {
+            result: Ok(result),
+            key,
+            cache_error: None,
+        };
+    }
+
+    match runner.run(&root, &task) {
+        Ok(result) => {
+            let cache_error = key
+                .as_deref()
+                .and_then(|computed| cache.store(&task, computed, &result).err());
+            WorkerReport::Finished {
+                result: Ok(result),
+                key,
+                cache_error,
+            }
+        }
+        Err(error) => WorkerReport::Finished {
+            result: Err(error),
+            key,
+            cache_error: None,
+        },
+    }
+}
+
+/// One worker's report to the scheduling loop.
+enum WorkerReport {
+    /// The worker finished, with either a task result or a runner failure.
+    /// `cache_error` records a successful run whose cache entry could not be
+    /// written; it is `None` when `result` itself is an error.
+    Finished {
+        result: Result<TaskResult, RunnerError>,
+        key: Option<String>,
+        cache_error: Option<CacheError>,
+    },
+    /// Cache state could not be computed or read, so the task never started.
+    CacheFailed(CacheError),
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]

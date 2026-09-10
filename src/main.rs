@@ -13,7 +13,7 @@ use monorelease::{CacheMode, Error, OutputMode, PipelineExecution};
 #[derive(Parser)]
 #[command(
     name = "monore",
-    version = "0.1.0",
+    version = env!("CARGO_PKG_VERSION"),
     about = "Language agnostic project and monorepo tooling",
     after_help = "Run `monore help <command>` for command details."
 )]
@@ -55,7 +55,7 @@ struct ExecutionOptions {
     #[arg(long, conflicts_with = "no_cache")]
     force: bool,
     /// Maximum number of independent tasks to execute concurrently.
-    #[arg(long, default_value_t = 1)]
+    #[arg(long, default_value_t = default_jobs())]
     jobs: usize,
     /// Output contract to use for task status and grouping.
     #[arg(long, value_enum, default_value = "terminal")]
@@ -123,6 +123,17 @@ enum CacheCommands {
     Clean,
 }
 
+/// Worker count used when `--jobs` is omitted.
+///
+/// `available_parallelism` reports the CPUs this process may actually use, so
+/// cgroup quotas and CPU affinity are respected rather than overwritten by the
+/// physical core count.
+fn default_jobs() -> usize {
+    std::thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(1)
+}
+
 fn main() -> ExitCode {
     let Cli { path, command } = Cli::parse();
 
@@ -158,7 +169,7 @@ fn run(path: PathBuf, command: Option<Commands>) -> Result<String, Error> {
             None,
             &[],
             false,
-            1,
+            default_jobs(),
             CacheMode::ReadWrite,
         )
         .map_err(Error::from),

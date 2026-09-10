@@ -387,7 +387,10 @@ fn ci_reports_failed_task_output_and_context() {
     )
     .expect("write package manifest");
 
-    let output = monore(&["ci"], temp.path());
+    // `--jobs 1` keeps this test about failure blocking: with the default
+    // worker count the independent `api:test` is dispatched before `api:build`
+    // reports its failure, so it would not be counted as blocked.
+    let output = monore(&["ci", "--jobs", "1"], temp.path());
 
     assert_eq!(output.status.code(), Some(1));
     assert!(stderr(&output).contains("boom"));
@@ -425,6 +428,23 @@ fn ci_reports_task_start_progress() {
     assert!(stderr(&output).contains("▶ b:build"));
     assert!(stderr(&output).contains("a:build: completed in "));
     assert!(stderr(&output).contains("b:build: completed in "));
+}
+
+#[cfg(unix)]
+#[test]
+fn jobs_defaults_to_machine_parallelism() {
+    let temp = TempDir::new("jobs-default");
+
+    let output = monore(&["run", "--help"], temp.path());
+
+    let expected = std::thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(1);
+    assert!(
+        stdout(&output).contains(&format!("[default: {expected}]")),
+        "expected the help to report the machine's parallelism: {}",
+        stdout(&output)
+    );
 }
 
 #[test]

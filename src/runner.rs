@@ -5,10 +5,18 @@ use std::fmt;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::workspace::PlannedTask;
+
+/// First wait between child-status polls. Short tasks finish after one or two
+/// of these instead of stalling for a fixed interval.
+const POLL_INTERVAL_START: Duration = Duration::from_millis(1);
+/// Longest wait between polls, so a long task stops waking the process
+/// hundreds of times per second.
+const POLL_INTERVAL_MAX: Duration = Duration::from_millis(50);
 
 /// Captured process output, presented by the scheduler after a task completes.
 #[derive(Debug, Clone, Default)]
@@ -49,6 +57,7 @@ impl Runner {
                     task: planned.task().to_owned(),
                 })?;
         assert!(planned.timeout() > Duration::ZERO);
+        assert!(planned.max_output_bytes() > 0);
         assert!(planned.package_path().starts_with(workspace_root));
         assert!(planned.cwd().is_absolute());
         assert!(planned.cwd().starts_with(planned.package_path()));
@@ -72,10 +81,38 @@ impl Runner {
 
         let stdout = child.stdout.take().expect("stdout was configured as piped");
         let stderr = child.stderr.take().expect("stderr was configured as piped");
-        let stdout_reader = thread::spawn(move || read_stream(stdout));
-        let stderr_reader = thread::spawn(move || read_stream(stderr));
+        let (limit_sender, limit_receiver) = mpsc::channel();
+        let output_limit = planned.max_output_bytes();
+        let stdout_reader = {
+            let limit_sender = limit_sender.clone();
+            thread::spawn(move || read_stream(stdout, output_limit, "stdout", limit_sender))
+        };
+        let stderr_reader =
+            thread::spawn(move || read_stream(stderr, output_limit, "stderr", limit_sender));
 
+        // Poll with exponential backoff capped at the remaining timeout: a
+        // short task is noticed within a millisecond, and a long task costs a
+        // handful of wakeups per second instead of a hundred.
+        let mut poll_interval = POLL_INTERVAL_START;
         let status = loop {
+            if let Ok(stream) = limit_receiver.try_recv() {
+                let _ = child.kill();
+                let _ = child.wait();
+                let joined = join_output(
+                    planned.package(),
+                    planned.task(),
+                    stdout_reader,
+                    stderr_reader,
+                )?;
+                return Err(RunnerError::OutputLimit(Box::new(OutputLimitTask {
+                    package: planned.package().to_owned(),
+                    task: planned.task().to_owned(),
+                    stream,
+                    limit: output_limit,
+                    output: joined.output,
+                    elapsed: started.elapsed(),
+                })));
+            }
             match child.try_wait() {
                 Ok(Some(status)) => break status,
                 Ok(None) if started.elapsed() >= planned.timeout() => {
@@ -86,7 +123,8 @@ impl Runner {
                         planned.task(),
                         stdout_reader,
                         stderr_reader,
-                    )?;
+                    )?
+                    .output;
                     return Err(RunnerError::TimedOut(Box::new(TimedOutTask {
                         package: planned.package().to_owned(),
                         task: planned.task().to_owned(),
@@ -97,7 +135,11 @@ impl Runner {
                         elapsed: started.elapsed(),
                     })));
                 }
-                Ok(None) => thread::sleep(Duration::from_millis(10)),
+                Ok(None) => {
+                    let remaining = planned.timeout().saturating_sub(started.elapsed());
+                    thread::sleep(poll_interval.min(remaining));
+                    poll_interval = (poll_interval * 2).min(POLL_INTERVAL_MAX);
+                }
                 Err(source) => {
                     let _ = child.kill();
                     let _ = child.wait();
@@ -112,13 +154,24 @@ impl Runner {
             }
         };
 
-        let output = join_output(
+        let joined = join_output(
             planned.package(),
             planned.task(),
             stdout_reader,
             stderr_reader,
         )?;
         let elapsed = started.elapsed();
+        if let Some(stream) = joined.exceeded_stream {
+            return Err(RunnerError::OutputLimit(Box::new(OutputLimitTask {
+                package: planned.package().to_owned(),
+                task: planned.task().to_owned(),
+                stream,
+                limit: output_limit,
+                output: joined.output,
+                elapsed,
+            })));
+        }
+        let output = joined.output;
         if !status.success() {
             return Err(RunnerError::Failed(Box::new(FailedTask {
                 package: planned.package().to_owned(),
@@ -139,18 +192,54 @@ impl Runner {
     }
 }
 
-fn read_stream<R: Read>(mut stream: R) -> io::Result<Vec<u8>> {
-    let mut output = Vec::new();
-    stream.read_to_end(&mut output)?;
-    Ok(output)
+struct StreamCapture {
+    bytes: Vec<u8>,
+    exceeded: bool,
+}
+
+struct JoinedOutput {
+    output: CapturedOutput,
+    exceeded_stream: Option<&'static str>,
+}
+
+fn read_stream<R: Read>(
+    mut stream: R,
+    limit: usize,
+    stream_name: &'static str,
+    limit_sender: mpsc::Sender<&'static str>,
+) -> io::Result<StreamCapture> {
+    let mut output = Vec::with_capacity(limit.min(8192));
+    let mut buffer = [0u8; 8192];
+    let mut exceeded = false;
+    loop {
+        let read = stream.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        if exceeded {
+            continue;
+        }
+        let remaining = limit.saturating_sub(output.len());
+        if read > remaining {
+            output.extend_from_slice(&buffer[..remaining]);
+            exceeded = true;
+            let _ = limit_sender.send(stream_name);
+            continue;
+        }
+        output.extend_from_slice(&buffer[..read]);
+    }
+    Ok(StreamCapture {
+        bytes: output,
+        exceeded,
+    })
 }
 
 fn join_output(
     package: &str,
     task: &str,
-    stdout_reader: thread::JoinHandle<io::Result<Vec<u8>>>,
-    stderr_reader: thread::JoinHandle<io::Result<Vec<u8>>>,
-) -> Result<CapturedOutput, RunnerError> {
+    stdout_reader: thread::JoinHandle<io::Result<StreamCapture>>,
+    stderr_reader: thread::JoinHandle<io::Result<StreamCapture>>,
+) -> Result<JoinedOutput, RunnerError> {
     let stdout = stdout_reader
         .join()
         .expect("stdout reader thread panicked")
@@ -169,7 +258,17 @@ fn join_output(
             stream: "stderr",
             source,
         })?;
-    Ok(CapturedOutput { stdout, stderr })
+    let exceeded_stream = stdout
+        .exceeded
+        .then_some("stdout")
+        .or_else(|| stderr.exceeded.then_some("stderr"));
+    Ok(JoinedOutput {
+        output: CapturedOutput {
+            stdout: stdout.bytes,
+            stderr: stderr.bytes,
+        },
+        exceeded_stream,
+    })
 }
 
 /// Details shared by a process that exited unsuccessfully.
@@ -192,6 +291,16 @@ pub struct TimedOutTask {
     command: Vec<String>,
     cwd: PathBuf,
     timeout: Duration,
+    output: CapturedOutput,
+    elapsed: Duration,
+}
+
+#[derive(Debug)]
+pub struct OutputLimitTask {
+    package: String,
+    task: String,
+    stream: &'static str,
+    limit: usize,
     output: CapturedOutput,
     elapsed: Duration,
 }
@@ -221,6 +330,7 @@ pub enum RunnerError {
         stream: &'static str,
         source: io::Error,
     },
+    OutputLimit(Box<OutputLimitTask>),
     Failed(Box<FailedTask>),
     TimedOut(Box<TimedOutTask>),
 }
@@ -230,6 +340,7 @@ impl RunnerError {
         match self {
             Self::Failed(details) => Some(&details.output),
             Self::TimedOut(details) => Some(&details.output),
+            Self::OutputLimit(details) => Some(&details.output),
             Self::EmptyCommand { .. }
             | Self::Spawn { .. }
             | Self::Wait { .. }
@@ -241,6 +352,7 @@ impl RunnerError {
         match self {
             Self::Failed(details) => Some(details.elapsed),
             Self::TimedOut(details) => Some(details.elapsed),
+            Self::OutputLimit(details) => Some(details.elapsed),
             Self::EmptyCommand { .. }
             | Self::Spawn { .. }
             | Self::Wait { .. }
@@ -278,6 +390,11 @@ impl fmt::Display for RunnerError {
                 stream,
                 source,
             } => write!(f, "could not read {stream} for {package}/{task}: {source}"),
+            Self::OutputLimit(details) => write!(
+                f,
+                "{}/{} exceeded the {} output limit of {} bytes",
+                details.package, details.task, details.stream, details.limit
+            ),
             Self::Failed(details) => write!(
                 f,
                 "{}/{} ({}) failed in {} with exit status {}",
@@ -403,6 +520,31 @@ mod tests {
 
         assert!(matches!(error, RunnerError::TimedOut(_)));
         assert!(error.to_string().contains("timed out after 1s"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stops_and_reports_when_task_output_exceeds_the_limit() {
+        let (_temp, mut workspace) = workspace_with_task("printf 123456789", None);
+        workspace
+            .packages
+            .get_mut("app")
+            .expect("fixture package exists")
+            .tasks
+            .get_mut("build")
+            .expect("fixture task exists")
+            .max_output_bytes = 8;
+        let plan = workspace.plan(None, None, &[]).expect("plan succeeds");
+        let error = Runner::new()
+            .run(&workspace.root, &plan[0])
+            .expect_err("task output must be bounded");
+
+        assert!(matches!(error, RunnerError::OutputLimit(_)));
+        assert!(error.to_string().contains("stdout output limit of 8 bytes"));
+        assert_eq!(
+            error.output().expect("partial output is retained").stdout,
+            b"12345678"
+        );
     }
 
     #[test]

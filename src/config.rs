@@ -71,6 +71,7 @@ impl MonorepoConfig {
                 outputs: Vec::new(),
                 cache_env: Vec::new(),
                 timeout_seconds: default_timeout_seconds(),
+                max_output_bytes: default_max_output_bytes(),
                 resource_group: None,
             },
         );
@@ -150,6 +151,9 @@ pub struct TaskConfig {
     /// Maximum runtime for one invocation, in seconds.
     #[serde(default = "default_timeout_seconds")]
     pub timeout_seconds: u64,
+    /// Maximum captured stdout or stderr per invocation.
+    #[serde(default = "default_max_output_bytes")]
+    pub max_output_bytes: u64,
     /// Tasks sharing a resource group never run concurrently.
     #[serde(default)]
     pub resource_group: Option<String>,
@@ -176,6 +180,10 @@ fn default_pipeline() -> String {
 
 fn default_timeout_seconds() -> u64 {
     600
+}
+
+fn default_max_output_bytes() -> u64 {
+    16 * 1024 * 1024
 }
 
 /// Path of the config file inside `dir`.
@@ -248,6 +256,7 @@ mod tests {
                 outputs: Vec::new(),
                 cache_env: Vec::new(),
                 timeout_seconds: 600,
+                max_output_bytes: default_max_output_bytes(),
                 resource_group: None,
             }
         );
