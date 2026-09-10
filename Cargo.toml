@@ -3,6 +3,7 @@ name = "monorelease"
 version = "0.1.0"
 edition = "2024"
 description = "Manifest-driven project and monorepo orchestration"
+license = "Apache-2.0"
 repository = "https://github.com/Tomperez98/monorelease"
 
 [dependencies]
