@@ -6,7 +6,7 @@ use std::fmt;
 use std::path::Path;
 
 use crate::cache::CacheMode;
-use crate::output::OutputSink;
+use crate::output::{OutputMode, OutputSink};
 use crate::runner::Runner;
 use crate::runner::format_command;
 use crate::scheduler::{ExecutionSummary, SchedulerError, execute_plan};
@@ -108,6 +108,34 @@ pub fn run_pipeline_with_cache(
     )
 }
 
+/// Selects the cache and output contracts for a pipeline run.
+#[derive(Debug, Clone, Copy)]
+pub struct PipelineExecution {
+    pub cache: CacheMode,
+    pub output: OutputMode,
+}
+
+/// Run a pipeline with an explicit execution contract.
+pub fn run_pipeline_with_mode(
+    path: &Path,
+    pipeline: Option<&str>,
+    selected_package: Option<&str>,
+    requested_tasks: &[String],
+    dry_run: bool,
+    jobs: usize,
+    execution: PipelineExecution,
+) -> Result<String, CiError> {
+    run_pipeline_with_options_and_mode(
+        path,
+        pipeline,
+        selected_package,
+        requested_tasks,
+        dry_run,
+        jobs,
+        execution,
+    )
+}
+
 pub(crate) fn run_pipeline_with_options(
     path: &Path,
     pipeline: Option<&str>,
@@ -116,6 +144,29 @@ pub(crate) fn run_pipeline_with_options(
     dry_run: bool,
     jobs: usize,
     cache_mode: CacheMode,
+) -> Result<String, CiError> {
+    run_pipeline_with_mode(
+        path,
+        pipeline,
+        selected_package,
+        requested_tasks,
+        dry_run,
+        jobs,
+        PipelineExecution {
+            cache: cache_mode,
+            output: OutputMode::Terminal,
+        },
+    )
+}
+
+fn run_pipeline_with_options_and_mode(
+    path: &Path,
+    pipeline: Option<&str>,
+    selected_package: Option<&str>,
+    requested_tasks: &[String],
+    dry_run: bool,
+    jobs: usize,
+    execution: PipelineExecution,
 ) -> Result<String, CiError> {
     if jobs == 0 {
         return Err(CiError::InvalidJobs);
@@ -129,8 +180,8 @@ pub(crate) fn run_pipeline_with_options(
     }
 
     let runner = Runner::new();
-    let output = OutputSink::new();
-    let summary = execute_plan(&workspace, &plan, jobs, &runner, &output, cache_mode)?;
+    let output = OutputSink::new(execution.output);
+    let summary = execute_plan(&workspace, &plan, jobs, &runner, &output, execution.cache)?;
 
     let package_count = plan
         .iter()

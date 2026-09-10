@@ -7,8 +7,8 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use clap::{Args, Parser, Subcommand};
-use monorelease::{CacheMode, Error};
+use clap::{Args, Parser, Subcommand, ValueEnum};
+use monorelease::{CacheMode, Error, OutputMode, PipelineExecution};
 
 #[derive(Parser)]
 #[command(
@@ -23,6 +23,23 @@ struct Cli {
     path: PathBuf,
     #[command(subcommand)]
     command: Option<Commands>,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum OutputFormat {
+    #[value(name = "terminal")]
+    Terminal,
+    #[value(name = "github-actions")]
+    GithubActions,
+}
+
+impl From<OutputFormat> for OutputMode {
+    fn from(format: OutputFormat) -> Self {
+        match format {
+            OutputFormat::Terminal => Self::Terminal,
+            OutputFormat::GithubActions => Self::GithubActions,
+        }
+    }
 }
 
 #[derive(Args, Clone)]
@@ -40,6 +57,9 @@ struct ExecutionOptions {
     /// Maximum number of independent tasks to execute concurrently.
     #[arg(long, default_value_t = 1)]
     jobs: usize,
+    /// Output contract to use for task status and grouping.
+    #[arg(long, value_enum, default_value = "terminal")]
+    output: OutputFormat,
 }
 
 #[derive(Subcommand)]
@@ -157,24 +177,30 @@ fn run(path: PathBuf, command: Option<Commands>) -> Result<String, Error> {
             pipeline,
             tasks,
             options,
-        }) => monorelease::run_pipeline_with_cache(
+        }) => monorelease::run_pipeline_with_mode(
             &path,
             pipeline.as_deref(),
             options.package.as_deref(),
             &tasks,
             options.dry_run,
             options.jobs,
-            cache_mode(options.no_cache, options.force),
+            PipelineExecution {
+                cache: cache_mode(options.no_cache, options.force),
+                output: options.output.into(),
+            },
         )
         .map_err(Error::from),
-        Some(Commands::Task { tasks, options }) => monorelease::run_pipeline_with_cache(
+        Some(Commands::Task { tasks, options }) => monorelease::run_pipeline_with_mode(
             &path,
             None,
             options.package.as_deref(),
             &tasks,
             options.dry_run,
             options.jobs,
-            cache_mode(options.no_cache, options.force),
+            PipelineExecution {
+                cache: cache_mode(options.no_cache, options.force),
+                output: options.output.into(),
+            },
         )
         .map_err(Error::from),
         Some(Commands::Check) => {

@@ -22,8 +22,8 @@ use std::fmt;
 
 pub use cache::CacheMode;
 pub use commands::ci::{
-    CiError, ci, ci_with_jobs, clean_cache, graph, plan, run_pipeline, run_pipeline_with_cache,
-    run_pipeline_with_jobs,
+    CiError, PipelineExecution, ci, ci_with_jobs, clean_cache, graph, plan, run_pipeline,
+    run_pipeline_with_cache, run_pipeline_with_jobs, run_pipeline_with_mode,
 };
 pub use commands::doctor::{DoctorError, doctor};
 pub use commands::init::{InitError, init, init_standalone};
@@ -32,6 +32,7 @@ pub use config::{
     CONFIG_FILE_NAME, MonorepoConfig, PackageConfig, PipelineConfig, TaskConfig,
     WORKSPACE_PACKAGE_NAME, WorkspaceConfig, config_path, render_config,
 };
+pub use output::OutputMode;
 pub use workspace::{Package, PlannedTask, TaskNode, Workspace, WorkspaceError};
 
 /// Every expected failure a `monore` command can report.

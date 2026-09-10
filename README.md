@@ -101,7 +101,7 @@ The manifest schema is intentionally fixed and has no `version` header. Unknown 
 
 ## CI/CD
 
-GitHub Actions runs `cargo run --locked -- ci --no-cache` for pull requests and pushes to `main`. The pipeline is defined by the root `monorepo.toml`, so local and hosted checks use the same task graph. It also runs `cargo package --locked` to verify the crate can be packaged.
+GitHub Actions runs `cargo run --locked -- ci --no-cache --output github-actions` for pull requests and pushes to `main`. The pipeline is defined by the root `monorepo.toml`, so local and hosted checks use the same task graph. Local runs default to terminal output; use `--output github-actions` only when GitHub log groups are desired. It also runs `cargo package --locked` to verify the crate can be packaged.
 
 To publish CLI binaries, update `Cargo.toml`'s version, commit the change, and push a matching tag:
 

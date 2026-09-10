@@ -357,6 +357,24 @@ fn ci_keeps_task_output_and_status_lines_separate() {
 
 #[cfg(unix)]
 #[test]
+fn github_actions_output_is_explicit() {
+    let temp = TempDir::new("github-actions-output");
+    fs::write(
+        temp.path().join("monorepo.toml"),
+        "[package]\nname = \"app\"\n\n[pipelines.ci]\ntasks = [\"build\"]\n\n[tasks.build]\ncommand = [\"echo\", \"building\"]\n",
+    )
+    .expect("write standalone manifest");
+
+    let output = monore(&["ci", "--output", "github-actions"], temp.path());
+
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    assert!(stdout(&output).contains("::group::app:build"));
+    assert!(stdout(&output).contains("building"));
+    assert!(stdout(&output).contains("::endgroup::"));
+}
+
+#[cfg(unix)]
+#[test]
 fn ci_reports_failed_task_output_and_context() {
     let temp = TempDir::new("ci-failure");
     assert!(monore(&["init"], temp.path()).status.success());

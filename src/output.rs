@@ -6,18 +6,27 @@ use std::sync::Mutex;
 use crate::runner::{RunnerError, TaskResult};
 use crate::workspace::TaskNode;
 
+/// Selects the output contract for a pipeline run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputMode {
+    /// Human-readable terminal output with status on stderr.
+    Terminal,
+    /// GitHub Actions log groups with status on stdout.
+    GithubActions,
+}
+
 /// Owns task presentation so worker threads never write directly to the
 /// process-global stdout or stderr handles.
 #[derive(Debug)]
 pub(crate) struct OutputSink {
-    ci: bool,
+    mode: OutputMode,
     lock: Mutex<()>,
 }
 
 impl OutputSink {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(mode: OutputMode) -> Self {
         Self {
-            ci: std::env::var_os("CI").is_some() || std::env::var_os("GITHUB_ACTIONS").is_some(),
+            mode,
             lock: Mutex::new(()),
         }
     }
@@ -56,7 +65,7 @@ impl OutputSink {
     }
 
     fn start_section(&self, node: &TaskNode) -> io::Result<()> {
-        if self.ci {
+        if self.mode == OutputMode::GithubActions {
             let mut stdout = io::stdout().lock();
             writeln!(stdout, "::group::{}:{}", node.package, node.task)?;
             stdout.flush()
@@ -81,7 +90,7 @@ impl OutputSink {
                 elapsed.as_millis()
             )
         })?;
-        if self.ci {
+        if self.mode == OutputMode::GithubActions {
             let mut stdout = io::stdout().lock();
             writeln!(stdout, "::endgroup::")?;
             stdout.flush()?;
@@ -107,7 +116,7 @@ impl OutputSink {
     where
         F: FnOnce(&mut dyn Write) -> io::Result<()>,
     {
-        if self.ci {
+        if self.mode == OutputMode::GithubActions {
             let mut stdout = io::stdout().lock();
             write(&mut stdout)?;
             stdout.flush()
