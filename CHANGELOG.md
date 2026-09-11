@@ -15,21 +15,8 @@ next version on the following release. Versions are monotonic but may skip
 numbers: shipping nothing is cheaper than shipping something broken. `Released:`
 is the date the entry was drafted; correct it if the release slips.
 
-## 0.1.1
 ## 0.1.2
 Released: 2026-09-11
-
-### Fixes
-
-- The documented Rust minimum is now 1.88, matching the language features used by the workspace.
-- Release validation selects the root `monorelease` package instead of the repository-only `xtask` member when checking the tag version.
-
-### Internals
-
-- Releases now record source identity, publish exact platform inventories, generate GitHub Actions provenance, and rebuild the released Linux artifact during recurring validation.
-
-## 0.1.1
-Released: 2026-09-10
 
 ### Features
 
@@ -42,6 +29,10 @@ Released: 2026-09-10
 
 - `--version`, `--help`, and error prefixes report the program as `monorelease`.
   They previously said `monore`.
+- The documented Rust minimum is now 1.88, matching the language features used
+  by the workspace.
+- Release validation selects the root `monorelease` package instead of the
+  repository-only `xtask` member when checking the tag version.
 
 ### Internals
 
@@ -51,6 +42,9 @@ Released: 2026-09-10
   are Rust programs in `xtask/`, which is not part of the published crate.
 - The local cache and the scheduler were reworked for content-addressed keys and
   deterministic, plan-ordered output.
+- Releases now record source identity, publish exact platform inventories,
+  generate GitHub Actions provenance, and rebuild the released Linux artifact
+  during recurring validation.
 
 ## 0.1.0
 Released: 2026-09-10
