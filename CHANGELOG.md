@@ -2,6 +2,20 @@
 
 Notable changes per release, newest first.
 
+## (unreleased)
+
+### Features
+
+- Add structured JSON execution events for machine-readable task orchestration.
+
+### Fixes
+
+- Terminate descendant processes when a task times out and reject cache restores through symlinked paths.
+
+### Internals
+
+- Version the `mono.toml` schema while preserving compatibility with manifests that omit `schema`.
+
 The top `## ` entry is the release being prepared. `release.yml` requires the git
 tag to be `v` + that heading, and the body under it becomes the GitHub release
 notes, so the changelog a reviewer approves is exactly what users read. Cutting a

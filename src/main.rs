@@ -47,6 +47,8 @@ struct Cli {
 enum OutputFormat {
     #[value(name = "terminal")]
     Terminal,
+    #[value(name = "json")]
+    Json,
     #[value(name = "github-actions")]
     GithubActions,
 }
@@ -55,6 +57,7 @@ impl From<OutputFormat> for OutputMode {
     fn from(format: OutputFormat) -> Self {
         match format {
             OutputFormat::Terminal => Self::Terminal,
+            OutputFormat::Json => Self::Json,
             OutputFormat::GithubActions => Self::GithubActions,
         }
     }
@@ -224,6 +227,10 @@ struct ReleaseIdentityOptions {
     commit: Option<String>,
     #[arg(long, env = "GITHUB_REPOSITORY")]
     repository: Option<String>,
+    /// Annotated tag object, absent for a lightweight tag. CI exports the empty
+    /// string for a lightweight tag, so [`resolve`](Self::resolve) drops it.
+    #[arg(long = "tag-object", env = "RELEASE_TAG_OBJECT")]
+    tag_object: Option<String>,
     #[arg(long = "workflow-run", env = "GITHUB_RUN_URL")]
     workflow_run: Option<String>,
 }
@@ -231,12 +238,20 @@ struct ReleaseIdentityOptions {
 impl ReleaseIdentityOptions {
     fn resolve(self) -> ReleaseIdentity {
         ReleaseIdentity {
-            repository: self.repository,
-            release_tag: self.tag,
-            source_commit: self.commit,
-            workflow_run: self.workflow_run,
+            repository: non_empty(self.repository),
+            release_tag: non_empty(self.tag),
+            source_commit: non_empty(self.commit),
+            tag_object: non_empty(self.tag_object),
+            workflow_run: non_empty(self.workflow_run),
         }
     }
+}
+
+/// Treat a variable that is set but empty as absent. The release workflows
+/// export `RELEASE_TAG_OBJECT` unconditionally, so a lightweight tag reaches
+/// this as `Some("")`; comparing that against a real object would fail.
+fn non_empty(value: Option<String>) -> Option<String> {
+    value.filter(|value| !value.is_empty())
 }
 
 /// Identity for `release source`, where a tag and commit are mandatory.
@@ -272,6 +287,9 @@ enum ReleaseCommands {
         /// Directory the release metadata is written to, below the root.
         #[arg(long, default_value = DEFAULT_RELEASE_DIRECTORY)]
         directory: PathBuf,
+        /// File containing one expected artifact path per line.
+        #[arg(long)]
+        expected: Option<PathBuf>,
         #[command(flatten)]
         identity: ReleaseIdentityOptions,
     },
@@ -280,6 +298,9 @@ enum ReleaseCommands {
         /// Directory the release metadata is read from, below the root.
         #[arg(long, default_value = DEFAULT_RELEASE_DIRECTORY)]
         directory: PathBuf,
+        /// File containing one expected artifact path per line.
+        #[arg(long)]
+        expected: Option<PathBuf>,
         #[command(flatten)]
         identity: ReleaseIdentityOptions,
     },
@@ -338,7 +359,13 @@ fn main() -> ExitCode {
 /// invariant, so it is reported as success instead of panicking the way
 /// `println!` would over the process-global handle. Taking `sink` as an
 /// argument keeps the mapping testable without spawning a process.
+///
+/// An empty summary (JSON mode) is silently skipped so the
+/// newline-delimited JSON stream never contains a blank line.
 fn emit_summary(sink: &mut impl Write, summary: &str) -> u8 {
+    if summary.is_empty() {
+        return 0;
+    }
     match writeln!(sink, "{summary}") {
         Ok(()) => 0,
         Err(error) if error.kind() == io::ErrorKind::BrokenPipe => 0,
@@ -561,18 +588,30 @@ fn run_release(root: &Path, command: ReleaseCommands) -> Result<String, Error> {
         }
         ReleaseCommands::Manifest {
             directory,
+            expected,
             identity,
-        } => Ok(release_manifest(
-            &resolve_path(root, directory),
-            identity.resolve(),
-        )?),
+        } => {
+            let directory = resolve_path(root, directory);
+            let expected = expected.map(|path| resolve_path(root, path));
+            Ok(release_manifest(
+                &directory,
+                identity.resolve(),
+                expected.as_deref(),
+            )?)
+        }
         ReleaseCommands::Verify {
             directory,
+            expected,
             identity,
-        } => Ok(release_verify(
-            &resolve_path(root, directory),
-            identity.resolve(),
-        )?),
+        } => {
+            let directory = resolve_path(root, directory);
+            let expected = expected.map(|path| resolve_path(root, path));
+            Ok(release_verify(
+                &directory,
+                identity.resolve(),
+                expected.as_deref(),
+            )?)
+        }
     }
 }
 
@@ -629,6 +668,14 @@ mod tests {
 
         assert_eq!(emit_summary(&mut sink, "summary: 1 completed"), 0);
         assert_eq!(String::from_utf8(sink).unwrap(), "summary: 1 completed\n");
+    }
+
+    #[test]
+    fn an_empty_summary_writes_nothing_and_returns_zero() {
+        let mut sink = Vec::new();
+
+        assert_eq!(emit_summary(&mut sink, ""), 0);
+        assert!(sink.is_empty(), "empty summary must write nothing");
     }
 
     #[test]

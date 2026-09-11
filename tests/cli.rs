@@ -367,9 +367,25 @@ fn github_actions_output_is_explicit() {
     let output = mono(&["ci", "--output", "github-actions"], temp.path());
 
     assert!(output.status.success(), "stderr: {}", stderr(&output));
-    assert!(stdout(&output).contains("::group::app:build"));
-    assert!(stdout(&output).contains("building"));
-    assert!(stdout(&output).contains("::endgroup::"));
+    let output = stdout(&output);
+    assert!(output.contains("::group::app:build"));
+    assert!(output.contains("building"));
+    assert!(output.contains("::endgroup::"));
+
+    // The group must start after the task-start event is emitted and end at
+    // task finish: the task output belongs inside the group.
+    let group_start = output.find("::group::app:build").expect("group start");
+    let status_start = output.find("▶ app:build").expect("task start marker");
+    let task_output = output.find("building").expect("task output");
+    let group_end = output.find("::endgroup::").expect("group end");
+    assert!(
+        group_start < task_output && task_output < group_end,
+        "group must wrap the task output: {output:?}"
+    );
+    assert!(
+        status_start > group_start && status_start < task_output,
+        "task-start marker must follow the group-start annotation: {output:?}"
+    );
 }
 
 #[cfg(unix)]
@@ -574,4 +590,87 @@ fn a_filesystem_failure_exits_with_three() {
 
     assert_eq!(output.status.code(), Some(3));
     assert!(stderr(&output).contains("could not create directory"));
+}
+
+#[cfg(unix)]
+#[test]
+fn json_output_contains_lifecycle_events() {
+    let temp = TempDir::new("json-output");
+    fs::write(
+        temp.path().join("mono.toml"),
+        "[package]\nname = \"app\"\n\n[pipelines.ci]\ntasks = [\"build\"]\n\n[tasks.build]\ncommand = [\"echo\", \"hello\"]\n",
+    )
+    .expect("write standalone manifest");
+
+    let output = mono(&["ci", "--output", "json"], temp.path());
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // Use split('\n') instead of lines() so a trailing empty element
+    // (produced by the terminating newline) is visible.  Any empty element
+    // before the last one is a blank record.
+    let json_lines: Vec<&str> = stdout.split('\n').collect();
+    let mut found_start = false;
+    let mut found_finished = false;
+    let mut found_run_finished = false;
+
+    for (i, line) in json_lines.iter().enumerate() {
+        if line.is_empty() {
+            assert_eq!(
+                i,
+                json_lines.len() - 1,
+                "JSON output must not contain a blank record at position {i}: {stdout:?}"
+            );
+            continue;
+        }
+        let event: serde_json::Value = serde_json::from_str(line).expect("each line is valid JSON");
+        match event["event"].as_str() {
+            Some("task_started") => found_start = true,
+            Some("task_finished") => found_finished = true,
+            Some("run_finished") => found_run_finished = true,
+            _ => {}
+        }
+    }
+
+    assert!(found_start, "missing task_started event");
+    assert!(found_finished, "missing task_finished event");
+    assert!(found_run_finished, "missing run_finished event");
+    // The last non-empty line must be the run_finished JSON event.
+    assert!(
+        json_lines
+            .iter()
+            .rev()
+            .find(|l| !l.is_empty())
+            .and_then(|last| serde_json::from_str::<serde_json::Value>(last).ok())
+            .is_some_and(|event| event["event"] == "run_finished"),
+        "the final non-empty stdio line must be the run_finished JSON event: {stdout:?}"
+    );
+
+    // stderr must not contain terminal status lines in JSON mode
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("▶"),
+        "stderr should not contain terminal status markers in JSON mode: {stderr}"
+    );
+}
+
+#[test]
+fn doctor_rejects_unsupported_schema_version() {
+    let temp = TempDir::new("unsupported-schema");
+    fs::write(
+        temp.path().join("mono.toml"),
+        "schema = 2\n\n[workspace]\nname = \"fixture\"\nmembers = []\n\n[pipelines.ci]\ntasks = [\"build\"]\n",
+    )
+    .expect("write root manifest with future schema");
+
+    let output = mono(&["check"], temp.path());
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("unsupported manifest schema 2"));
 }

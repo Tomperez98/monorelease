@@ -15,7 +15,7 @@ use sha2::{Digest, Sha256};
 use crate::runner::{CapturedOutput, TaskResult};
 use crate::workspace::PlannedTask;
 
-const CACHE_FORMAT_VERSION: u32 = 2;
+const CACHE_FORMAT_VERSION: u32 = 3;
 const CACHE_GITIGNORE: &str = "*\n!.gitignore\n";
 const HASH_BUFFER_SIZE: usize = 64 * 1024;
 const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
@@ -52,6 +52,7 @@ struct CacheMetadata {
 #[derive(Debug, Serialize, Deserialize)]
 struct CachedOutput {
     path: String,
+    sha256: String,
     #[serde(default)]
     mode: Option<u32>,
 }
@@ -112,6 +113,8 @@ impl CacheStore {
         let mut hasher = Sha256::new();
         hash_string(&mut hasher, "mono-cache");
         hash_string(&mut hasher, &CACHE_FORMAT_VERSION.to_string());
+        hash_string(&mut hasher, std::env::consts::OS);
+        hash_string(&mut hasher, std::env::consts::ARCH);
         hash_string(&mut hasher, task.package());
         hash_string(&mut hasher, task.task());
         hash_string(
@@ -134,6 +137,7 @@ impl CacheStore {
         hash_string(&mut hasher, task.resource_group().unwrap_or(""));
         hash_strings(&mut hasher, task.inputs());
         hash_strings(&mut hasher, task.outputs());
+        hash_strings(&mut hasher, task.artifacts());
         hash_strings(&mut hasher, task.cache_env());
         hash_strings(&mut hasher, dependency_keys);
 
@@ -233,8 +237,12 @@ impl CacheStore {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
                 Err(source_error) => return Err(CacheError::io(source, source_error)),
             };
+            if file_digest(&source)? != output.sha256 {
+                return Ok(None);
+            }
             let destination = task.package_path().join(&relative_path);
             ensure_inside(task.package_path(), &destination)?;
+            ensure_no_symlink_components(task.package_path(), &destination)?;
             outputs.push((relative_path, source, destination, source_metadata));
         }
 
@@ -290,7 +298,14 @@ impl CacheStore {
             let _ = fs::remove_dir_all(&temporary);
             return Ok(());
         }
-        fs::rename(&temporary, &entry).map_err(|source| CacheError::io(entry, source))
+        match fs::rename(&temporary, &entry) {
+            Ok(()) => Ok(()),
+            Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => {
+                let _ = fs::remove_dir_all(&temporary);
+                Ok(())
+            }
+            Err(source) => Err(CacheError::io(entry, source)),
+        }
     }
 
     fn store_in(
@@ -321,6 +336,7 @@ impl CacheStore {
                 .map_err(|source_error| CacheError::io(source.clone(), source_error))?;
             outputs.push(CachedOutput {
                 path: relative_path,
+                sha256: file_digest(&source)?,
                 mode: file_mode(&source)?,
             });
         }
@@ -631,6 +647,45 @@ fn ensure_inside(root: &Path, path: &Path) -> Result<(), CacheError> {
     }
 }
 
+/// Reject cache output restoration through any symlink component from the
+/// package root down to (and including) the destination path.
+///
+/// Uses `symlink_metadata` instead of `metadata` so a symlink is detected
+/// rather than followed.  The path may not exist yet — that is only the
+/// destination file, not an intermediate directory, but we stop scanning at
+/// the first missing component since earlier components must exist.
+fn ensure_no_symlink_components(root: &Path, destination: &Path) -> Result<(), CacheError> {
+    ensure_inside(root, destination)?;
+
+    let relative = destination
+        .strip_prefix(root)
+        .map_err(|_| CacheError::Invalid {
+            message: format!(
+                "cache destination escapes package root: {}",
+                destination.display()
+            ),
+        })?;
+
+    let mut current = root.to_path_buf();
+    for component in relative.components() {
+        current.push(component);
+        let meta = match fs::symlink_metadata(&current) {
+            Ok(meta) => meta,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => break,
+            Err(source) => return Err(CacheError::io(current, source)),
+        };
+        if meta.file_type().is_symlink() {
+            return Err(CacheError::Invalid {
+                message: format!(
+                    "cache output restoration refuses symlink component {}",
+                    current.display()
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
 fn hash_strings(hasher: &mut Sha256, values: &[String]) {
     hash_string(hasher, &values.len().to_string());
     for value in values {
@@ -648,12 +703,14 @@ fn hash_string(hasher: &mut Sha256, value: &str) {
 fn hash_file(hasher: &mut Sha256, label: &str, path: &Path) -> Result<(), CacheError> {
     let mut file =
         fs::File::open(path).map_err(|source| CacheError::io(path.to_path_buf(), source))?;
-    let length = file
+    let metadata = file
         .metadata()
-        .map_err(|source| CacheError::io(path.to_path_buf(), source))?
-        .len();
+        .map_err(|source| CacheError::io(path.to_path_buf(), source))?;
     hash_string(hasher, label);
-    hasher.update(length.to_le_bytes());
+    hasher.update(metadata.len().to_le_bytes());
+    if let Some(mode) = file_mode(path)? {
+        hasher.update(mode.to_le_bytes());
+    }
 
     let mut buffer = vec![0u8; HASH_BUFFER_SIZE];
     loop {
@@ -666,6 +723,23 @@ fn hash_file(hasher: &mut Sha256, label: &str, path: &Path) -> Result<(), CacheE
         hasher.update(&buffer[..read]);
     }
     Ok(())
+}
+
+fn file_digest(path: &Path) -> Result<String, CacheError> {
+    let mut file =
+        fs::File::open(path).map_err(|source| CacheError::io(path.to_path_buf(), source))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0u8; HASH_BUFFER_SIZE];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|source| CacheError::io(path.to_path_buf(), source))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 fn read_file(path: &Path) -> Result<Vec<u8>, CacheError> {
@@ -1060,6 +1134,137 @@ mod tests {
         assert_eq!(
             fs::read_to_string(package.join("dist/nested/artifact.txt")).expect("read output"),
             "nested"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refuses_to_restore_through_a_destination_symlink() {
+        let temp = TempDir::new();
+        let workspace = workspace_with_task(&temp);
+        let task = only_task(&workspace);
+        let package = task.package_path().to_path_buf();
+        let store = CacheStore::new(&workspace.root);
+
+        let key = store
+            .task_key(&workspace.root, &task, &[])
+            .expect("key succeeds");
+        let result = Runner::new()
+            .run(&workspace.root, &task)
+            .expect("task succeeds");
+        store.store(&task, &key, &result).expect("store succeeds");
+
+        fs::remove_file(package.join("output.txt")).expect("remove generated output");
+        fs::write(package.join("outside.txt"), "must remain unchanged")
+            .expect("write outside target");
+        std::os::unix::fs::symlink("outside.txt", package.join("output.txt"))
+            .expect("create destination symlink");
+
+        let error = store
+            .lookup(&task, &key)
+            .expect_err("symlink destination must be rejected");
+
+        assert!(error.to_string().contains("symlink"));
+        assert_eq!(
+            fs::read_to_string(package.join("outside.txt")).unwrap(),
+            "must remain unchanged"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refuses_to_restore_through_a_symlinked_output_parent() {
+        let temp = TempDir::new();
+        let workspace = workspace_with_manifest(
+            &temp,
+            "[package]\nname = \"app\"\n\n[tasks.build]\ncommand = [\"sh\", \"-c\", \"mkdir -p dist/nested && cp src/input.txt dist/nested/artifact.txt\"]\ncache = true\ninputs = [\"src/**\"]\noutputs = [\"dist/**\"]\n",
+        );
+        let task = only_task(&workspace);
+        let package = task.package_path().to_path_buf();
+        let store = CacheStore::new(&workspace.root);
+
+        fs::create_dir_all(package.join("src")).expect("create source directory");
+        fs::write(package.join("src/input.txt"), "cached").expect("write source");
+        let key = store
+            .task_key(&workspace.root, &task, &[])
+            .expect("key succeeds");
+        let result = Runner::new()
+            .run(&workspace.root, &task)
+            .expect("task succeeds");
+        store.store(&task, &key, &result).expect("store succeeds");
+
+        let outside = temp.path().join("outside");
+        fs::create_dir_all(&outside).expect("create outside directory");
+        fs::write(outside.join("artifact.txt"), "must remain unchanged")
+            .expect("write outside sentinel");
+        fs::remove_dir_all(package.join("dist")).expect("remove real output directory");
+        std::os::unix::fs::symlink(&outside, package.join("dist"))
+            .expect("create symlinked output parent");
+
+        let error = store
+            .lookup(&task, &key)
+            .expect_err("symlinked parent must be rejected");
+
+        assert!(error.to_string().contains("symlink"));
+        assert_eq!(
+            fs::read_to_string(outside.join("artifact.txt")).unwrap(),
+            "must remain unchanged"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preflight_validates_all_outputs_before_copying_any() {
+        let temp = TempDir::new();
+        let workspace = workspace_with_manifest(
+            &temp,
+            "[package]\nname = \"app\"\n\n[tasks.build]\ncommand = [\"sh\", \"-c\", \"mkdir -p deep && echo first > output1.txt && echo second > deep/output2.txt\"]\ncache = true\ninputs = [\"input.txt\"]\noutputs = [\"output1.txt\", \"deep/output2.txt\"]\n",
+        );
+        let task = only_task(&workspace);
+        let package = task.package_path().to_path_buf();
+        let store = CacheStore::new(&workspace.root);
+
+        fs::write(package.join("input.txt"), "input").expect("write input");
+
+        let key = store
+            .task_key(&workspace.root, &task, &[])
+            .expect("key succeeds");
+        let result = Runner::new()
+            .run(&workspace.root, &task)
+            .expect("task succeeds");
+        store.store(&task, &key, &result).expect("store succeeds");
+
+        let outside = temp.path().join("outside");
+        fs::create_dir_all(&outside).expect("create outside directory");
+        fs::write(outside.join("sentinel.txt"), "must remain unchanged")
+            .expect("write outside sentinel");
+
+        // First output: replace with a regular file so we can verify it was
+        // NOT overwritten by a partial restore.
+        fs::write(package.join("output1.txt"), "old content before restore")
+            .expect("write sentinel to first output");
+
+        // Second output: replace the real directory tree with a symlink.
+        fs::remove_dir_all(package.join("deep")).expect("remove deep directory");
+        fs::create_dir_all(package.join("deep")).expect("recreate deep directory");
+        std::os::unix::fs::symlink("../outside/sentinel.txt", package.join("deep/output2.txt"))
+            .expect("create symlink for later output");
+
+        let error = store
+            .lookup(&task, &key)
+            .expect_err("symlink in a later output must be rejected");
+
+        assert!(error.to_string().contains("symlink"));
+
+        // The first output was NOT restored because the preflight caught the
+        // symlink before any copy started.
+        assert_eq!(
+            fs::read_to_string(package.join("output1.txt")).unwrap(),
+            "old content before restore"
+        );
+        assert_eq!(
+            fs::read_to_string(outside.join("sentinel.txt")).unwrap(),
+            "must remain unchanged"
         );
     }
 }

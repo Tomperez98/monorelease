@@ -5,7 +5,8 @@ use std::fmt;
 use std::path::Path;
 
 use crate::release::{
-    ReleaseError, ReleaseIdentity, create_manifest, verify_manifest, verify_source,
+    ReleaseError, ReleaseIdentity, create_manifest_with_expected, verify_manifest_with_expected,
+    verify_source,
 };
 
 /// Default directory holding the release artifacts and their metadata.
@@ -14,8 +15,9 @@ pub const DEFAULT_DIRECTORY: &str = "dist";
 pub fn manifest(
     directory: &Path,
     identity: ReleaseIdentity,
+    expected_path: Option<&Path>,
 ) -> Result<String, ReleaseCommandError> {
-    let manifest = create_manifest(directory, identity)?;
+    let manifest = create_manifest_with_expected(directory, identity, expected_path)?;
     Ok(format!(
         "wrote release manifest for {} artifact(s) in {}",
         manifest.artifacts.len(),
@@ -34,8 +36,12 @@ pub fn source(
     ))
 }
 
-pub fn verify(directory: &Path, expected: ReleaseIdentity) -> Result<String, ReleaseCommandError> {
-    let manifest = verify_manifest(directory, expected)?;
+pub fn verify(
+    directory: &Path,
+    expected: ReleaseIdentity,
+    expected_path: Option<&Path>,
+) -> Result<String, ReleaseCommandError> {
+    let manifest = verify_manifest_with_expected(directory, expected, expected_path)?;
     Ok(format!(
         "verified release manifest for {} artifact(s) in {}",
         manifest.artifacts.len(),
@@ -87,6 +93,7 @@ mod tests {
                 release_tag: Some("v1.0.0".to_owned()),
                 ..ReleaseIdentity::default()
             },
+            None,
         )
         .unwrap();
         let output = verify(
@@ -95,6 +102,7 @@ mod tests {
                 release_tag: Some("v1.0.0".to_owned()),
                 ..ReleaseIdentity::default()
             },
+            None,
         )
         .unwrap();
         assert!(output.contains("verified release manifest"));

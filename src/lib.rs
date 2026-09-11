@@ -11,7 +11,9 @@ mod changelog;
 mod commands;
 mod config;
 mod discovery;
+pub(crate) mod events;
 mod output;
+pub(crate) mod process;
 mod release;
 mod runner;
 mod scheduler;
@@ -42,15 +44,16 @@ pub use commands::release::{
     manifest as release_manifest, source as release_source, verify as release_verify,
 };
 pub use config::{
-    CONFIG_FILE_NAME, MonoConfig, PackageConfig, PipelineConfig, TaskConfig,
+    CONFIG_FILE_NAME, MonoConfig, PackageConfig, PipelineConfig, SUPPORTED_SCHEMA, TaskConfig,
     WORKSPACE_PACKAGE_NAME, WorkspaceConfig, config_path, render_config,
 };
 pub use output::OutputMode;
 // `CiError::Scheduler` already exposes this type in its public variant; naming it
 // lets a caller tell a failed task apart from a scheduler or cache failure.
 pub use release::{
-    Artifact, ReleaseError, ReleaseIdentity, ReleaseManifest, create_manifest, verify_checksums,
-    verify_manifest, verify_source,
+    Artifact, ReleaseError, ReleaseIdentity, ReleaseManifest, create_manifest,
+    create_manifest_with_expected, verify_checksums, verify_manifest,
+    verify_manifest_with_expected, verify_source,
 };
 pub use scheduler::SchedulerError;
 pub use workspace::{Package, PlannedTask, TaskNode, Workspace, WorkspaceError};

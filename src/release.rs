@@ -6,13 +6,14 @@
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error as StdError;
 use std::fmt;
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub const METADATA_FILE_NAME: &str = "BUILD-METADATA.json";
 pub const CHECKSUMS_FILE_NAME: &str = "SHA256SUMS";
@@ -23,6 +24,7 @@ pub struct ReleaseIdentity {
     pub repository: Option<String>,
     pub release_tag: Option<String>,
     pub source_commit: Option<String>,
+    pub tag_object: Option<String>,
     pub workflow_run: Option<String>,
 }
 
@@ -42,6 +44,9 @@ pub struct ReleaseManifest {
     pub release_tag: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_commit: Option<String>,
+    /// The annotated tag object, when the release tag is annotated.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tag_object: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub workflow_run: Option<String>,
     pub artifacts: Vec<Artifact>,
@@ -53,6 +58,7 @@ impl ReleaseManifest {
             repository: self.repository.clone(),
             release_tag: self.release_tag.clone(),
             source_commit: self.source_commit.clone(),
+            tag_object: self.tag_object.clone(),
             workflow_run: self.workflow_run.clone(),
         }
     }
@@ -95,6 +101,14 @@ pub fn create_manifest(
     directory: &Path,
     identity: ReleaseIdentity,
 ) -> Result<ReleaseManifest, ReleaseError> {
+    create_manifest_with_expected(directory, identity, None)
+}
+
+pub fn create_manifest_with_expected(
+    directory: &Path,
+    identity: ReleaseIdentity,
+    expected_path: Option<&Path>,
+) -> Result<ReleaseManifest, ReleaseError> {
     let artifacts = collect_artifacts(directory)?;
     if artifacts.is_empty() {
         return Err(ReleaseError::Invalid(format!(
@@ -102,11 +116,13 @@ pub fn create_manifest(
             directory.display()
         )));
     }
+    validate_expected_inventory(directory, &artifacts, expected_path)?;
     let manifest = ReleaseManifest {
         manifest_version: MANIFEST_VERSION,
         repository: identity.repository,
         release_tag: identity.release_tag,
         source_commit: identity.source_commit,
+        tag_object: identity.tag_object,
         workflow_run: identity.workflow_run,
         artifacts,
     };
@@ -125,15 +141,25 @@ pub fn verify_source(
             "release source verification requires a non-empty tag and commit".to_owned(),
         ));
     }
-    if tag.starts_with('-') || tag.chars().any(char::is_whitespace) {
+    if tag.starts_with('-') || tag.chars().any(char::is_whitespace) || tag.contains('\0') {
         return Err(ReleaseError::Invalid(format!(
             "release tag `{tag}` is not a safe Git ref"
         )));
     }
+    if expected_commit.chars().any(char::is_whitespace) || expected_commit.contains('\0') {
+        return Err(ReleaseError::Invalid(
+            "expected release commit is not a safe Git object name".to_owned(),
+        ));
+    }
 
+    let tag_ref = format!("refs/tags/{tag}");
+    git(
+        repository,
+        &["check-ref-format", "--allow-onelevel", &tag_ref],
+    )?;
     let checkout_commit = git(repository, &["rev-parse", "HEAD"])?;
-    let tag_ref = format!("{tag}^{{commit}}");
-    let tag_commit = git(repository, &["rev-parse", "--verify", &tag_ref])?;
+    let tag_commit_ref = format!("{tag_ref}^{{commit}}");
+    let tag_commit = git(repository, &["rev-parse", "--verify", &tag_commit_ref])?;
     if checkout_commit != tag_commit || checkout_commit != expected_commit {
         return Err(ReleaseError::Invalid(format!(
             "release source does not match: checkout {checkout_commit}, tag {tag_commit}, expected {expected_commit}"
@@ -176,6 +202,14 @@ pub fn verify_manifest(
     directory: &Path,
     expected: ReleaseIdentity,
 ) -> Result<ReleaseManifest, ReleaseError> {
+    verify_manifest_with_expected(directory, expected, None)
+}
+
+pub fn verify_manifest_with_expected(
+    directory: &Path,
+    expected: ReleaseIdentity,
+    expected_path: Option<&Path>,
+) -> Result<ReleaseManifest, ReleaseError> {
     let metadata_path = directory.join(METADATA_FILE_NAME);
     let checksums_path = directory.join(CHECKSUMS_FILE_NAME);
     let manifest_text = read_to_string(&metadata_path)?;
@@ -197,6 +231,7 @@ pub fn verify_manifest(
     compare_identity(&manifest.identity(), &expected)?;
 
     let actual_artifacts = collect_artifacts(directory)?;
+    validate_expected_inventory(directory, &actual_artifacts, expected_path)?;
     let expected_artifacts = artifact_map(&manifest.artifacts, "metadata")?;
     let actual_artifacts_map = artifact_map(&actual_artifacts, "directory")?;
     if expected_artifacts.keys().collect::<Vec<_>>()
@@ -267,6 +302,7 @@ fn compare_identity(
             &actual.source_commit,
             &expected.source_commit,
         ),
+        ("tag object", &actual.tag_object, &expected.tag_object),
         ("workflow run", &actual.workflow_run, &expected.workflow_run),
     ] {
         if let Some(expected) = expected_value
@@ -389,6 +425,57 @@ fn relative_name(path: &Path) -> Result<String, ReleaseError> {
     Ok(name)
 }
 
+fn validate_expected_inventory(
+    directory: &Path,
+    artifacts: &[Artifact],
+    expected_path: Option<&Path>,
+) -> Result<(), ReleaseError> {
+    let Some(expected_path) = expected_path else {
+        return Ok(());
+    };
+    let text = read_to_string(expected_path)?;
+    let mut expected = BTreeSet::new();
+    for (line_number, line) in text.lines().enumerate() {
+        let name = line.trim();
+        if name.is_empty() {
+            continue;
+        }
+        let path = Path::new(name);
+        if path.is_absolute()
+            || path
+                .components()
+                .any(|component| matches!(component, Component::ParentDir))
+            || name.contains(['\n', '\r'])
+        {
+            return Err(ReleaseError::Invalid(format!(
+                "{}:{}: invalid expected artifact name",
+                expected_path.display(),
+                line_number + 1
+            )));
+        }
+        if !expected.insert(name.to_owned()) {
+            return Err(ReleaseError::Invalid(format!(
+                "{}:{}: duplicate expected artifact `{name}`",
+                expected_path.display(),
+                line_number + 1
+            )));
+        }
+    }
+    let actual = artifacts
+        .iter()
+        .map(|artifact| artifact.name.as_str())
+        .collect::<BTreeSet<_>>();
+    let expected_refs = expected.iter().map(String::as_str).collect::<BTreeSet<_>>();
+    if actual != expected_refs {
+        return Err(ReleaseError::Invalid(format!(
+            "expected artifact inventory in {} does not match {}",
+            expected_path.display(),
+            directory.display()
+        )));
+    }
+    Ok(())
+}
+
 fn artifact_map<'a>(
     artifacts: &'a [Artifact],
     source: &str,
@@ -497,10 +584,56 @@ fn read_to_string(path: &Path) -> Result<String, ReleaseError> {
 }
 
 fn write_file(path: &Path, contents: &str) -> Result<(), ReleaseError> {
-    fs::write(path, contents).map_err(|source| ReleaseError::Write {
-        path: path.to_path_buf(),
-        source,
-    })
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let temporary = path.with_file_name(format!(
+        ".{}.{}.{}.tmp",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("release"),
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed),
+    ));
+
+    let result = (|| {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .map_err(|source| ReleaseError::Write {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        file.write_all(contents.as_bytes())
+            .and_then(|_| file.sync_all())
+            .map_err(|source| ReleaseError::Write {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        drop(file);
+
+        match fs::rename(&temporary, path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                fs::remove_file(path).map_err(|source| ReleaseError::Write {
+                    path: path.to_path_buf(),
+                    source,
+                })?;
+                fs::rename(&temporary, path).map_err(|source| ReleaseError::Write {
+                    path: path.to_path_buf(),
+                    source,
+                })
+            }
+            Err(source) => Err(ReleaseError::Write {
+                path: path.to_path_buf(),
+                source,
+            }),
+        }
+    })();
+
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
 }
 
 #[cfg(test)]
@@ -569,5 +702,102 @@ mod tests {
 
         let error = create_manifest(temp.path(), ReleaseIdentity::default()).unwrap_err();
         assert!(error.to_string().contains("symlink"));
+    }
+
+    /// The workflows read and write these field names, so they are a contract
+    /// with `.github/workflows/release*.yml` rather than an implementation
+    /// detail. A rename here has to be paired with one there.
+    #[test]
+    fn writes_the_field_names_the_release_workflows_read() {
+        let temp = TempDir::new();
+        fs::write(temp.path().join("artifact.tar.gz"), b"artifact").unwrap();
+        create_manifest(
+            temp.path(),
+            ReleaseIdentity {
+                repository: Some("owner/repo".to_owned()),
+                release_tag: Some("v1.2.3".to_owned()),
+                source_commit: Some("abc123".to_owned()),
+                tag_object: Some("def456".to_owned()),
+                workflow_run: Some("https://example.test/runs/1".to_owned()),
+            },
+        )
+        .unwrap();
+
+        let written: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(temp.path().join(METADATA_FILE_NAME)).unwrap(),
+        )
+        .unwrap();
+        for field in [
+            "manifest_version",
+            "repository",
+            "release_tag",
+            "source_commit",
+            "tag_object",
+            "workflow_run",
+            "artifacts",
+        ] {
+            assert!(written.get(field).is_some(), "missing {field}: {written}");
+        }
+        assert_eq!(
+            written["manifest_version"],
+            serde_json::json!(MANIFEST_VERSION)
+        );
+    }
+
+    #[test]
+    fn records_the_annotated_tag_object_and_verifies_it() {
+        let temp = TempDir::new();
+        fs::write(temp.path().join("artifact"), b"artifact").unwrap();
+        let identity = ReleaseIdentity {
+            release_tag: Some("v1.2.3".to_owned()),
+            tag_object: Some("def456".to_owned()),
+            ..ReleaseIdentity::default()
+        };
+
+        let manifest = create_manifest(temp.path(), identity.clone()).unwrap();
+        assert_eq!(manifest.tag_object.as_deref(), Some("def456"));
+        verify_manifest(temp.path(), identity).unwrap();
+
+        let error = verify_manifest(
+            temp.path(),
+            ReleaseIdentity {
+                tag_object: Some("other".to_owned()),
+                ..ReleaseIdentity::default()
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("tag object"));
+    }
+
+    /// A lightweight tag has no tag object. It must be omitted rather than
+    /// written as an empty string, which the validator would compare literally.
+    #[test]
+    fn omits_the_tag_object_for_a_lightweight_tag() {
+        let temp = TempDir::new();
+        fs::write(temp.path().join("artifact"), b"artifact").unwrap();
+        create_manifest(
+            temp.path(),
+            ReleaseIdentity {
+                release_tag: Some("v1.2.3".to_owned()),
+                ..ReleaseIdentity::default()
+            },
+        )
+        .unwrap();
+
+        let written: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(temp.path().join(METADATA_FILE_NAME)).unwrap(),
+        )
+        .unwrap();
+        assert!(written.get("tag_object").is_none(), "{written}");
+
+        let error = verify_manifest(
+            temp.path(),
+            ReleaseIdentity {
+                tag_object: Some("def456".to_owned()),
+                ..ReleaseIdentity::default()
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("tag object"));
     }
 }

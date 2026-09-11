@@ -7,6 +7,8 @@ use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
+use serde::Serialize;
+
 use crate::config::{
     MonoConfig, PackageConfig, PipelineConfig, TaskConfig, WORKSPACE_PACKAGE_NAME, config_path,
     validate_process_value,
@@ -22,7 +24,7 @@ pub struct Package {
 }
 
 /// A task node uniquely identifies one package task.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub struct TaskNode {
     pub package: String,
     pub task: String,
@@ -62,6 +64,10 @@ pub struct PlannedTask {
     timeout: Duration,
     max_output_bytes: usize,
     resource_group: Option<String>,
+    retries: u32,
+    retry_backoff_seconds: Duration,
+    artifacts: Vec<String>,
+    finalizer: bool,
     depends_on: Vec<TaskNode>,
 }
 
@@ -125,6 +131,22 @@ impl PlannedTask {
         self.resource_group.as_deref()
     }
 
+    pub fn retries(&self) -> u32 {
+        self.retries
+    }
+
+    pub fn retry_backoff(&self) -> Duration {
+        self.retry_backoff_seconds
+    }
+
+    pub fn artifacts(&self) -> &[String] {
+        &self.artifacts
+    }
+
+    pub fn is_finalizer(&self) -> bool {
+        self.finalizer
+    }
+
     pub fn depends_on(&self) -> &[TaskNode] {
         &self.depends_on
     }
@@ -136,6 +158,7 @@ impl Workspace {
         let discovered = find_root(start)?;
         let root = discovered.root;
         let root_config = discovered.config;
+        validate_schema(&config_path(&root), root_config.schema)?;
         if discovered.kind == RootKind::Standalone {
             return Self::load_standalone(root, root_config);
         }
@@ -162,12 +185,12 @@ impl Workspace {
             validate_identifier(&config_path(&root), "pipeline name", pipeline_name)?;
         }
         for (pipeline_name, pipeline) in &root_config.pipelines {
-            if pipeline.tasks.is_empty() {
+            if pipeline.tasks.is_empty() && pipeline.finally.is_empty() {
                 return Err(WorkspaceError::InvalidWorkspace {
                     message: format!("pipeline '{pipeline_name}' has no tasks"),
                 });
             }
-            for task_name in &pipeline.tasks {
+            for task_name in pipeline.tasks.iter().chain(&pipeline.finally) {
                 validate_task_reference(task_name).map_err(|message| {
                     WorkspaceError::InvalidManifest {
                         path: config_path(&root),
@@ -239,6 +262,7 @@ impl Workspace {
                 }
 
                 let config = read_manifest(&manifest_path)?;
+                validate_schema(&manifest_path, config.schema)?;
                 let package_config =
                     config
                         .package
@@ -315,12 +339,12 @@ impl Workspace {
             validate_identifier(&config_path(&root), "pipeline name", pipeline_name)?;
         }
         for (pipeline_name, pipeline) in &root_config.pipelines {
-            if pipeline.tasks.is_empty() {
+            if pipeline.tasks.is_empty() && pipeline.finally.is_empty() {
                 return Err(WorkspaceError::InvalidWorkspace {
                     message: format!("pipeline '{pipeline_name}' has no tasks"),
                 });
             }
-            for task_name in &pipeline.tasks {
+            for task_name in pipeline.tasks.iter().chain(&pipeline.finally) {
                 validate_task_reference(task_name).map_err(|message| {
                     WorkspaceError::InvalidManifest {
                         path: config_path(&root),
@@ -433,10 +457,31 @@ impl Workspace {
         pipeline: Option<&str>,
         requested_tasks: &[String],
     ) -> Result<Vec<PlannedTask>, WorkspaceError> {
-        let ordered_nodes = self.plan_nodes(selected_package, pipeline, requested_tasks)?;
+        let mut ordered_nodes = self.plan_nodes(selected_package, pipeline, requested_tasks)?;
+        let mut finalizers = BTreeSet::new();
+        if requested_tasks.is_empty() {
+            let pipeline_name = pipeline.unwrap_or(&self.default_pipeline);
+            if let Some(pipeline_config) = self.pipelines.get(pipeline_name) {
+                let package_names = self.selected_packages(selected_package)?;
+                let mut state = ordered_nodes
+                    .iter()
+                    .cloned()
+                    .map(|node| (node, VisitState::Visited))
+                    .collect::<BTreeMap<_, _>>();
+                let mut stack = Vec::new();
+                for task_name in &pipeline_config.finally {
+                    let roots = self.root_nodes(task_name, selected_package, &package_names)?;
+                    for root in roots {
+                        finalizers.insert(root.clone());
+                        self.visit_task(&root, &mut state, &mut stack, &mut ordered_nodes)?;
+                    }
+                }
+            }
+        }
         let mut planned = Vec::with_capacity(ordered_nodes.len());
         for node in ordered_nodes {
-            planned.push(self.planned_task(node)?);
+            let is_finalizer = finalizers.contains(&node);
+            planned.push(self.planned_task(node, is_finalizer)?);
         }
         Ok(planned)
     }
@@ -469,7 +514,12 @@ impl Workspace {
             requested_tasks
         };
 
-        if task_names.is_empty() {
+        let pipeline_has_finalizers = requested_tasks.is_empty()
+            && self
+                .pipelines
+                .get(pipeline.unwrap_or(&self.default_pipeline))
+                .is_some_and(|config| !config.finally.is_empty());
+        if task_names.is_empty() && !pipeline_has_finalizers {
             return Err(WorkspaceError::InvalidWorkspace {
                 message: "the selected pipeline has no tasks".to_owned(),
             });
@@ -478,27 +528,7 @@ impl Workspace {
         let package_names = self.selected_packages(selected_package)?;
         let mut roots = BTreeSet::new();
         for task_name in task_names {
-            if let Some((package, task)) = split_task_ref(task_name) {
-                if let Some(selected) = selected_package
-                    && package != selected
-                {
-                    return Err(WorkspaceError::TaskOutsideSelectedPackage {
-                        package: package.to_owned(),
-                        selected: selected.to_owned(),
-                    });
-                }
-                roots.insert(TaskNode {
-                    package: package.to_owned(),
-                    task: task.to_owned(),
-                });
-            } else {
-                for package in &package_names {
-                    roots.insert(TaskNode {
-                        package: package.clone(),
-                        task: task_name.clone(),
-                    });
-                }
-            }
+            roots.extend(self.root_nodes(task_name, selected_package, &package_names)?);
         }
 
         if roots.is_empty() {
@@ -522,10 +552,66 @@ impl Workspace {
         Ok(ordered_nodes)
     }
 
+    fn root_nodes(
+        &self,
+        task_name: &str,
+        selected_package: Option<&str>,
+        package_names: &BTreeSet<String>,
+    ) -> Result<Vec<TaskNode>, WorkspaceError> {
+        let package_tasks = if let Some((package, task)) = split_task_ref(task_name) {
+            if let Some(selected) = selected_package
+                && package != selected
+            {
+                return Err(WorkspaceError::TaskOutsideSelectedPackage {
+                    package: package.to_owned(),
+                    selected: selected.to_owned(),
+                });
+            }
+            vec![(package.to_owned(), task.to_owned())]
+        } else {
+            package_names
+                .iter()
+                .map(|package| (package.clone(), task_name.to_owned()))
+                .collect()
+        };
+
+        let mut roots = Vec::new();
+        for (package, task) in package_tasks {
+            let node = TaskNode {
+                package: package.clone(),
+                task: task.clone(),
+            };
+            let config = self.task_config(&node)?;
+            let dimensions =
+                task_dimensions(&task).map_err(|_| WorkspaceError::InvalidTaskReference {
+                    reference: task.clone(),
+                    from: node.clone(),
+                })?;
+            if !dimensions.is_empty() {
+                roots.push(node);
+                continue;
+            }
+            let instances =
+                matrix_instances(&config.matrix, &BTreeMap::new()).map_err(|message| {
+                    WorkspaceError::InvalidTask {
+                        package,
+                        task,
+                        message,
+                    }
+                })?;
+            let base = base_task_name(&node.task).expect("task name parsed");
+            roots.extend(instances.into_iter().map(|instance| TaskNode {
+                package: node.package.clone(),
+                task: format_task_instance(base, &instance),
+            }));
+        }
+        Ok(roots)
+    }
+
     /// Report every graph defect in every declared pipeline.
     fn validate_pipelines(&self) -> Result<(), WorkspaceError> {
         for pipeline_name in self.pipelines.keys() {
-            self.plan_nodes(None, Some(pipeline_name), &[])?;
+            self.plan(None, Some(pipeline_name), &[])?;
         }
         Ok(())
     }
@@ -545,8 +631,11 @@ impl Workspace {
                     .task_config(&node)?
                     .depends_on
                     .iter()
-                    .map(|dependency| self.resolve_task_ref(&node, dependency))
-                    .collect::<Result<Vec<_>, _>>()?;
+                    .map(|dependency| self.resolve_task_refs(&node, dependency))
+                    .collect::<Result<Vec<Vec<_>>, _>>()?
+                    .into_iter()
+                    .flatten()
+                    .collect();
                 Ok((node, dependencies))
             })
             .collect()
@@ -573,6 +662,7 @@ impl Workspace {
     }
 
     fn task_suggestion(&self, package: &str, task: &str) -> Option<String> {
+        let task = base_task_name(task).unwrap_or(task);
         if package == WORKSPACE_PACKAGE_NAME {
             closest_name(task, self.workspace_tasks.keys())
         } else {
@@ -625,8 +715,11 @@ impl Workspace {
         let dependencies = task
             .depends_on
             .iter()
-            .map(|dependency| self.resolve_task_ref(node, dependency))
-            .collect::<Result<Vec<_>, _>>()?;
+            .map(|dependency| self.resolve_task_refs(node, dependency))
+            .collect::<Result<Vec<Vec<_>>, _>>()?
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
         for dependency in &dependencies {
             self.visit_task(dependency, state, stack, order)?;
         }
@@ -638,12 +731,17 @@ impl Workspace {
         Ok(())
     }
 
-    fn planned_task(&self, node: TaskNode) -> Result<PlannedTask, WorkspaceError> {
+    fn planned_task(&self, node: TaskNode, finalizer: bool) -> Result<PlannedTask, WorkspaceError> {
+        let base_task =
+            base_task_name(&node.task).map_err(|_| WorkspaceError::InvalidTaskReference {
+                reference: node.task.clone(),
+                from: node.clone(),
+            })?;
         let (package_name, package_path, task) = if node.package == WORKSPACE_PACKAGE_NAME {
             (
                 WORKSPACE_PACKAGE_NAME,
                 &self.root,
-                self.workspace_tasks.get(&node.task),
+                self.workspace_tasks.get(base_task),
             )
         } else {
             let package =
@@ -656,7 +754,7 @@ impl Workspace {
             (
                 package.name.as_str(),
                 &package.path,
-                package.tasks.get(&node.task),
+                package.tasks.get(base_task),
             )
         };
         let task = task.ok_or_else(|| WorkspaceError::MissingTask {
@@ -664,10 +762,30 @@ impl Workspace {
             package: node.package.clone(),
             task: node.task.clone(),
         })?;
-        let cwd = task.cwd.as_deref().unwrap_or(".");
+        let dimensions =
+            task_dimensions(&node.task).map_err(|_| WorkspaceError::InvalidTaskReference {
+                reference: node.task.clone(),
+                from: node.clone(),
+            })?;
+        validate_matrix_instance(&task.matrix, &dimensions).map_err(|message| {
+            WorkspaceError::InvalidTask {
+                package: package_name.to_owned(),
+                task: node.task.clone(),
+                message,
+            }
+        })?;
+        let task_name = node.task.clone();
+        let interpolate = |value: &str| {
+            interpolate_value(value, &dimensions).map_err(|message| WorkspaceError::InvalidTask {
+                package: package_name.to_owned(),
+                task: task_name.clone(),
+                message,
+            })
+        };
+        let cwd = interpolate(task.cwd.as_deref().unwrap_or("."))?;
         let cwd_path =
-            fs::canonicalize(package_path.join(cwd)).map_err(|source| WorkspaceError::Io {
-                path: package_path.join(cwd),
+            fs::canonicalize(package_path.join(&cwd)).map_err(|source| WorkspaceError::Io {
+                path: package_path.join(&cwd),
                 source,
             })?;
         if !cwd_path.starts_with(package_path) || !cwd_path.is_dir() {
@@ -680,19 +798,37 @@ impl Workspace {
         let depends_on = task
             .depends_on
             .iter()
-            .map(|dependency| self.resolve_task_ref(&node, dependency))
-            .collect::<Result<Vec<_>, _>>()?;
-        let task_name = node.task.clone();
+            .map(|dependency| self.resolve_task_refs(&node, dependency))
+            .collect::<Result<Vec<Vec<_>>, _>>()?
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
         let planned = PlannedTask {
             package: package_name.to_owned(),
             package_path: package_path.clone(),
-            task: node.task,
-            command: task.command.clone(),
+            task: task_name.clone(),
+            command: task
+                .command
+                .iter()
+                .map(|value| interpolate(value))
+                .collect::<Result<Vec<_>, _>>()?,
             cwd: cwd_path,
-            env: task.env.clone(),
+            env: task
+                .env
+                .iter()
+                .map(|(key, value)| Ok((key.clone(), interpolate(value)?)))
+                .collect::<Result<BTreeMap<_, _>, WorkspaceError>>()?,
             cache: task.cache,
-            inputs: task.inputs.clone(),
-            outputs: task.outputs.clone(),
+            inputs: task
+                .inputs
+                .iter()
+                .map(|value| interpolate(value))
+                .collect::<Result<Vec<_>, _>>()?,
+            outputs: task
+                .outputs
+                .iter()
+                .map(|value| interpolate(value))
+                .collect::<Result<Vec<_>, _>>()?,
             cache_env: task.cache_env.clone(),
             timeout: Duration::from_secs(task.timeout_seconds),
             max_output_bytes: usize::try_from(task.max_output_bytes).map_err(|_| {
@@ -703,6 +839,14 @@ impl Workspace {
                 }
             })?,
             resource_group: task.resource_group.clone(),
+            retries: task.retries,
+            retry_backoff_seconds: Duration::from_secs(task.retry_backoff_seconds),
+            artifacts: task
+                .artifacts
+                .iter()
+                .map(|value| interpolate(value))
+                .collect::<Result<Vec<_>, _>>()?,
+            finalizer,
             depends_on,
         };
         assert!(
@@ -729,14 +873,20 @@ impl Workspace {
     }
 
     fn task_config(&self, node: &TaskNode) -> Result<&TaskConfig, WorkspaceError> {
+        let base =
+            base_task_name(&node.task).map_err(|_| WorkspaceError::InvalidTaskReference {
+                reference: node.task.clone(),
+                from: node.clone(),
+            })?;
         if node.package == WORKSPACE_PACKAGE_NAME {
-            return self.workspace_tasks.get(&node.task).ok_or_else(|| {
-                WorkspaceError::MissingTask {
-                    suggestion: self.task_suggestion(&node.package, &node.task),
+            return self
+                .workspace_tasks
+                .get(base)
+                .ok_or_else(|| WorkspaceError::MissingTask {
+                    suggestion: self.task_suggestion(&node.package, base),
                     package: node.package.clone(),
                     task: node.task.clone(),
-                }
-            });
+                });
         }
 
         let package =
@@ -748,12 +898,59 @@ impl Workspace {
                 })?;
         package
             .tasks
-            .get(&node.task)
+            .get(base)
             .ok_or_else(|| WorkspaceError::MissingTask {
-                suggestion: self.task_suggestion(&node.package, &node.task),
+                suggestion: self.task_suggestion(&node.package, base),
                 package: node.package.clone(),
                 task: node.task.clone(),
             })
+    }
+
+    fn resolve_task_refs(
+        &self,
+        current: &TaskNode,
+        reference: &str,
+    ) -> Result<Vec<TaskNode>, WorkspaceError> {
+        let base = self.resolve_task_ref(current, reference)?;
+        let task = self.task_config(&base)?;
+        let explicit =
+            task_dimensions(&base.task).map_err(|_| WorkspaceError::InvalidTaskReference {
+                reference: reference.to_owned(),
+                from: current.clone(),
+            })?;
+        if !explicit.is_empty() {
+            validate_matrix_instance(&task.matrix, &explicit).map_err(|message| {
+                WorkspaceError::InvalidTask {
+                    package: base.package.clone(),
+                    task: base.task.clone(),
+                    message,
+                }
+            })?;
+            return Ok(vec![base]);
+        }
+
+        let dimensions =
+            task_dimensions(&current.task).map_err(|_| WorkspaceError::InvalidTaskReference {
+                reference: current.task.clone(),
+                from: current.clone(),
+            })?;
+        let values = matrix_instances(&task.matrix, &dimensions).map_err(|message| {
+            WorkspaceError::InvalidTask {
+                package: base.package.clone(),
+                task: base.task.clone(),
+                message,
+            }
+        })?;
+        Ok(values
+            .into_iter()
+            .map(|instance| TaskNode {
+                package: base.package.clone(),
+                task: format_task_instance(
+                    base_task_name(&base.task).expect("base task parsed"),
+                    &instance,
+                ),
+            })
+            .collect())
     }
 
     fn resolve_task_ref(
@@ -802,6 +999,17 @@ impl Package {
     }
 }
 
+pub(crate) fn validate_schema(path: &Path, schema: u32) -> Result<(), WorkspaceError> {
+    if schema != crate::config::SUPPORTED_SCHEMA {
+        return Err(WorkspaceError::UnsupportedSchema {
+            path: path.to_path_buf(),
+            found: schema,
+            supported: crate::config::SUPPORTED_SCHEMA,
+        });
+    }
+    Ok(())
+}
+
 fn validate_package_config(
     manifest_path: &Path,
     package_path: &Path,
@@ -816,7 +1024,7 @@ fn validate_package_config(
             &format!("task name in package '{}'", config.name),
             task_name,
         )?;
-        if task_name.is_empty() || task_name.contains(':') {
+        if task_name.is_empty() || task_name.contains([':', '[', ']', '=', ',']) {
             return Err(WorkspaceError::InvalidTaskName {
                 package: config.name.clone(),
                 task: task_name.clone(),
@@ -873,6 +1081,57 @@ fn validate_package_config(
                 message,
             })?;
         }
+        for (dimension, values) in &task.matrix {
+            validate_identifier(manifest_path, "matrix dimension", dimension)?;
+            if values.is_empty() {
+                return Err(WorkspaceError::InvalidTask {
+                    package: config.name.clone(),
+                    task: task_name.clone(),
+                    message: format!("matrix dimension '{dimension}' must have at least one value"),
+                });
+            }
+            let mut seen = BTreeSet::new();
+            for value in values {
+                validate_process_value(value, "matrix value")
+                    .and_then(|_| {
+                        if value.contains(['[', ']', '=', ',']) {
+                            Err("matrix values cannot contain '[', ']', '=', or ','".to_owned())
+                        } else {
+                            Ok(())
+                        }
+                    })
+                    .map_err(|message| WorkspaceError::InvalidTask {
+                        package: config.name.clone(),
+                        task: task_name.clone(),
+                        message,
+                    })?;
+                if !seen.insert(value) {
+                    return Err(WorkspaceError::InvalidTask {
+                        package: config.name.clone(),
+                        task: task_name.clone(),
+                        message: format!(
+                            "matrix dimension '{dimension}' contains duplicate value '{value}'"
+                        ),
+                    });
+                }
+            }
+        }
+        let matrix_size = task
+            .matrix
+            .values()
+            .try_fold(1usize, |size, values| size.checked_mul(values.len()))
+            .ok_or_else(|| WorkspaceError::InvalidTask {
+                package: config.name.clone(),
+                task: task_name.clone(),
+                message: "matrix has too many instances".to_owned(),
+            })?;
+        if matrix_size > 1024 {
+            return Err(WorkspaceError::InvalidTask {
+                package: config.name.clone(),
+                task: task_name.clone(),
+                message: "matrix cannot expand to more than 1024 instances".to_owned(),
+            });
+        }
         for variable in &task.cache_env {
             if variable.is_empty() || variable.contains('=') {
                 return Err(WorkspaceError::InvalidTask {
@@ -902,6 +1161,32 @@ fn validate_package_config(
                 task: task_name.clone(),
                 message: "max_output_bytes must be greater than zero".to_owned(),
             });
+        }
+        if task.retries > 0 && task.retry_backoff_seconds > 86_400 {
+            return Err(WorkspaceError::InvalidTask {
+                package: config.name.clone(),
+                task: task_name.clone(),
+                message: "retry_backoff_seconds must not exceed 86400".to_owned(),
+            });
+        }
+        if !task.artifacts.is_empty()
+            && !task
+                .artifacts
+                .iter()
+                .any(|pattern| !pattern.starts_with('!'))
+        {
+            return Err(WorkspaceError::InvalidTask {
+                package: config.name.clone(),
+                task: task_name.clone(),
+                message: "artifacts must declare at least one positive pattern".to_owned(),
+            });
+        }
+        for pattern in &task.artifacts {
+            validate_cache_pattern(pattern).map_err(|message| WorkspaceError::InvalidTask {
+                package: config.name.clone(),
+                task: task_name.clone(),
+                message: format!("artifact pattern: {message}"),
+            })?;
         }
         if usize::try_from(task.max_output_bytes).is_err() {
             return Err(WorkspaceError::InvalidTask {
@@ -934,18 +1219,20 @@ fn validate_package_config(
                     message: "cwd must be an existing relative directory without '..'".to_owned(),
                 });
             }
-            let cwd_path = package_path.join(cwd);
-            let canonical_cwd =
-                fs::canonicalize(&cwd_path).map_err(|source| WorkspaceError::Io {
-                    path: cwd_path.clone(),
-                    source,
-                })?;
-            if !canonical_cwd.starts_with(package_path) || !canonical_cwd.is_dir() {
-                return Err(WorkspaceError::InvalidTask {
-                    package: config.name.clone(),
-                    task: task_name.clone(),
-                    message: "cwd must resolve to a directory inside the package".to_owned(),
-                });
+            if !cwd.contains("${") {
+                let cwd_path = package_path.join(cwd);
+                let canonical_cwd =
+                    fs::canonicalize(&cwd_path).map_err(|source| WorkspaceError::Io {
+                        path: cwd_path.clone(),
+                        source,
+                    })?;
+                if !canonical_cwd.starts_with(package_path) || !canonical_cwd.is_dir() {
+                    return Err(WorkspaceError::InvalidTask {
+                        package: config.name.clone(),
+                        task: task_name.clone(),
+                        message: "cwd must resolve to a directory inside the package".to_owned(),
+                    });
+                }
             }
         }
     }
@@ -999,6 +1286,130 @@ fn validate_cache_pattern(pattern: &str) -> Result<(), String> {
 
 fn split_task_ref(reference: &str) -> Option<(&str, &str)> {
     reference.split_once(':')
+}
+
+fn base_task_name(task: &str) -> Result<&str, ()> {
+    match task.find('[') {
+        None => Ok(task),
+        Some(index) if task.ends_with(']') && index > 0 => Ok(&task[..index]),
+        Some(_) => Err(()),
+    }
+}
+
+fn task_dimensions(task: &str) -> Result<BTreeMap<String, String>, ()> {
+    let Some(index) = task.find('[') else {
+        return Ok(BTreeMap::new());
+    };
+    if !task.ends_with(']') {
+        return Err(());
+    }
+    let body = &task[index + 1..task.len() - 1];
+    if body.is_empty() {
+        return Err(());
+    }
+    let mut dimensions = BTreeMap::new();
+    for pair in body.split(',') {
+        let Some((key, value)) = pair.split_once('=') else {
+            return Err(());
+        };
+        if key.is_empty()
+            || value.is_empty()
+            || dimensions
+                .insert(key.to_owned(), value.to_owned())
+                .is_some()
+        {
+            return Err(());
+        }
+    }
+    Ok(dimensions)
+}
+
+fn validate_matrix_instance(
+    matrix: &BTreeMap<String, Vec<String>>,
+    dimensions: &BTreeMap<String, String>,
+) -> Result<(), String> {
+    if matrix.is_empty() {
+        if dimensions.is_empty() {
+            return Ok(());
+        }
+        return Err("task is not matrix-parameterized".to_owned());
+    }
+    if matrix.len() != dimensions.len() {
+        return Err("matrix task references must specify every dimension".to_owned());
+    }
+    for (key, values) in matrix {
+        let Some(value) = dimensions.get(key) else {
+            return Err(format!(
+                "matrix task reference is missing dimension '{key}'"
+            ));
+        };
+        if !values.contains(value) {
+            return Err(format!("matrix dimension '{key}' has no value '{value}'"));
+        }
+    }
+    Ok(())
+}
+
+fn format_task_instance(base: &str, dimensions: &BTreeMap<String, String>) -> String {
+    if dimensions.is_empty() {
+        return base.to_owned();
+    }
+    let values = dimensions
+        .iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("{base}[{values}]")
+}
+
+fn matrix_instances(
+    matrix: &BTreeMap<String, Vec<String>>,
+    fixed: &BTreeMap<String, String>,
+) -> Result<Vec<BTreeMap<String, String>>, String> {
+    if matrix.is_empty() {
+        return Ok(vec![BTreeMap::new()]);
+    }
+    let mut instances = vec![BTreeMap::new()];
+    for (key, values) in matrix {
+        let selected = if let Some(value) = fixed.get(key) {
+            if !values.contains(value) {
+                return Err(format!("matrix dimension '{key}' has no value '{value}'"));
+            }
+            vec![value.clone()]
+        } else {
+            values.clone()
+        };
+        let mut next = Vec::new();
+        for instance in instances {
+            for value in &selected {
+                let mut expanded = instance.clone();
+                expanded.insert(key.clone(), value.clone());
+                next.push(expanded);
+            }
+        }
+        instances = next;
+    }
+    Ok(instances)
+}
+
+fn interpolate_value(value: &str, dimensions: &BTreeMap<String, String>) -> Result<String, String> {
+    let mut output = String::with_capacity(value.len());
+    let mut remaining = value;
+    while let Some(start) = remaining.find("${") {
+        output.push_str(&remaining[..start]);
+        let after = &remaining[start + 2..];
+        let Some(end) = after.find('}') else {
+            return Err(format!("unterminated matrix placeholder in `{value}`"));
+        };
+        let key = &after[..end];
+        let replacement = dimensions
+            .get(key)
+            .ok_or_else(|| format!("unknown matrix placeholder `${{{key}}}` in `{value}`"))?;
+        output.push_str(replacement);
+        remaining = &after[end + 1..];
+    }
+    output.push_str(remaining);
+    Ok(output)
 }
 
 fn closest_name<'a>(
@@ -1103,6 +1514,11 @@ pub enum WorkspaceError {
     TaskCycle {
         path: Vec<TaskNode>,
     },
+    UnsupportedSchema {
+        path: PathBuf,
+        found: u32,
+        supported: u32,
+    },
 }
 
 impl fmt::Display for WorkspaceError {
@@ -1178,6 +1594,15 @@ impl fmt::Display for WorkspaceError {
                     .join(" -> ");
                 write!(f, "task dependency cycle detected: {cycle}")
             }
+            Self::UnsupportedSchema {
+                path,
+                found,
+                supported,
+            } => write!(
+                f,
+                "unsupported manifest schema {found} in {}; supported schema is {supported}",
+                path.display()
+            ),
         }
     }
 }
@@ -1615,5 +2040,112 @@ mod tests {
             error,
             WorkspaceError::TaskOutsideSelectedPackage { .. }
         ));
+    }
+
+    #[test]
+    fn rejects_an_unsupported_root_manifest_schema() {
+        let temp = TempDir::new();
+        fs::write(
+            config_path(temp.path()),
+            "schema = 2\n\n[workspace]\nname = \"repo\"\nmembers = []\n\n[pipelines.ci]\ntasks = [\"build\"]\n",
+        )
+        .expect("write future manifest");
+
+        let error = Workspace::load(temp.path()).expect_err("future schema must fail clearly");
+
+        assert!(error.to_string().contains("unsupported manifest schema 2"));
+        assert!(error.to_string().contains("supported schema is 1"));
+    }
+
+    #[test]
+    fn rejects_unsupported_schema_before_invalid_manifest_precedence() {
+        // An unsupported-schema root with both [workspace] and [package] must return
+        // UnsupportedSchema, *not* InvalidManifest ("both present") — schema validation
+        // must run before manifest classification.
+        let temp = TempDir::new();
+        fs::write(
+            config_path(temp.path()),
+            "schema = 2\n\n[workspace]\nname = \"repo\"\nmembers = []\n\n[package]\nname = \"repo\"\n\n[pipelines.ci]\ntasks = [\"build\"]\n",
+        )
+        .expect("write future manifest with both sections");
+
+        let error = Workspace::load(temp.path())
+            .expect_err("future schema must fail before invalid-manifest");
+
+        assert!(
+            error.to_string().contains("unsupported manifest schema 2"),
+            "expected UnsupportedSchema, got: {error}"
+        );
+        assert!(error.to_string().contains("supported schema is 1"));
+    }
+
+    #[test]
+    fn rejects_an_unsupported_package_manifest_schema() {
+        let temp = TempDir::new();
+        let root = root_with_members(&temp, "\"packages/*\"");
+        write_manifest(
+            &root.join("packages/app"),
+            "schema = 2\n\n[package]\nname = \"app\"\n\n[tasks.build]\ncommand = [\"echo\", \"build\"]\n",
+        );
+
+        let error = Workspace::load(&root).expect_err("future package schema must fail clearly");
+
+        assert!(error.to_string().contains("unsupported manifest schema 2"));
+    }
+
+    #[test]
+    fn expands_matrix_tasks_and_interpolates_arguments() {
+        let temp = TempDir::new();
+        let root = root_with_members(&temp, "\"packages/*\"");
+        write_manifest(
+            &root.join("packages/app"),
+            "[package]\nname = \"app\"\n\n[tasks.prepare]\ncommand = [\"echo\", \"prepare\"]\n\n[tasks.build]\ncommand = [\"echo\", \"${target}\"]\ndepends_on = [\"prepare\"]\nmatrix.target = [\"linux\", \"windows\"]\n",
+        );
+
+        let workspace = Workspace::load(&root).expect("workspace loads");
+        let plan = workspace
+            .plan(None, None, &[])
+            .expect("matrix plan succeeds");
+
+        assert_eq!(
+            plan.iter().map(|task| task.node()).collect::<Vec<_>>(),
+            vec![
+                TaskNode {
+                    package: "app".to_owned(),
+                    task: "prepare".to_owned()
+                },
+                TaskNode {
+                    package: "app".to_owned(),
+                    task: "build[target=linux]".to_owned()
+                },
+                TaskNode {
+                    package: "app".to_owned(),
+                    task: "build[target=windows]".to_owned()
+                },
+            ]
+        );
+        assert_eq!(plan[1].command(), &["echo".to_owned(), "linux".to_owned()]);
+        assert_eq!(
+            plan[2].command(),
+            &["echo".to_owned(), "windows".to_owned()]
+        );
+    }
+
+    #[test]
+    fn appends_pipeline_finalizers_and_marks_them() {
+        let temp = TempDir::new();
+        fs::write(
+            config_path(temp.path()),
+            "[package]\nname = \"app\"\n\n[pipelines.ci]\ntasks = [\"build\"]\nfinally = [\"cleanup\"]\n\n[tasks.build]\ncommand = [\"echo\", \"build\"]\n\n[tasks.cleanup]\ncommand = [\"echo\", \"cleanup\"]\n",
+        )
+        .expect("write standalone manifest");
+
+        let workspace = Workspace::load(temp.path()).expect("workspace loads");
+        let plan = workspace.plan(None, None, &[]).expect("plan succeeds");
+
+        assert_eq!(plan.len(), 2);
+        assert!(!plan[0].is_finalizer());
+        assert!(plan[1].is_finalizer());
+        assert_eq!(plan[1].task(), "cleanup");
     }
 }

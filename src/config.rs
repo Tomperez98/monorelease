@@ -10,10 +10,16 @@ pub const CONFIG_FILE_NAME: &str = "mono.toml";
 /// Namespace used by task references for tasks declared in the root manifest.
 pub const WORKSPACE_PACKAGE_NAME: &str = "workspace";
 
+/// Version of the `mono.toml` schema, not the project or package version.
+pub const SUPPORTED_SCHEMA: u32 = 1;
+
 /// The fixed on-disk `mono.toml` schema.
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct MonoConfig {
+    /// Version of the `mono.toml` schema, not the project or package version.
+    #[serde(default = "default_schema")]
+    pub schema: u32,
     #[serde(default)]
     pub workspace: Option<WorkspaceConfig>,
     #[serde(default)]
@@ -32,6 +38,7 @@ impl MonoConfig {
         pipelines.insert("ci".to_owned(), PipelineConfig::ci_template());
 
         Self {
+            schema: default_schema(),
             workspace: Some(WorkspaceConfig::template()),
             package: None,
             tasks: BTreeMap::new(),
@@ -73,6 +80,10 @@ impl MonoConfig {
                 timeout_seconds: default_timeout_seconds(),
                 max_output_bytes: default_max_output_bytes(),
                 resource_group: None,
+                retries: 0,
+                retry_backoff_seconds: 0,
+                artifacts: Vec::new(),
+                matrix: BTreeMap::new(),
             },
         );
         let mut pipelines = BTreeMap::new();
@@ -80,10 +91,12 @@ impl MonoConfig {
             "ci".to_owned(),
             PipelineConfig {
                 tasks: vec!["build".to_owned()],
+                finally: Vec::new(),
             },
         );
 
         Self {
+            schema: default_schema(),
             workspace: None,
             package: Some(PackageConfig { name }),
             tasks,
@@ -157,6 +170,19 @@ pub struct TaskConfig {
     /// Tasks sharing a resource group never run concurrently.
     #[serde(default)]
     pub resource_group: Option<String>,
+    /// Number of additional attempts after a failed invocation.
+    #[serde(default)]
+    pub retries: u32,
+    /// Delay between retry attempts, in seconds.
+    #[serde(default)]
+    pub retry_backoff_seconds: u64,
+    /// Files produced for release or distribution workflows. Unlike `outputs`,
+    /// these are metadata only and are never restored by the task cache.
+    #[serde(default)]
+    pub artifacts: Vec<String>,
+    /// Opaque string dimensions used to create independent task instances.
+    #[serde(default)]
+    pub matrix: BTreeMap<String, Vec<String>>,
 }
 
 /// A named workspace pipeline made of task names.
@@ -164,14 +190,22 @@ pub struct TaskConfig {
 #[serde(deny_unknown_fields)]
 pub struct PipelineConfig {
     pub tasks: Vec<String>,
+    /// Tasks that run after the normal pipeline, even when a normal task fails.
+    #[serde(default)]
+    pub finally: Vec<String>,
 }
 
 impl PipelineConfig {
     pub fn ci_template() -> Self {
         Self {
             tasks: vec!["build".to_owned(), "test".to_owned()],
+            finally: Vec::new(),
         }
     }
+}
+
+fn default_schema() -> u32 {
+    SUPPORTED_SCHEMA
 }
 
 fn default_pipeline() -> String {
@@ -218,6 +252,14 @@ mod tests {
     }
 
     #[test]
+    fn config_path_joins_the_file_name_onto_the_directory() {
+        assert_eq!(
+            config_path(Path::new("repo")),
+            Path::new("repo").join(CONFIG_FILE_NAME),
+        );
+    }
+
+    #[test]
     fn standalone_template_round_trips_through_toml() {
         let config = MonoConfig::standalone_template(
             "app".to_owned(),
@@ -227,14 +269,6 @@ mod tests {
         let parsed = MonoConfig::parse(&rendered).expect("standalone config parses");
 
         assert_eq!(parsed, config);
-    }
-
-    #[test]
-    fn config_path_joins_the_file_name_onto_the_directory() {
-        assert_eq!(
-            config_path(Path::new("repo")),
-            Path::new("repo").join(CONFIG_FILE_NAME),
-        );
     }
 
     #[test]
@@ -258,15 +292,41 @@ mod tests {
                 timeout_seconds: 600,
                 max_output_bytes: default_max_output_bytes(),
                 resource_group: None,
+                retries: 0,
+                retry_backoff_seconds: 0,
+                artifacts: Vec::new(),
+                matrix: BTreeMap::new(),
             }
         );
     }
 
     #[test]
-    fn rejects_schema_version_headers() {
-        let error = MonoConfig::parse("version = 1\n\n[workspace]\nname = \"repo\"\n")
-            .expect_err("version headers are not part of the fixed schema");
+    fn omitted_schema_defaults_to_version_one() {
+        let parsed = MonoConfig::parse(
+            "[package]\nname = \"worker\"\n\n[tasks.build]\ncommand = [\"make\", \"build\"]\n",
+        )
+        .expect("package parses");
 
-        assert!(error.to_string().contains("unknown field"));
+        assert_eq!(parsed.schema, 1);
+    }
+
+    #[test]
+    fn schema_round_trips_through_toml() {
+        let config = MonoConfig::template();
+        let rendered = render_config(&config);
+        assert!(rendered.starts_with("schema = 1\n"));
+        assert_eq!(MonoConfig::parse(&rendered).unwrap(), config);
+    }
+
+    #[test]
+    fn rejects_unknown_top_level_fields_but_accepts_schema() {
+        let accepted = MonoConfig::parse(
+            "schema = 1\n\n[workspace]\nname = \"repo\"\n\n[pipelines.ci]\ntasks = [\"build\"]\n",
+        );
+        assert!(accepted.is_ok());
+
+        let rejected = MonoConfig::parse("version = 1\n\n[workspace]\nname = \"repo\"\n")
+            .expect_err("version is not the manifest schema field");
+        assert!(rejected.to_string().contains("unknown field"));
     }
 }

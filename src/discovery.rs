@@ -4,7 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::config::{MonoConfig, config_path};
-use crate::workspace::WorkspaceError;
+use crate::workspace::{WorkspaceError, validate_schema};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RootKind {
@@ -36,6 +36,7 @@ pub(crate) fn find_root(start: &Path) -> Result<DiscoveredRoot, WorkspaceError> 
         let manifest_path = config_path(&current);
         if manifest_path.is_file() {
             let config = read_manifest(&manifest_path)?;
+            validate_schema(&manifest_path, config.schema)?;
             match (config.workspace.is_some(), config.package.is_some()) {
                 (true, true) => {
                     return Err(WorkspaceError::InvalidManifest {

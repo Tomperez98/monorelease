@@ -5,10 +5,12 @@ use std::fmt;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::process::{ManagedChild, WaitResult};
 use crate::workspace::PlannedTask;
 
 /// First wait between child-status polls. Short tasks finish after one or two
@@ -63,15 +65,17 @@ impl Runner {
         assert!(planned.cwd().starts_with(planned.package_path()));
 
         let started = Instant::now();
-        let mut child = Command::new(program)
+        let mut command = Command::new(program);
+        command
             .args(args)
             .current_dir(planned.cwd())
             .envs(planned.env())
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|source| RunnerError::Spawn {
+            .stderr(Stdio::piped());
+
+        let mut managed =
+            ManagedChild::spawn(&mut command).map_err(|source| RunnerError::Spawn {
                 package: planned.package().to_owned(),
                 task: planned.task().to_owned(),
                 command: planned.command().to_vec(),
@@ -79,25 +83,57 @@ impl Runner {
                 source,
             })?;
 
-        let stdout = child.stdout.take().expect("stdout was configured as piped");
-        let stderr = child.stderr.take().expect("stderr was configured as piped");
+        let stdout = managed
+            .take_stdout()
+            .expect("stdout was configured as piped");
+        let stderr = managed
+            .take_stderr()
+            .expect("stderr was configured as piped");
         let (limit_sender, limit_receiver) = mpsc::channel();
         let output_limit = planned.max_output_bytes();
+        let reader_done = Arc::new(AtomicU8::new(0));
         let stdout_reader = {
             let limit_sender = limit_sender.clone();
-            thread::spawn(move || read_stream(stdout, output_limit, "stdout", limit_sender))
+            let done = Arc::clone(&reader_done);
+            thread::spawn(move || {
+                let result = read_stream(stdout, output_limit, "stdout", limit_sender);
+                done.fetch_add(1, Ordering::Release);
+                result
+            })
         };
-        let stderr_reader =
-            thread::spawn(move || read_stream(stderr, output_limit, "stderr", limit_sender));
+        let stderr_reader = {
+            let limit_sender_clone = limit_sender.clone();
+            let done = Arc::clone(&reader_done);
+            thread::spawn(move || {
+                let result = read_stream(stderr, output_limit, "stderr", limit_sender_clone);
+                done.fetch_add(1, Ordering::Release);
+                result
+            })
+        };
 
         // Poll with exponential backoff capped at the remaining timeout: a
         // short task is noticed within a millisecond, and a long task costs a
         // handful of wakeups per second instead of a hundred.
         let mut poll_interval = POLL_INTERVAL_START;
+        let mut exceeded_stream: Option<&'static str> = None;
         let status = loop {
-            if let Ok(stream) = limit_receiver.try_recv() {
-                let _ = child.kill();
-                let _ = child.wait();
+            // Check stream-limit notification before checking child status
+            // so overflow is detected even when the notification arrives
+            // between polls.
+            if exceeded_stream.is_none()
+                && let Ok(stream) = limit_receiver.try_recv()
+            {
+                exceeded_stream = Some(stream);
+            }
+            if let Some(stream_name) = exceeded_stream {
+                // Terminate the tree so pipe-holding descendants release
+                // the readers, then join them and report the overflow.
+                let _ = managed.terminate_tree();
+                managed.wait().map_err(|source| RunnerError::Wait {
+                    package: planned.package().to_owned(),
+                    task: planned.task().to_owned(),
+                    source,
+                })?;
                 let joined = join_output(
                     planned.package(),
                     planned.task(),
@@ -107,17 +143,31 @@ impl Runner {
                 return Err(RunnerError::OutputLimit(Box::new(OutputLimitTask {
                     package: planned.package().to_owned(),
                     task: planned.task().to_owned(),
-                    stream,
+                    stream: stream_name,
                     limit: output_limit,
                     output: joined.output,
                     elapsed: started.elapsed(),
                 })));
             }
-            match child.try_wait() {
-                Ok(Some(status)) => break status,
-                Ok(None) if started.elapsed() >= planned.timeout() => {
-                    let _ = child.kill();
-                    let _ = child.wait();
+            match managed.try_wait() {
+                Ok(WaitResult::Exited(status)) => {
+                    // The child has exited. If both output readers have
+                    // already finished (no descendant inherited the pipe),
+                    // skip terminate_tree entirely.  Otherwise a descendant
+                    // still holds a pipe open and we must terminate the tree
+                    // to unblock the readers.
+                    if reader_done.load(Ordering::Acquire) < 2 {
+                        let _ = managed.terminate_tree();
+                    }
+                    break status;
+                }
+                Ok(WaitResult::Running) if started.elapsed() >= planned.timeout() => {
+                    let _ = managed.terminate_tree();
+                    managed.wait().map_err(|source| RunnerError::Wait {
+                        package: planned.package().to_owned(),
+                        task: planned.task().to_owned(),
+                        source,
+                    })?;
                     let output = join_output(
                         planned.package(),
                         planned.task(),
@@ -135,14 +185,13 @@ impl Runner {
                         elapsed: started.elapsed(),
                     })));
                 }
-                Ok(None) => {
+                Ok(WaitResult::Running) => {
                     let remaining = planned.timeout().saturating_sub(started.elapsed());
                     thread::sleep(poll_interval.min(remaining));
                     poll_interval = (poll_interval * 2).min(POLL_INTERVAL_MAX);
                 }
                 Err(source) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    let _ = managed.terminate_tree();
                     let _ = stdout_reader.join();
                     let _ = stderr_reader.join();
                     return Err(RunnerError::Wait {
@@ -202,8 +251,8 @@ struct JoinedOutput {
     exceeded_stream: Option<&'static str>,
 }
 
-fn read_stream<R: Read>(
-    mut stream: R,
+fn read_stream(
+    mut stream: Box<dyn Read + Send>,
     limit: usize,
     stream_name: &'static str,
     limit_sender: mpsc::Sender<&'static str>,
@@ -524,6 +573,58 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn timeout_terminates_descendants_before_their_delayed_write() {
+        let temp = TempDir::new();
+        let marker = temp.path().join("descendant-finished");
+        let marker_text = marker.to_string_lossy();
+        let (_temp, workspace) = workspace_with_task(
+            &format!("(sleep 5; printf leaked > '{marker_text}') & wait"),
+            Some(1),
+        );
+        let plan = workspace.plan(None, None, &[]).expect("plan succeeds");
+
+        let error = Runner::new()
+            .run(&workspace.root, &plan[0])
+            .expect_err("task must time out");
+        assert!(matches!(error, RunnerError::TimedOut(_)));
+
+        std::thread::sleep(std::time::Duration::from_millis(1200));
+        assert!(!marker.exists(), "a timed-out descendant kept running");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn successful_exit_spares_a_detached_descendant() {
+        let temp = TempDir::new();
+        let marker = temp.path().join("descendant-finished");
+        let marker_text = marker.to_string_lossy();
+        // The direct child closes its own stdout/stderr first, so the output
+        // readers reach EOF while it sleeps; then it detaches a descendant
+        // whose stdout/stderr point at /dev/null and exits successfully.
+        // Because the descendant never held the pipes, output collection
+        // completes without touching it, and a normal successful exit must
+        // not terminate its tree.  Only timeout and output-limit paths
+        // terminate trees.
+        let (_temp, workspace) = workspace_with_task(
+            &format!(
+                "exec 1>&- 2>&-; (sleep 3; printf leaked > '{marker_text}') </dev/null >/dev/null 2>&1 & sleep 0.5; exit 0"
+            ),
+            None,
+        );
+        let plan = workspace.plan(None, None, &[]).expect("plan succeeds");
+        Runner::new()
+            .run(&workspace.root, &plan[0])
+            .expect("task succeeds");
+
+        std::thread::sleep(std::time::Duration::from_secs(4));
+        assert!(
+            marker.exists(),
+            "a successful task killed a detached descendant"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn stops_and_reports_when_task_output_exceeds_the_limit() {
         let (_temp, mut workspace) = workspace_with_task("printf 123456789", None);
         workspace
@@ -544,6 +645,47 @@ mod tests {
         assert_eq!(
             error.output().expect("partial output is retained").stdout,
             b"12345678"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn successful_exit_spares_a_detached_descendant_on_windows() {
+        // Regression: a child that exits successfully must not kill its
+        // descendants via Job Object cleanup.  The kill-on-close flag
+        // must not be set (Finding 1 from the P0 review).
+        let temp = TempDir::new();
+        let marker = temp.path().join("descendant-finished");
+        let marker_text = marker.to_string_lossy();
+        let script = temp.path().join("spawn_and_exit.bat");
+
+        // Lift escaped paths into a batch variable to avoid quoting chaos.
+        fs::write(
+            &script,
+            format!(
+                "@echo off\r\nstart /b cmd /c ping -n 4 127.0.0.1 >nul && echo leaked > \"{marker_text}\"\r\nexit /b 0\r\n"
+            ),
+        )
+        .expect("write batch script");
+
+        fs::write(
+            config_path(temp.path()),
+            format!(
+                "[package]\nname = \"app\"\n\n[pipelines.ci]\ntasks = [\"build\"]\n\n[tasks.build]\ncommand = [\"cmd\", \"/c\", \"spawn_and_exit.bat\"]\n"
+            ),
+        )
+        .expect("write manifest");
+
+        let workspace = Workspace::load(temp.path()).expect("workspace loads");
+        let plan = workspace.plan(None, None, &[]).expect("plan succeeds");
+        Runner::new()
+            .run(&workspace.root, &plan[0])
+            .expect("task succeeds");
+
+        std::thread::sleep(std::time::Duration::from_secs(6));
+        assert!(
+            marker.exists(),
+            "a successful task killed a detached descendant on Windows"
         );
     }
 

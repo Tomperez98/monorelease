@@ -121,7 +121,7 @@ depends_on = ["shared:build"]
 | `--dry-run` | off | Resolve and print the plan; run nothing and touch no cache. |
 | `--no-cache` | off | Skip reading and writing the cache for this run. |
 | `--force` | off | Ignore cache hits and refresh successful entries. |
-| `--output terminal\|github-actions` | `terminal` | Select the output contract. |
+| `--output terminal\|json\|github-actions` | `terminal` | Select the output contract. |
 
 ```bash
 mono task test --package web --jobs 4
@@ -155,6 +155,7 @@ tasks = ["build", "test"]
 
 [pipelines.release]
 tasks = ["workspace:release-verify"]
+finally = ["workspace:release-cleanup"]
 
 # Root tasks run once, from the workspace root, and are addressed as
 # `workspace:<name>`. Use them for cross-package coordination such as
@@ -164,6 +165,10 @@ command = ["./automation/release-verify"]
 depends_on = ["web:package", "api:package"]
 cwd = "automation"
 timeout_seconds = 1800
+
+[tasks.release-cleanup]
+command = ["./automation/release-cleanup"]
+cwd = "automation"
 ```
 
 ```toml
@@ -195,18 +200,61 @@ Every task accepts the same fields:
 | `timeout_seconds` | `600` | Wall-clock limit for one invocation. Must be greater than zero. |
 | `max_output_bytes` | `16777216` | Per-stream capture limit. A task that exceeds it is killed and reports its partial output. |
 | `resource_group` | unset | Tasks sharing a group never run concurrently. |
+| `retries` | `0` | Additional attempts after a failed invocation. |
+| `retry_backoff_seconds` | `0` | Delay between retry attempts. |
+| `artifacts` | `[]` | Files declared for distribution or release workflows. |
+| `matrix.<name>` | unset | Opaque values used to create task instances such as `build[target=linux]`. |
 
 Names must be non-empty and cannot contain `:`. `workspace` is reserved for root tasks.
 
-The schema is fixed: there is no `version` header, and unknown fields are rejected, so typos fail in `check` instead of being ignored.
+Every manifest has a `schema` field. It currently defaults to `1`. The field
+versions the `mono.toml` format; it is not a package or release version. Unknown
+fields are rejected so typos fail during `mono check` instead of being silently
+ignored.
+
+Matrix tasks expand opaque string dimensions without invoking a shell:
+
+```toml
+[tasks.build]
+command = ["tool", "build", "--target", "${target}"]
+matrix.target = ["x86_64-linux", "aarch64-linux"]
+```
+
+The plan contains `build[target=x86_64-linux]` and
+`build[target=aarch64-linux]`. Matrix values are included in cache identity.
+Pipelines may also declare `finally = [...]` tasks; those tasks run after the
+normal pipeline even when a normal task fails.
 
 ## Execution model
 
 - The plan is a dependency-first topological order. Cycles, unknown packages, unknown tasks, and unresolvable references are rejected before anything runs; near-misses get a "did you mean" suggestion.
 - With `--jobs N`, a task starts as soon as its dependencies finish and a worker is free. Independent branches overlap; `resource_group` and dependencies hold back only what they must. `N` defaults to this machine's available parallelism (cgroup quotas and CPU affinity included), so pass `--jobs 1` for strictly serial execution. The default is a dispatch limit, not a promise about the commands themselves: a task that starts its own workers, such as a compiler, can oversubscribe the machine.
 - Every task's stdout and stderr are captured. Task output and status lines are presented in deterministic plan order, so parallel logs never interleave. In `terminal` mode status goes to stderr and task output to stdout; `github-actions` mode wraps each task in `::group::` on stdout.
-- A failure or timeout stops new work from being scheduled while in-flight tasks finish. The summary reports `completed`, `cached`, `failed`, and `blocked`, and the process exits `1`.
-- Nothing is implicit: no shell, no hidden environment merging, no working-directory mutation.
+- A failure or timeout stops new work from being scheduled while in-flight tasks finish.
+
+### Machine-readable execution events
+
+Task execution can be rendered for terminals, GitHub Actions, or machines:
+
+```bash
+mono run --output terminal
+mono run --output json
+mono run --output github-actions
+```
+
+JSON output is newline-delimited. Each line is one event with an `event` field
+and `schema` version, including `run_started`, `task_started`, `task_finished`,
+blocked task events, and `run_finished`.
+Task output is represented as a byte array so machine consumers do not lose
+information when a command emits non-UTF-8 bytes.
+
+The scheduler does not know about GitHub Actions or any other CI provider. Those
+are output adapters around the same execution events.
+
+A timeout terminates the task's complete process tree rather than only the
+first executable. Unix tasks run in a dedicated process group; Windows tasks run
+in a Job Object. Commands are still executed directly as argv arrays and are
+never passed through a shell implicitly.
 
 ```console
 $ mono --dir examples/release-gate plan release
@@ -252,6 +300,10 @@ Patterns select files with `*` (within a path segment), `**` (across segments), 
 Failed and timed-out tasks are never cached. `--force` re-runs cacheable tasks and refreshes their entries, `--no-cache` bypasses the cache for a run, and `--dry-run` never reads or writes it. `cache_env = ["*"]` hashes the complete inherited environment: more correct for environment-sensitive tasks, fewer hits.
 
 Do not cache publishing, deployment, migration, time-dependent, network-dependent, or otherwise nondeterministic tasks. Caching is local only; there is no remote cache.
+
+Cache output restoration refuses to follow symlinks in the destination path.
+This prevents a stale or malicious worktree symlink from redirecting a cached
+artifact outside its package.
 
 ## Discovery
 
@@ -303,9 +355,11 @@ mono changelog scaffold --version 0.1.2
 RELEASE_TAG=v0.1.2 mono changelog notes --output RELEASE_NOTES.md
 
 mono release source --tag v0.1.2 --commit "$GITHUB_SHA"
-mono release manifest --directory dist
-mono release verify --directory dist --tag v0.1.2
+mono release manifest --directory dist --expected release-expected.txt --tag v0.1.2 --commit "$GITHUB_SHA" --tag-object "$RELEASE_TAG_OBJECT"
+mono release verify --directory dist --expected release-expected.txt --tag v0.1.2
 ```
+
+Every flag on `release manifest` and `release verify` is optional and also read from the matching environment variable (`RELEASE_TAG`, `GITHUB_SHA`, `GITHUB_REPOSITORY`, `RELEASE_TAG_OBJECT`, `GITHUB_RUN_URL`), so CI can pass the release identity once. `--tag-object` is the annotated tag object; a lightweight tag has none, and an empty value is treated as absent.
 
 Changelog commands validate and render the repository's structured `CHANGELOG.md`; they do not assume GitHub, pull requests, or a programming language. Release commands operate on files, checksums, and explicit source identity. They do not publish, inspect registries, execute binaries, or assume a package format.
 
@@ -321,13 +375,13 @@ git tag v0.1.2
 git push origin v0.1.2
 ```
 
-The `Release` workflow refuses a tag that matches neither `Cargo.toml` nor the newest changelog entry, verifies that the tag resolves to the checked-out commit, runs the project's `ci` pipeline and release gates, builds the four targets, asserts each binary reports the release version, and generates GitHub Actions provenance for each archive. Before publication it requires exactly the four expected archives, `SHA256SUMS`, and `BUILD-METADATA.json`. The draft only becomes the latest release once every asset is uploaded. Re-running is safe: an existing draft is reused, `--clobber` refreshes its assets, and an already published tag is never overwritten. If a run fails halfway, resume it from the tag instead of moving it:
+The `Release` workflow refuses a tag that matches neither `Cargo.toml` nor the newest changelog entry, verifies that the tag resolves to the checked-out commit, runs the project's `ci` pipeline and release gates, builds the four targets, asserts each binary reports the release version, and generates GitHub Actions provenance for each archive. `mono release manifest`, run from the released tag, writes `BUILD-METADATA.json` and `SHA256SUMS` for exactly the published archives, and `mono release verify` accepts them before anything is uploaded: the file that `Release (validate)` reads back is written and checked by the same code, so the producer and the consumer cannot disagree about its schema. Before publication the job requires exactly the four expected archives, `SHA256SUMS`, and `BUILD-METADATA.json`. The draft only becomes the latest release once every asset is uploaded. Re-running is safe: an existing draft is reused, `--clobber` refreshes its assets, and an already published tag is never overwritten. If a run fails halfway, resume it from the tag instead of moving it:
 
 ```bash
 gh workflow run Release --field tag=v0.1.2
 ```
 
-`Release (validate)` runs weekly and after every successful release, sharing the `release` concurrency group so it cannot race publication. It checks out the released tag, verifies `BUILD-METADATA.json`, downloads the published assets, rebuilds the Linux binary from the tag, compares it with the published binary, verifies its GitHub Actions provenance, and runs the release pipeline with the published binary — checksums, identity, manifests, and examples. Tags cut before metadata and provenance existed fall back to the legacy checksum/version checks.
+`Release (validate)` runs weekly and after every successful release, sharing the `release` concurrency group so it cannot race publication. It checks out the released tag, downloads the published assets, rebuilds the Linux binary from the tag, compares it with the published binary, verifies its GitHub Actions provenance, and runs the release pipeline with the published binary — checksums, identity, manifests, and examples. The published `BUILD-METADATA.json` decides how much of that can run: `manifest_version` 1 means the full gate, including `mono release verify` over the published inventory; metadata written before the schema existed falls back to the legacy checksum and version checks, and an unknown `manifest_version` fails.
 
 The publishing job uses the protected GitHub `release` environment. Repository administrators must create that environment and may configure required reviewers before a release can become public. Published releases are immutable: retry drafts, but supersede a bad published release with a new fix-forward version rather than moving tags or replacing assets.
 

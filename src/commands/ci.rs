@@ -64,7 +64,14 @@ pub fn run_pipeline_with_mode(
         .map(|task| task.package())
         .collect::<BTreeSet<_>>()
         .len();
-    Ok(format_summary(&summary, package_count))
+
+    if execution.output == crate::output::OutputMode::Json {
+        // JSON mode emits a run_finished event; the text summary would
+        // break the newline-delimited JSON contract.
+        Ok(String::new())
+    } else {
+        Ok(format_summary(&summary, package_count))
+    }
 }
 
 /// Return the resolved execution plan without running commands.
@@ -153,6 +160,21 @@ fn format_plan(workspace: &Workspace, plan: &[PlannedTask]) -> String {
         }
         if !task.outputs().is_empty() {
             output.push_str(&format!(" [outputs={}]", task.outputs().join(", ")));
+        }
+        if !task.artifacts().is_empty() {
+            output.push_str(&format!(" [artifacts={}]", task.artifacts().join(", ")));
+        }
+        if task.retries() > 0 {
+            output.push_str(&format!(" [retries={}]", task.retries()));
+            if task.retry_backoff() > std::time::Duration::ZERO {
+                output.push_str(&format!(
+                    " [retry_backoff={}s]",
+                    task.retry_backoff().as_secs()
+                ));
+            }
+        }
+        if task.is_finalizer() {
+            output.push_str(" [finally]");
         }
         for key in task.env().keys() {
             output.push_str(&format!(" [env {key}=<redacted>]"));
@@ -252,6 +274,74 @@ mod tests {
 
         assert!(output.find("base:build").unwrap() < output.find("app:build").unwrap());
         assert!(output.contains("would run app:build"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retries_a_failed_task_before_reporting_failure() {
+        let temp = TempDir::new();
+        fs::write(
+            config_path(temp.path()),
+            "[workspace]\nname = \"fixture\"\nmembers = [\"packages/*\"]\n\n[pipelines.ci]\ntasks = [\"build\"]\n",
+        )
+        .expect("write root manifest");
+        let package = temp.path().join("packages/app");
+        fs::create_dir_all(&package).expect("create package");
+        let marker = package.join("attempted");
+        let marker = marker.to_string_lossy();
+        fs::write(
+            config_path(&package),
+            format!(
+                "[package]\nname = \"app\"\n\n[tasks.build]\ncommand = [\"sh\", \"-c\", \"if [ ! -e '{marker}' ]; then touch '{marker}'; exit 7; fi; printf success\"]\nretries = 1\n"
+            ),
+        )
+        .expect("write package manifest");
+
+        let output = run_pipeline_with_mode(
+            temp.path(),
+            None,
+            None,
+            &[],
+            false,
+            1,
+            PipelineExecution {
+                cache: CacheMode::NoCache,
+                output: OutputMode::Terminal,
+            },
+        )
+        .expect("retry succeeds");
+        assert!(output.contains("1 completed"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runs_finalizers_after_a_failed_task() {
+        let temp = TempDir::new();
+        let marker = temp.path().join("cleanup-ran");
+        let marker_text = marker.to_string_lossy();
+        fs::write(
+            config_path(temp.path()),
+            format!(
+                "[package]\nname = \"app\"\n\n[pipelines.ci]\ntasks = [\"build\"]\nfinally = [\"cleanup\"]\n\n[tasks.build]\ncommand = [\"sh\", \"-c\", \"exit 7\"]\n\n[tasks.cleanup]\ncommand = [\"sh\", \"-c\", \"touch '{marker_text}'\"]\n"
+            ),
+        )
+        .expect("write manifest");
+
+        let error = run_pipeline_with_mode(
+            temp.path(),
+            None,
+            None,
+            &[],
+            false,
+            1,
+            PipelineExecution {
+                cache: CacheMode::NoCache,
+                output: OutputMode::Terminal,
+            },
+        )
+        .expect_err("failed task remains a failed run");
+        assert!(matches!(error, CiError::Scheduler(_)));
+        assert!(marker.exists(), "finalizer did not run");
     }
 
     #[cfg(unix)]

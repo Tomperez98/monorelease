@@ -23,9 +23,6 @@ pub(crate) fn execute_plan(
     cache_mode: CacheMode,
 ) -> Result<ExecutionSummary, SchedulerError> {
     assert!(jobs > 0, "scheduler requires at least one worker");
-    if plan.is_empty() {
-        return Ok(ExecutionSummary::default());
-    }
 
     let mut tasks = BTreeMap::new();
     for task in plan {
@@ -69,6 +66,10 @@ pub(crate) fn execute_plan(
         } else {
             None
         };
+
+    output
+        .present_run_start(&workspace.root, plan.len())
+        .map_err(SchedulerError::Output)?;
     let force = matches!(cache_mode, CacheMode::Force);
     let (sender, receiver) = mpsc::channel::<(TaskNode, WorkerReport)>();
     let (job_sender, job_receiver) = mpsc::channel::<WorkerJob>();
@@ -92,10 +93,12 @@ pub(crate) fn execute_plan(
     let mut output_error = None;
     let mut stopping = false;
 
-    while !active.is_empty() || (!stopping && !ready.is_empty()) {
+    while !active.is_empty()
+        || (!ready.is_empty() && (!stopping || has_ready_finalizer(&ready, &tasks)))
+    {
         assert!(active.len() <= jobs, "scheduler exceeded its worker limit");
-        while !stopping && active.len() < jobs {
-            let Some(node) = next_ready(&ready, &tasks, &active_groups) else {
+        while active.len() < jobs {
+            let Some(node) = next_ready(&ready, &tasks, &active_groups, stopping) else {
                 break;
             };
             ready.remove(&node);
@@ -194,14 +197,21 @@ pub(crate) fn execute_plan(
 
         if result.is_err() || cache_error.is_some() {
             stopping = true;
-        } else if let Some(children) = dependents.get(&node) {
+        }
+        if let Some(children) = dependents.get(&node) {
             for child in children {
-                let count = remaining_dependencies
-                    .get_mut(child)
-                    .expect("dependent must exist in the validated plan");
-                *count -= 1;
-                if *count == 0 {
-                    ready.insert(child.clone());
+                let child_is_finalizer = tasks
+                    .get(child)
+                    .expect("dependent must exist in the validated plan")
+                    .is_finalizer();
+                if result.is_ok() && cache_error.is_none() || child_is_finalizer {
+                    let count = remaining_dependencies
+                        .get_mut(child)
+                        .expect("dependent must exist in the validated plan");
+                    *count -= 1;
+                    if *count == 0 {
+                        ready.insert(child.clone());
+                    }
                 }
             }
         }
@@ -225,6 +235,9 @@ pub(crate) fn execute_plan(
     for task in plan {
         let node = task.node();
         let Some(result) = results.remove(&node) else {
+            output
+                .present_blocked(&node)
+                .map_err(SchedulerError::Output)?;
             continue;
         };
         match result {
@@ -255,22 +268,25 @@ pub(crate) fn execute_plan(
 
     if let Some(error) = output_error {
         output
-            .present_summary(&summary)
+            .present_run_finished(&summary)
             .map_err(SchedulerError::Output)?;
         return Err(SchedulerError::Output(error));
     }
     if let Some(error) = cache_error {
         output
-            .present_summary(&summary)
+            .present_run_finished(&summary)
             .map_err(SchedulerError::Output)?;
         return Err(SchedulerError::Cache(error));
     }
     if let Some(error) = first_error {
         output
-            .present_summary(&summary)
+            .present_run_finished(&summary)
             .map_err(SchedulerError::Output)?;
         return Err(SchedulerError::Task(Box::new(error)));
     }
+    output
+        .present_run_finished(&summary)
+        .map_err(SchedulerError::Output)?;
     Ok(summary)
 }
 
@@ -282,19 +298,32 @@ fn next_ready(
     ready: &BTreeSet<TaskNode>,
     tasks: &BTreeMap<TaskNode, Arc<PlannedTask>>,
     active_groups: &HashSet<String>,
+    stopping: bool,
 ) -> Option<TaskNode> {
-    if active_groups.is_empty() {
-        return ready.iter().next().cloned();
-    }
-    ready.iter().find_map(|node| {
+    let available = |node: &TaskNode| {
         let task = tasks
             .get(node)
             .expect("ready task must exist in the validated plan");
-        let available = match task.resource_group() {
+        if stopping && !task.is_finalizer() {
+            return false;
+        }
+        match task.resource_group() {
             Some(group) => !active_groups.contains(group),
             None => true,
-        };
-        available.then_some(node.clone())
+        }
+    };
+    ready.iter().find(|node| available(node)).cloned()
+}
+
+fn has_ready_finalizer(
+    ready: &BTreeSet<TaskNode>,
+    tasks: &BTreeMap<TaskNode, Arc<PlannedTask>>,
+) -> bool {
+    ready.iter().any(|node| {
+        tasks
+            .get(node)
+            .expect("ready task must exist in the validated plan")
+            .is_finalizer()
     })
 }
 
@@ -371,7 +400,21 @@ fn execute_task(job: WorkerJob) -> WorkerReport {
         };
     }
 
-    match runner.run(&root, &task) {
+    let mut attempt = 0;
+    let result = loop {
+        match runner.run(&root, &task) {
+            Ok(result) => break Ok(result),
+            Err(_error) if attempt < task.retries() => {
+                attempt += 1;
+                if task.retry_backoff() > std::time::Duration::ZERO {
+                    thread::sleep(task.retry_backoff());
+                }
+            }
+            Err(error) => break Err(error),
+        }
+    };
+
+    match result {
         Ok(result) => {
             let cache_error = key
                 .as_deref()

@@ -2,13 +2,17 @@
 name = "mono"
 
 [pipelines.ci]
-tasks = ["fmt", "check", "test", "clippy"]
+tasks = ["changelog-validate", "fmt", "check", "test", "clippy"]
 
 # Release gates. `.github/workflows/release.yml` runs this pipeline before it
 # builds anything, and `release_validate.yml` runs it again with the published
 # binary against the released tag.
 [pipelines.release]
 tasks = ["release-verify"]
+
+[tasks.changelog-validate]
+command = ["cargo", "run", "--locked", "--quiet", "--", "changelog", "validate"]
+timeout_seconds = 30
 
 [tasks.fmt]
 command = ["cargo", "fmt", "--check"]

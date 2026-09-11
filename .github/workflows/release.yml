@@ -228,7 +228,31 @@ jobs:
     env:
       RELEASE_COMMIT: ${{ needs.validate.outputs.source_commit }}
       RELEASE_TAG_OBJECT: ${{ needs.validate.outputs.tag_object }}
+      # The run the CLI records as having produced the release.
+      RELEASE_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
     steps:
+      # `release manifest` needs the released source, not the default branch:
+      # `release_validate.yml` checks the published metadata against this code.
+      - name: Check out the released source
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # pinned action
+        with:
+          toolchain: 1.88.0
+
+      - name: Cache Cargo dependencies
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
       - name: Download release artifacts
         uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
         with:
@@ -242,20 +266,41 @@ jobs:
           name: release-notes
           path: notes
 
+      # `BUILD-METADATA.json` and `SHA256SUMS` are written by the same command
+      # that `release_validate.yml` reads them back with, so the producer and
+      # the consumer cannot disagree about the schema.
+      - name: Write expected release inventory
+        shell: bash
+        run: |
+          cat > release-expected.txt <<EOF
+          mono-${RELEASE_TAG}-x86_64-unknown-linux-gnu.tar.gz
+          mono-${RELEASE_TAG}-aarch64-apple-darwin.tar.gz
+          mono-${RELEASE_TAG}-x86_64-apple-darwin.tar.gz
+          mono-${RELEASE_TAG}-x86_64-pc-windows-msvc.zip
+          EOF
+
       - name: Write release metadata
         run: |
-          jq -n \
-            --arg repository "$GITHUB_REPOSITORY" \
-            --arg release_tag "$RELEASE_TAG" \
-            --arg source_commit "$RELEASE_COMMIT" \
-            --arg tag_object "$RELEASE_TAG_OBJECT" \
-            --arg workflow_run "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
-            '{repository: $repository, release_tag: $release_tag, source_commit: $source_commit, tag_object: (if $tag_object == "" then null else $tag_object end), workflow_run: $workflow_run}' \
-            > dist/BUILD-METADATA.json
+          cargo run --locked --quiet -- release manifest \
+            --directory dist \
+            --tag "$RELEASE_TAG" \
+            --commit "$RELEASE_COMMIT" \
+            --repository "$GITHUB_REPOSITORY" \
+            --tag-object "$RELEASE_TAG_OBJECT" \
+            --workflow-run "$RELEASE_RUN_URL" \
+            --expected release-expected.txt
 
-      - name: Generate checksums
-        working-directory: dist
-        run: sha256sum mono-* > SHA256SUMS
+      # A manifest the validator would reject must never reach a release.
+      - name: Verify release metadata
+        run: |
+          cargo run --locked --quiet -- release verify \
+            --directory dist \
+            --tag "$RELEASE_TAG" \
+            --commit "$RELEASE_COMMIT" \
+            --repository "$GITHUB_REPOSITORY" \
+            --tag-object "$RELEASE_TAG_OBJECT" \
+            --workflow-run "$RELEASE_RUN_URL" \
+            --expected release-expected.txt
 
       - name: Verify release asset inventory
         working-directory: dist

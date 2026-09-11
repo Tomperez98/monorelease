@@ -74,16 +74,62 @@ jobs:
             echo 'No BUILD-METADATA.json asset; validating this legacy release without source metadata.'
           fi
 
+      - name: Write expected release inventory
+        if: steps.release.outputs.exists == 'true'
+        env:
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+        shell: bash
+        run: |
+          cat > release-expected.txt <<EOF
+          mono-${RELEASE_TAG}-x86_64-unknown-linux-gnu.tar.gz
+          mono-${RELEASE_TAG}-aarch64-apple-darwin.tar.gz
+          mono-${RELEASE_TAG}-x86_64-apple-darwin.tar.gz
+          mono-${RELEASE_TAG}-x86_64-pc-windows-msvc.zip
+          EOF
+
+      # Which gates can run depends on the metadata schema the release carries.
+      # A release cut before the schema existed still gets the checksum and
+      # version gates below. `release.yml` self-verifies what it writes, so a
+      # current release cannot silently degrade to the legacy path.
+      - name: Detect release metadata schema
+        id: metadata
+        if: steps.release.outputs.exists == 'true'
+        run: |
+          schema=none
+          if [[ -f dist/BUILD-METADATA.json ]]; then
+            version="$(jq -r '.manifest_version // empty' dist/BUILD-METADATA.json)" || {
+              echo "::error::dist/BUILD-METADATA.json is not valid JSON" >&2
+              exit 1
+            }
+            case "$version" in
+              1)
+                schema=current
+                ;;
+              '')
+                schema=legacy
+                echo "::warning::$RELEASE_TAG carries pre-schema release metadata; only the legacy checksum and version gates apply."
+                ;;
+              *)
+                echo "::error::BUILD-METADATA.json declares unsupported manifest_version $version" >&2
+                exit 1
+                ;;
+            esac
+          fi
+          echo "schema=$schema" >> "$GITHUB_OUTPUT"
+
+      # `release verify` inventories the directory it is handed, so the
+      # extracted binary stays outside `dist` to keep that inventory equal to
+      # the published asset set.
       - name: Extract the Linux artifact
         if: steps.release.outputs.exists == 'true'
         run: |
-          archive="$(find dist -name '*x86_64-unknown-linux-gnu.tar.gz' -print -quit)"
+          archive="$(find dist -maxdepth 1 -type f -name '*x86_64-unknown-linux-gnu.tar.gz' -print -quit)"
           test -n "$archive"
-          mkdir -p dist/extracted
-          tar -xzf "$archive" -C dist/extracted
+          mkdir -p extracted
+          tar -xzf "$archive" -C extracted
 
       - name: Verify release metadata
-        if: ${{ steps.release.outputs.exists == 'true' && hashFiles('dist/BUILD-METADATA.json') != '' }}
+        if: ${{ steps.release.outputs.exists == 'true' && steps.metadata.outputs.schema != 'none' }}
         env:
           RELEASE_TAG: ${{ steps.release.outputs.tag }}
         run: |
@@ -119,12 +165,13 @@ jobs:
             ${{ runner.os }}-cargo-
 
       - name: Verify published artifact manifest
-        if: ${{ steps.release.outputs.exists == 'true' && hashFiles('dist/BUILD-METADATA.json') != '' }}
+        if: ${{ steps.release.outputs.exists == 'true' && steps.metadata.outputs.schema == 'current' }}
         env:
           RELEASE_TAG: ${{ steps.release.outputs.tag }}
         run: |
           cargo run --locked --quiet -- release verify \
             --directory dist \
+            --expected release-expected.txt \
             --tag "$RELEASE_TAG" \
             --commit "$(git rev-parse HEAD)" \
             --repository "$GITHUB_REPOSITORY"
@@ -137,14 +184,14 @@ jobs:
         if: ${{ steps.release.outputs.exists == 'true' && hashFiles('xtask/Cargo.toml') != '' }}
         shell: bash
         run: |
-          cmp target/x86_64-unknown-linux-gnu/release/mono dist/extracted/mono || {
+          cmp target/x86_64-unknown-linux-gnu/release/mono extracted/mono || {
             echo 'the released Linux binary differs from a rebuild of its tagged source' >&2
-            sha256sum target/x86_64-unknown-linux-gnu/release/mono dist/extracted/mono
+            sha256sum target/x86_64-unknown-linux-gnu/release/mono extracted/mono
             exit 1
           }
 
       - name: Verify Linux artifact provenance
-        if: ${{ steps.release.outputs.exists == 'true' && hashFiles('dist/BUILD-METADATA.json') != '' }}
+        if: ${{ steps.release.outputs.exists == 'true' && steps.metadata.outputs.schema != 'none' }}
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
@@ -157,12 +204,14 @@ jobs:
         if: ${{ steps.release.outputs.exists == 'true' && hashFiles('xtask/Cargo.toml') != '' }}
         env:
           RELEASE_TAG: ${{ steps.release.outputs.tag }}
-          MONO_BIN: dist/extracted/mono
+          MONO_BIN: extracted/mono
         run: '"$MONO_BIN" run release --output github-actions'
 
-      # Releases cut before the pipeline existed: not much to check, but check it.
+      # Releases that predate the metadata schema, and releases cut before the
+      # pipeline itself existed: the manifest says little, but the checksums and
+      # the version the binary reports still have to hold.
       - name: Verify checksums and version
-        if: ${{ steps.release.outputs.exists == 'true' && hashFiles('xtask/Cargo.toml') == '' }}
+        if: ${{ steps.release.outputs.exists == 'true' && (hashFiles('xtask/Cargo.toml') == '' || steps.metadata.outputs.schema == 'legacy') }}
         run: |
           ( cd dist && sha256sum -c SHA256SUMS )
-          ./dist/extracted/mono --version
+          ./extracted/mono --version
