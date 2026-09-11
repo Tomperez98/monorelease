@@ -2,6 +2,29 @@
 
 Notable changes per release, newest first.
 
+## (unreleased)
+
+### Features
+
+- Use one root `mono.toml` task graph for every project shape.
+- Document Mono's opinionated Markdown/SemVer release conventions.
+- Add matrix task expansion with argv/environment interpolation.
+- Add retry policies and pipeline finalizers for cleanup and diagnostics.
+- Add explicit release artifact inventory validation.
+- Add structured JSON execution events for machine-readable task orchestration.
+
+### Fixes
+
+- Terminate descendant processes when a task times out and reject cache restores through symlinked paths.
+
+### Internals
+
+- Add platform-aware cache keys, output digests, and concurrent cache publication.
+- Validate process-tree behavior across the supported operating systems in CI.
+- Harden Git release-source validation and publish release metadata through temporary files with atomic replacement where supported.
+- Remove package manifests, member discovery, standalone mode, and task artifacts while keeping the `mono.toml` schema at `1`.
+- Version the execution event contract while keeping the `mono.toml` schema at `1`.
+
 The top `## ` entry is the release being prepared. `release.yml` requires the git
 tag to be `v` + that heading, and the body under it becomes the GitHub release
 notes, so the changelog a reviewer approves is exactly what users read. Cutting a

@@ -1,28 +1,15 @@
-# mono (release)
+# mono
 
-Run every package's tasks in dependency order, from one `mono.toml` — in any language.
+Run a project's commands in dependency order, from one root `mono.toml` — in any language.
 
-[![CI](https://github.com/Tomperez98/mono/actions/workflows/ci.yml/badge.svg)](https://github.com/Tomperez98/mono/actions/workflows/ci.yml)
-[![Release](https://github.com/Tomperez98/mono/actions/workflows/release.yml/badge.svg)](https://github.com/Tomperez98/mono/actions/workflows/release.yml)
-![License](https://img.shields.io/badge/license-Apache--2.0-blue)
-
-`mono` reads your manifests, builds one task graph across every package, and runs the commands. It does not know whether a package is Rust, Node, Go, Make, Docker, or a shell script: a task is an argv array, executed directly with no shell in between.
+`mono` does not detect languages, frameworks, package managers, or project conventions. A task is an argv array executed directly. The only project model is a root manifest containing a task graph.
 
 ```console
-$ mono --dir examples/echo task build --jobs 2
-▶ docs:build
-▶ shared:build
-▶ app:build
-[shared] build
-shared:build: completed in 4ms
-[app] build after shared:build
-app:build: completed in 4ms
-[docs] build from site with MODE=check
-docs:build: completed in 4ms
-summary: 3 completed, 0 cached, 0 failed, 0 blocked across 3 package(s)
+$ mono plan
+project mono (/repo/mono)
+would run fmt in /repo/mono: cargo fmt --check [timeout=30s]
+would run check in /repo/mono: cargo check --workspace ... [timeout=120s]
 ```
-
-`app:build` waited for `shared:build`. `docs:build` ran alongside them in its own directory with its own environment. No central registry of packages, no language plugins, no build backend.
 
 ## Install
 
@@ -30,307 +17,193 @@ summary: 3 completed, 0 cached, 0 failed, 0 blocked across 3 package(s)
 cargo install --path .
 ```
 
-Building requires Rust 1.88+ (edition 2024). Prebuilt binaries for Linux x86_64, macOS arm64, macOS x86_64, and Windows x86_64 are attached to each [GitHub release](https://github.com/Tomperez98/mono/releases) together with a `SHA256SUMS` file:
-
-```bash
-sha256sum -c SHA256SUMS
-```
+Prebuilt binaries for Linux x86_64, macOS arm64, macOS x86_64, and Windows x86_64 are attached to each [GitHub release](https://github.com/Tomperez98/mono/releases).
 
 ## Quick start
 
-A project does not need to be a workspace. One root manifest is enough:
-
-```toml
-# mono.toml
-[package]
-name = "my-project"
-
-[pipelines.ci]
-tasks = ["build", "test"]
-
-[tasks.build]
-command = ["cargo", "build"]
-
-[tasks.test]
-command = ["cargo", "test"]
-depends_on = ["build"]
-```
-
-```bash
-mono check    # validate manifests and the task graph
-mono          # run the default pipeline (ci)
-mono plan     # print the resolved order without running anything
-```
-
-Scaffold that file instead of writing it by hand. The generated package is named `project`; rename it in the manifest afterward:
-
-```bash
-mono init --standalone --command cargo --command build
-```
-
-For a workspace, `mono init` writes a root manifest with member patterns instead:
+Create one root manifest:
 
 ```bash
 mono init
 ```
 
+The generated file is valid immediately and can be edited into the commands your project needs:
+
 ```toml
-[workspace]
-name = "mono"
-members = ["apps/*", "packages/*"]
+schema = 1
+
+[project]
+name = "my-project"
 default_pipeline = "ci"
 
 [pipelines.ci]
 tasks = ["build", "test"]
-```
-
-Then add one manifest per package. `apps/web` can depend on `packages/shared` without either package knowing about the other:
-
-```toml
-# apps/web/mono.toml
-[package]
-name = "web"
 
 [tasks.build]
-command = ["npm", "run", "build"]
-depends_on = ["shared:build"]
+command = ["tool", "build"]
+
+[tasks.test]
+command = ["tool", "test"]
+depends_on = ["build"]
+```
+
+Every task is root-scoped. Use `cwd` when a command belongs to a subdirectory:
+
+```toml
+[tasks.api-test]
+cwd = "services/api"
+command = ["go", "test", "./..."]
+```
+
+There are no package manifests, member globs, standalone mode, package selection, or language-specific task types. A repository with one directory and a repository with one hundred directories use the same model.
+
+Commands can be run from nested directories. `mono` walks upward from `--dir` until it finds the project root manifest:
+
+```bash
+mono --dir services/api task api-test
 ```
 
 ## Commands
 
-`--dir <PATH>` is global and defaults to `.`; root discovery walks up from there, so commands work from any nested directory.
-
 | Command | What it does |
 | --- | --- |
 | `mono` | Run the default pipeline. |
-| `mono run [PIPELINE]` | Run the default or a named pipeline (alias: `ci`). |
-| `mono task TASK...` | Run one or more tasks and their transitive dependencies. |
-| `mono check` | Validate manifests, references, and working directories (alias: `doctor`). |
+| `mono run [PIPELINE]` | Run a named pipeline. `ci` is an alias. |
+| `mono task TASK...` | Run one or more tasks and dependencies. |
+| `mono check` | Validate the root manifest and complete task graph. |
+| `mono list` | List pipelines and tasks. |
 | `mono plan [PIPELINE]` | Print the dependency-first execution plan. |
-| `mono graph [PIPELINE]` | Print the dependency edges. |
-| `mono list` | List pipelines, tasks, and common commands. |
-| `mono init [--standalone] [--command CMD]` | Write a fresh manifest; refuses to overwrite an existing one. |
-| `mono cache clean` | Delete all local cache entries. |
+| `mono graph [PIPELINE]` | Print task dependency edges. |
+| `mono cache clean` | Delete local cache entries. |
+| `mono changelog ...` | Apply Mono's documented changelog conventions. |
+| `mono release ...` | Create or verify provider-neutral artifact metadata. |
 
-`run` and `task` accept:
+All commands accept the global `--output terminal|live|json|github-actions` option.
+Terminal output is buffered for deterministic presentation, while `live` streams
+raw task output as it arrives. JSON output is a versioned,
+newline-delimited machine contract. `run` and `task` additionally emit
+execution lifecycle events (`run_started`, `task_started`, `task_output`,
+`task_finished`, and `run_finished`). `plan`, `graph`, `list`, and `check`
+return one JSON document with `schema = 1` and a command-specific `kind`.
+Failures in JSON mode are emitted as `{"schema":1,"kind":"error",...}` and
+retain the same process exit code as terminal mode. Environment values are
+never included in plan or list output; only configured variable names are
+reported.
 
-| Flag | Default | Effect |
-| --- | --- | --- |
-| `--package NAME` | all packages | Restrict the run to one package, keeping its transitive dependencies. |
-| `--jobs N` | machine CPUs | Maximum independent tasks to execute concurrently. Must be at least `1`. Defaults to this machine's available parallelism. |
-| `--dry-run` | off | Resolve and print the plan; run nothing and touch no cache. |
-| `--no-cache` | off | Skip reading and writing the cache for this run. |
-| `--force` | off | Ignore cache hits and refresh successful entries. |
-| `--output terminal\|github-actions` | `terminal` | Select the output contract. |
+`run` and `task` support:
 
-```bash
-mono task test --package web --jobs 4
-mono run release --dry-run
-mono --dir examples/echo task build --jobs 2
+| Flag | Effect |
+| --- | --- |
+| `--jobs N` | Maximum independent tasks to execute concurrently. |
+| `--dry-run` | Resolve and print the plan without running commands. |
+| `--no-cache` | Skip cache reads and writes. |
+| `--force` | Ignore cache hits and refresh successful entries. |
+| `--output terminal\|live\|json\|github-actions` | Select the output contract. |
+
+## Manifest model
+
+The manifest schema remains `1`; the root-only model is a deliberate breaking change while Mono is pre-1.0.
+
+```toml
+schema = 1
+
+[project]
+name = "acme"
+default_pipeline = "ci"
+
+[pipelines.ci]
+tasks = ["fmt", "test"]
+
+[pipelines.release]
+tasks = ["release-verify"]
+finally = ["release-cleanup"]
+
+[tasks.fmt]
+command = ["formatter", "check"]
+
+[tasks.test]
+command = ["test-runner"]
+depends_on = ["fmt"]
+resource_group = "checks"
+timeout_seconds = 900
+retries = 1
+retry_backoff_seconds = 5
+
+[tasks.release-verify]
+command = ["./automation/release-verify"]
+depends_on = ["test"]
+cwd = "automation"
+
+[tasks.release-cleanup]
+command = ["./automation/release-cleanup"]
+cwd = "automation"
 ```
+
+Task fields:
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `command` | required | Executable and arguments as an array. No shell is inserted. |
+| `depends_on` | `[]` | Global task IDs that must complete first. |
+| `cwd` | project root | Existing directory inside the project root. |
+| `env` | `{}` | Extra child-process environment. |
+| `stdin` | `null` | Use `inherit` to pass the parent process's standard input through. |
+| `cache` | `false` | Allow successful results to be reused. |
+| `inputs` | `[]` | Relative patterns included in the cache fingerprint. |
+| `outputs` | `[]` | Relative files copied into and restored from the cache. |
+| `cache_env` | `[]` | Environment variables included in the cache key; `*` means all. |
+| `timeout_seconds` | `600` | Wall-clock limit for one invocation. |
+| `max_output_bytes` | `16777216` | Per-stream capture limit. |
+| `resource_group` | unset | Tasks sharing a group never overlap. |
+| `retries` | `0` | Additional attempts after a failed invocation. |
+| `retry_backoff_seconds` | `0` | Delay between attempts. |
+| `matrix.<name>` | unset | Opaque dimensions expanded into task instances. |
+
+`outputs` are cache outputs. They are not release artifacts. Release files are intentionally handled by the separate `mono release manifest` and `mono release verify` commands, which inventory an explicit directory and generate `BUILD-METADATA.json` and `SHA256SUMS`.
+
+## Execution behavior
+
+- Plans are validated before any task starts: unknown tasks, cycles, invalid paths, bad matrix references, and invalid task configuration fail early.
+- Independent tasks overlap up to `--jobs`; resource groups add explicit serialization only where required.
+- A normal task failure stops new normal work. In-flight tasks finish, then pipeline finalizers run as cleanup work.
+- Finalizers are not cacheable because a cache hit must not skip cleanup side effects.
+- Timeouts terminate the complete child process tree using Unix process groups or Windows Job Objects.
+- Output is captured and presented in deterministic plan order by default. `live` streams task bytes while preserving lifecycle summaries. JSON output is newline-delimited and preserves non-UTF-8 task output as byte arrays.
+- Ctrl-C cancels running normal tasks, terminates their process trees, and still permits finalizer tasks to run.
+- Direct execution never changes Mono's process-global working directory.
+
+## Release conventions
+
+Mono is intentionally opinionated about release process. Every Mono project gets the same TigerBeetle-inspired changelog and release pattern:
+
+- `CHANGELOG.md` is Markdown.
+- The newest heading is `## (unreleased)` or `## X.Y.Z`.
+- Version entries contain `Released: YYYY-MM-DD`.
+- Release tags are `vX.Y.Z`.
+- The tag must resolve to the checked-out source commit.
+- The matching changelog entry becomes `RELEASE_NOTES.md`.
+- Release directories contain an explicit, verified artifact inventory and SHA-256 metadata.
+- Publishing remains an ordinary project task or CI step; Mono does not know registries or package managers.
+
+These are release conventions, not language or framework conventions. See [`docs/release-conventions.md`](docs/release-conventions.md).
+
+Mono does not publish to npm, Cargo, Maven, PyPI, Docker, or any other registry. Those operations remain ordinary tasks or CI workflow steps, preserving the language-agnostic execution kernel.
 
 ## Exit codes
 
 | Code | Meaning |
 | --- | --- |
 | `0` | The command succeeded. |
-| `1` | The command was understood and failed: an invalid or unreadable manifest, an absent `--dir`, an unknown task or package, a task that exited non-zero, or a changelog or release check that did not pass. |
-| `2` | The command line was wrong. `clap` rejects it while parsing, so a bad value never reaches the pipeline — `--jobs 0` and empty values such as `--package ""` fail here. |
-| `3` | `mono` could not carry the command out: `init` could not write the manifest, `changelog` or `release` could not read or write its files, `git` could not be run, the cache could not be updated, or task output could not be written. |
+| `1` | The request was understood but the project, task, changelog, or release check failed. |
+| `2` | The command line was invalid. |
+| `3` | Mono or its environment could not carry the command out. |
 
-`1` and `3` are the useful pair in CI: `1` means the pipeline is red, `3` means the tool never got far enough to tell you.
-
-## Manifest model
-
-A root manifest is either a workspace or a standalone project — never both. Package manifests declare identity and tasks only.
-
-```toml
-[workspace]
-name = "acme"
-members = ["apps/*", "packages/*"]
-default_pipeline = "ci"
-
-[pipelines.ci]
-tasks = ["build", "test"]
-
-[pipelines.release]
-tasks = ["workspace:release-verify"]
-
-# Root tasks run once, from the workspace root, and are addressed as
-# `workspace:<name>`. Use them for cross-package coordination such as
-# release validation.
-[tasks.release-verify]
-command = ["./automation/release-verify"]
-depends_on = ["web:package", "api:package"]
-cwd = "automation"
-timeout_seconds = 1800
-```
-
-```toml
-[package]
-name = "web"
-
-[tasks.build]
-command = ["npm", "run", "build"]
-depends_on = ["shared:build"]
-
-[tasks.test]
-command = ["npm", "test"]
-depends_on = ["build", "shared:test"]
-resource_group = "checks"
-```
-
-Every task accepts the same fields:
-
-| Field | Default | Meaning |
-| --- | --- | --- |
-| `command` | — (required) | Executable and arguments as an array. No shell, so pipes and redirects are not interpreted. |
-| `depends_on` | `[]` | Task references: `build` (same package), `shared:build` (another package), `workspace:verify` (root task). |
-| `cwd` | package root | Relative directory inside the package. Must exist and resolve inside the package after symlinks. |
-| `env` | `{}` | Extra child-process environment. Values are redacted in plan output. |
-| `cache` | `false` | Allow a successful result to be reused from the local cache. |
-| `inputs` | `[]` | Globs whose contents are hashed into the cache key. |
-| `outputs` | `[]` | Globs copied into the cache and restored on a hit. |
-| `cache_env` | `[]` | Environment variable names that affect the cache key; `["*"]` means the whole environment. |
-| `timeout_seconds` | `600` | Wall-clock limit for one invocation. Must be greater than zero. |
-| `max_output_bytes` | `16777216` | Per-stream capture limit. A task that exceeds it is killed and reports its partial output. |
-| `resource_group` | unset | Tasks sharing a group never run concurrently. |
-
-Names must be non-empty and cannot contain `:`. `workspace` is reserved for root tasks.
-
-The schema is fixed: there is no `version` header, and unknown fields are rejected, so typos fail in `check` instead of being ignored.
-
-## Execution model
-
-- The plan is a dependency-first topological order. Cycles, unknown packages, unknown tasks, and unresolvable references are rejected before anything runs; near-misses get a "did you mean" suggestion.
-- With `--jobs N`, a task starts as soon as its dependencies finish and a worker is free. Independent branches overlap; `resource_group` and dependencies hold back only what they must. `N` defaults to this machine's available parallelism (cgroup quotas and CPU affinity included), so pass `--jobs 1` for strictly serial execution. The default is a dispatch limit, not a promise about the commands themselves: a task that starts its own workers, such as a compiler, can oversubscribe the machine.
-- Every task's stdout and stderr are captured. Task output and status lines are presented in deterministic plan order, so parallel logs never interleave. In `terminal` mode status goes to stderr and task output to stdout; `github-actions` mode wraps each task in `::group::` on stdout.
-- A failure or timeout stops new work from being scheduled while in-flight tasks finish. The summary reports `completed`, `cached`, `failed`, and `blocked`, and the process exits `1`.
-- Nothing is implicit: no shell, no hidden environment merging, no working-directory mutation.
-
-```console
-$ mono --dir examples/release-gate plan release
-workspace release-gate (/path/to/examples/release-gate)
-would run api:build in .../packages/api: echo '[api] build' [timeout=30s] [max_output_bytes=16777216]
-would run api:test in .../packages/api: echo '[api] test' [timeout=30s] [max_output_bytes=16777216] [resource_group=checks]
-would run api:package in .../packages/api: echo '[api] package' [timeout=30s] [max_output_bytes=16777216]
-...
-would run workspace:release-verify in .../automation: echo '[workspace] verify artifacts, installability, and versions' [timeout=60s] [max_output_bytes=16777216] [resource_group=release-gate]
-would run workspace:release-summary in .../automation: echo '[workspace] release gate passed once for all packages' [timeout=60s] [max_output_bytes=16777216]
-```
-
-## Caching
-
-Caching is opt-in, because a task's side effects are yours to declare. A cacheable task must declare at least one positive input pattern:
-
-```toml
-[tasks.build]
-command = ["cargo", "build", "--release"]
-cache = true
-inputs = ["src/**", "Cargo.toml", "Cargo.lock"]
-outputs = ["target/release/my-binary"]
-cache_env = ["RUSTFLAGS"]
-```
-
-A cache hit replays the captured stdout/stderr and restores the declared outputs, so downstream tasks see the same artifacts as a real run:
-
-```console
-$ mono --dir examples/cache run
-▶ app:build
-[build] generated artifact from input: hello from the cache example
-app:build: cache hit in 0ms
-▶ app:verify
-[verify] artifact: hello from the cache example
-app:verify: completed in 9ms
-summary: 1 completed, 1 cached, 0 failed, 0 blocked across 1 package(s)
-```
-
-The key covers the task's package, name, cwd, command, timeout, output limit, resource group, input/output patterns, declared environment values, dependency keys, and the workspace and package manifest contents. Changing a declared input changes the key.
-
-Patterns select files with `*` (within a path segment), `**` (across segments), and a leading `!` to exclude; the last matching pattern wins. `.git` and `.mono` are never walked. A positive pattern that matches no files is an error, and symlink matches are rejected because content addressing cannot represent them. `.mono/.gitignore` keeps the store out of Git.
-
-Failed and timed-out tasks are never cached. `--force` re-runs cacheable tasks and refreshes their entries, `--no-cache` bypasses the cache for a run, and `--dry-run` never reads or writes it. `cache_env = ["*"]` hashes the complete inherited environment: more correct for environment-sensitive tasks, fewer hits.
-
-Do not cache publishing, deployment, migration, time-dependent, network-dependent, or otherwise nondeterministic tasks. Caching is local only; there is no remote cache.
-
-## Discovery
-
-`workspace.members` is evaluated relative to the root manifest. Literal segments, `*`, and `**` are supported, and every match must be a directory containing a package manifest.
-
-Root discovery walks up from `--dir` until it finds a manifest: the nearest `[workspace]` wins, otherwise the nearest `[package]`. A manifest containing both sections is rejected. A package manifest may contain only `[package]` and `[tasks]`; pipelines live in the root.
-
-`mono` plans and schedules work. It does not fetch dependencies, bump versions, or publish artifacts — a task does that by running the command your package already uses.
-
-## Examples
-
-Runnable workspaces under [`examples/`](examples), each with its own README:
-
-| Example | Demonstrates |
-| --- | --- |
-| [`examples/standalone`](examples/standalone/README.md) | One manifest, one package, tasks with a nested `cwd`. |
-| [`examples/echo`](examples/echo/README.md) | Package discovery, local and cross-package dependencies, pipelines, package selection, timeouts, resource groups, dry runs, and parallel scheduling. |
-| [`examples/cache`](examples/cache/README.md) | Cache hits, output restoration, and invalidation when an input changes. |
-| [`examples/release-gate`](examples/release-gate/README.md) | A `workspace:` task that coordinates a release once after every package is ready. |
+## Development
 
 ```bash
-cargo run -- check --dir examples/echo
-cargo run -- run --dir examples/echo --jobs 2
+cargo fmt --check
+cargo test --workspace --all-targets --all-features
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo package --locked
+mono check
 ```
-
-## CI and releases
-
-The project dogfoods itself: `.github/workflows/ci.yml` runs the pipeline defined in its own root `mono.toml`, so local and hosted checks use the same task graph.
-
-```bash
-cargo run --locked -- ci --no-cache --output github-actions
-```
-
-Releasing is a pipeline too, and it is the only place release knowledge lives:
-
-```bash
-RELEASE_TAG=v0.1.2 cargo run --locked -- run release
-```
-
-The tasks call [`xtask/`](xtask), a Rust helper that is deliberately *not* part of the published binary. It contains this repository's project-specific release gates: binary behavior, examples, and release-plan assertions. `mono` now provides the provider-neutral changelog and artifact operations that can be reused by any language or package manager.
-
-### Generic changelog and release commands
-
-These commands require no additional `mono.toml` sections:
-
-```bash
-mono changelog validate
-mono changelog scaffold --version 0.1.2
-RELEASE_TAG=v0.1.2 mono changelog notes --output RELEASE_NOTES.md
-
-mono release source --tag v0.1.2 --commit "$GITHUB_SHA"
-mono release manifest --directory dist
-mono release verify --directory dist --tag v0.1.2
-```
-
-Changelog commands validate and render the repository's structured `CHANGELOG.md`; they do not assume GitHub, pull requests, or a programming language. Release commands operate on files, checksums, and explicit source identity. They do not publish, inspect registries, execute binaries, or assume a package format.
-
-The project's `release-notes` task turns `CHANGELOG.md` into `RELEASE_NOTES.md`, while `release-verify` asserts this repository's project-specific claims: that its binary reports the version it claims, that its own manifests validate, that examples run, and that the documented release plan resolves. The generic `mono release verify` command validates published metadata and artifacts separately. The version of a release is the newest `## ` entry of [`CHANGELOG.md`](CHANGELOG.md), so the notes a reviewer approves are the notes users read. Name that entry `## (unreleased)` to fold a skipped release into the next one.
-
-To cut a release, scaffold the newest changelog entry, fill in the user-facing notes, set the same version in `Cargo.toml`, merge, then push the tag:
-
-```bash
-cargo run --locked -- changelog scaffold --version 0.1.2
-# edit CHANGELOG.md
-# CHANGELOG.md: ## 0.1.2  |  Cargo.toml: version = "0.1.2"
-git tag v0.1.2
-git push origin v0.1.2
-```
-
-The `Release` workflow refuses a tag that matches neither `Cargo.toml` nor the newest changelog entry, verifies that the tag resolves to the checked-out commit, runs the project's `ci` pipeline and release gates, builds the four targets, asserts each binary reports the release version, and generates GitHub Actions provenance for each archive. Before publication it requires exactly the four expected archives, `SHA256SUMS`, and `BUILD-METADATA.json`. The draft only becomes the latest release once every asset is uploaded. Re-running is safe: an existing draft is reused, `--clobber` refreshes its assets, and an already published tag is never overwritten. If a run fails halfway, resume it from the tag instead of moving it:
-
-```bash
-gh workflow run Release --field tag=v0.1.2
-```
-
-`Release (validate)` runs weekly and after every successful release, sharing the `release` concurrency group so it cannot race publication. It checks out the released tag, verifies `BUILD-METADATA.json`, downloads the published assets, rebuilds the Linux binary from the tag, compares it with the published binary, verifies its GitHub Actions provenance, and runs the release pipeline with the published binary — checksums, identity, manifests, and examples. Tags cut before metadata and provenance existed fall back to the legacy checksum/version checks.
-
-The publishing job uses the protected GitHub `release` environment. Repository administrators must create that environment and may configure required reviewers before a release can become public. Published releases are immutable: retry drafts, but supersede a bad published release with a new fix-forward version rather than moving tags or replacing assets.
-
-## License
-
-Apache-2.0. See [LICENSE](LICENSE).

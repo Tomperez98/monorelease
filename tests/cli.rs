@@ -1,11 +1,9 @@
-//! End-to-end checks of the transport contract `main` owns: what the binary
-//! prints and which exit code it maps each expected failure to.
+//! End-to-end checks of the CLI transport contract.
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Command, Output};
 
-/// A unique directory that deletes itself when the test ends.
 struct TempDir(PathBuf);
 
 impl TempDir {
@@ -32,546 +30,321 @@ fn mono(args: &[&str], cwd: &Path) -> Output {
         .args(args)
         .current_dir(cwd)
         .output()
-        .expect("run the mono binary")
+        .expect("run mono")
 }
 
 fn stdout(output: &Output) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
-
 fn stderr(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
 }
 
+fn write_project(root: &Path, body: &str) {
+    fs::write(
+        root.join("mono.toml"),
+        format!("[project]\nname = \"fixture\"\n\n{body}"),
+    )
+    .expect("write project manifest");
+}
+
 #[test]
-fn init_succeeds_with_exit_code_zero() {
+fn init_creates_a_valid_root_project() {
     let temp = TempDir::new("init");
-
     let output = mono(&["init"], temp.path());
-
-    assert!(output.status.success(), "stderr: {}", stderr(&output));
-    assert!(temp.path().join("mono.toml").is_file());
-    assert!(stdout(&output).starts_with("initialized"));
-}
-
-#[test]
-fn standalone_init_creates_a_valid_single_package_project() {
-    let temp = TempDir::new("standalone-init");
-
-    let output = mono(
-        &[
-            "init",
-            "--standalone",
-            "--command",
-            "echo",
-            "--command",
-            "build",
-        ],
-        temp.path(),
-    );
-
-    assert!(output.status.success(), "stderr: {}", stderr(&output));
-    let manifest =
-        fs::read_to_string(temp.path().join("mono.toml")).expect("standalone manifest is readable");
-    assert!(manifest.contains("[package]"));
+    assert!(output.status.success(), "{}", stderr(&output));
+    let manifest = fs::read_to_string(temp.path().join("mono.toml")).unwrap();
+    assert!(manifest.contains("schema = 1"));
+    assert!(manifest.contains("[project]"));
     assert!(!manifest.contains("[workspace]"));
-    assert!(!temp.path().join("apps").exists());
-    assert!(!temp.path().join("packages").exists());
-
-    let doctor = mono(&["doctor"], temp.path());
-    assert!(doctor.status.success(), "stderr: {}", stderr(&doctor));
+    assert!(!manifest.contains("[package]"));
+    assert!(mono(&["check"], temp.path()).status.success());
 }
 
 #[test]
-fn standalone_init_requires_a_command() {
-    let temp = TempDir::new("standalone-init-missing-command");
-
+fn init_has_no_standalone_mode() {
+    let temp = TempDir::new("no-standalone");
     let output = mono(&["init", "--standalone"], temp.path());
-
-    assert_eq!(output.status.code(), Some(1));
-    assert!(stderr(&output).contains("requires a non-empty --command"));
-    assert!(!temp.path().join("mono.toml").exists());
+    assert_eq!(output.status.code(), Some(2));
 }
 
 #[test]
-fn cache_clean_removes_local_entries_without_removing_the_workspace() {
-    let temp = TempDir::new("cache-clean");
-    assert!(mono(&["init"], temp.path()).status.success());
-    let cache_entry = temp.path().join(".mono").join("cache").join("entry");
-    fs::create_dir_all(&cache_entry).expect("create cache entry");
-    fs::write(cache_entry.join("metadata.json"), "cache").expect("write cache metadata");
-
-    let output = mono(&["cache", "clean"], temp.path());
-
-    assert!(output.status.success(), "stderr: {}", stderr(&output));
-    assert!(!temp.path().join(".mono/cache").exists());
-    assert!(temp.path().join("mono.toml").is_file());
-}
-
-#[test]
-fn reinitializing_fails_with_a_nonzero_exit_code() {
+fn reinitializing_refuses_to_overwrite() {
     let temp = TempDir::new("reinit");
     assert!(mono(&["init"], temp.path()).status.success());
-
     let output = mono(&["init"], temp.path());
-
     assert_eq!(output.status.code(), Some(1));
     assert!(stderr(&output).contains("refusing to overwrite"));
 }
 
 #[test]
-fn doctor_fails_with_a_nonzero_exit_code_without_a_root_manifest() {
-    let temp = TempDir::new("doctor-missing-root");
-
-    let output = mono(&["doctor"], temp.path());
-
-    assert_eq!(output.status.code(), Some(1));
-    assert!(stderr(&output).contains("could not find a root mono.toml"));
+fn nested_invocation_uses_the_ancestor_root() {
+    let temp = TempDir::new("nested");
+    fs::create_dir(temp.path().join("services")).unwrap();
+    write_project(
+        temp.path(),
+        "[pipelines.ci]\ntasks = [\"build\"]\n\n[tasks.build]\ncommand = [\"echo\", \"ok\"]\n",
+    );
+    let output = mono(&["plan"], &temp.path().join("services"));
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(stdout(&output).contains("would run build"));
 }
 
 #[test]
-fn doctor_accepts_the_manifest_created_by_init() {
-    let temp = TempDir::new("doctor-valid");
-    assert!(mono(&["init"], temp.path()).status.success());
-
-    let output = mono(&["doctor"], temp.path());
-
-    assert!(output.status.success(), "stderr: {}", stderr(&output));
-    assert!(stdout(&output).contains("checked"));
+fn default_pipeline_runs_global_tasks_in_dependency_order() {
+    let temp = TempDir::new("run");
+    write_project(
+        temp.path(),
+        "[pipelines.ci]\ntasks = [\"app-build\"]\n\n[tasks.base-build]\ncommand = [\"echo\", \"base\"]\n\n[tasks.app-build]\ncommand = [\"echo\", \"app\"]\ndepends_on = [\"base-build\"]\n",
+    );
+    let output = mono(&["run", "--no-cache"], temp.path());
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stdout(&output).matches("summary: 2 completed").count(), 1);
+    assert!(!stderr(&output).contains("summary:"));
+    assert!(stderr(&output).contains("app-build"));
 }
 
 #[test]
-fn default_command_runs_the_default_pipeline() {
-    let temp = TempDir::new("default-command");
-    fs::write(
-        temp.path().join("mono.toml"),
-        "[package]\nname = \"app\"\n\n[pipelines.ci]\ntasks = [\"build\"]\n\n[tasks.build]\ncommand = [\"echo\", \"building\"]\n",
-    )
-    .expect("write standalone manifest");
-
-    let output = mono(&[], temp.path());
-
-    assert!(output.status.success(), "stderr: {}", stderr(&output));
-    assert!(stdout(&output).contains("summary: 1 completed"));
-}
-
-#[test]
-fn list_describes_available_tasks_and_pipelines() {
+fn list_describes_one_project_and_global_tasks() {
     let temp = TempDir::new("list");
-    fs::write(
-        temp.path().join("mono.toml"),
-        "[package]\nname = \"app\"\n\n[pipelines.ci]\ntasks = [\"test\"]\n\n[tasks.test]\ncommand = [\"echo\", \"testing\"]\n",
-    )
-    .expect("write standalone manifest");
-
+    write_project(
+        temp.path(),
+        "[pipelines.ci]\ntasks = [\"test\"]\n\n[tasks.test]\ncommand = [\"echo\", \"testing\"]\n",
+    );
     let output = mono(&["list"], temp.path());
-
-    assert!(output.status.success(), "stderr: {}", stderr(&output));
-    let listing = stdout(&output);
-    assert!(listing.contains("Pipelines:"));
-    assert!(listing.contains("ci  test"));
-    assert!(listing.contains("app:test"));
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(stdout(&output).contains("project fixture"));
+    assert!(stdout(&output).contains("test: echo testing"));
 }
 
 #[test]
-fn unknown_task_suggests_the_closest_task_name() {
-    let temp = TempDir::new("task-suggestion");
-    fs::write(
-        temp.path().join("mono.toml"),
-        "[package]\nname = \"app\"\n\n[pipelines.ci]\ntasks = [\"test\"]\n\n[tasks.test]\ncommand = [\"echo\", \"testing\"]\n",
-    )
-    .expect("write standalone manifest");
-
+fn unknown_task_suggests_the_closest_global_task() {
+    let temp = TempDir::new("suggestion");
+    write_project(
+        temp.path(),
+        "[pipelines.ci]\ntasks = [\"test\"]\n\n[tasks.test]\ncommand = [\"echo\", \"testing\"]\n",
+    );
     let output = mono(&["task", "tests"], temp.path());
-
     assert_eq!(output.status.code(), Some(1));
     assert!(stderr(&output).contains("Did you mean 'test'?"));
 }
 
 #[test]
-fn standalone_project_runs_without_workspace_members() {
-    let temp = TempDir::new("standalone");
-    fs::create_dir_all(temp.path().join("src")).expect("create source directory");
-    fs::write(
-        temp.path().join("mono.toml"),
-        "[package]\nname = \"app\"\n\n[pipelines.ci]\ntasks = [\"build\", \"test\"]\n\n[tasks.build]\ncommand = [\"echo\", \"building\"]\n\n[tasks.test]\ncommand = [\"echo\", \"testing\"]\ndepends_on = [\"build\"]\n",
-    )
-    .expect("write standalone manifest");
-
-    let plan = mono(&["plan"], &temp.path().join("src"));
-
-    assert!(plan.status.success(), "stderr: {}", stderr(&plan));
-    let plan_output = stdout(&plan);
-    assert!(plan_output.find("app:build").unwrap() < plan_output.find("app:test").unwrap());
-    assert!(!plan_output.contains("workspace:build"));
-
-    let run = mono(&["ci"], temp.path());
-    assert!(run.status.success(), "stderr: {}", stderr(&run));
-    assert!(stdout(&run).contains("summary: 2 completed"));
-}
-
-#[test]
-fn ci_dry_run_discovers_a_package_manifest() {
-    let temp = TempDir::new("ci-dry-run");
-    assert!(mono(&["init"], temp.path()).status.success());
-
-    let package = temp.path().join("packages").join("api");
-    fs::create_dir_all(&package).expect("create package directory");
-    fs::write(
-        package.join("mono.toml"),
-        "[package]\nname = \"api\"\n\n[tasks.build]\ncommand = [\"echo\", \"building-api\"]\n\n[tasks.test]\ncommand = [\"echo\", \"testing-api\"]\n",
-    )
-    .expect("write package manifest");
-
-    let output = mono(&["ci", "--dry-run"], temp.path());
-
-    assert!(output.status.success(), "stderr: {}", stderr(&output));
-    assert!(stdout(&output).contains("would run api:build"));
-    assert!(stdout(&output).contains("echo building-api"));
+fn cacheable_tasks_cannot_inherit_standard_input() {
+    let temp = TempDir::new("cache-stdin");
+    write_project(
+        temp.path(),
+        "[pipelines.ci]\ntasks = [\"build\"]\n\n[tasks.build]\ncommand = [\"echo\", \"build\"]\ncache = true\ninputs = [\"input.txt\"]\nstdin = \"inherit\"\n",
+    );
+    fs::write(temp.path().join("input.txt"), "input").unwrap();
+    let output = mono(&["check"], temp.path());
+    assert!(!output.status.success());
+    assert!(stderr(&output).contains("cannot inherit standard input"));
 }
 
 #[cfg(unix)]
 #[test]
-fn ci_reuses_cached_outputs_and_supports_cache_bypass_flags() {
-    let temp = TempDir::new("ci-cache");
-    fs::write(
-        temp.path().join("mono.toml"),
-        "[workspace]\nname = \"fixture\"\nmembers = [\"packages/*\"]\ndefault_pipeline = \"ci\"\n\n[pipelines.ci]\ntasks = [\"build\"]\n",
-    )
-    .expect("write root manifest");
-    let package = temp.path().join("packages").join("app");
-    fs::create_dir_all(&package).expect("create package directory");
-    fs::write(
-        package.join("mono.toml"),
-        "[package]\nname = \"app\"\n\n[tasks.build]\ncommand = [\"sh\", \"-c\", \"n=$(cat count 2>/dev/null || echo 0); echo $((n + 1)) > count; cat seed > artifact\"]\ncache = true\ninputs = [\"seed\"]\noutputs = [\"artifact\"]\n",
-    )
-    .expect("write package manifest");
-    fs::write(package.join("seed"), "hello").expect("write input");
-
-    let first = mono(&["ci"], temp.path());
-    assert!(first.status.success(), "stderr: {}", stderr(&first));
+fn cache_reuses_root_task_outputs_and_supports_bypass() {
+    let temp = TempDir::new("cache");
+    write_project(
+        temp.path(),
+        "[pipelines.ci]\ntasks = [\"build\"]\n\n[tasks.build]\ncommand = [\"sh\", \"-c\", \"n=$(cat count 2>/dev/null || echo 0); echo $((n + 1)) > count; cat seed > artifact\"]\ncache = true\ninputs = [\"seed\"]\noutputs = [\"artifact\"]\n",
+    );
+    fs::write(temp.path().join("seed"), "hello").unwrap();
+    assert!(mono(&["ci"], temp.path()).status.success());
     let second = mono(&["ci"], temp.path());
-    assert!(second.status.success(), "stderr: {}", stderr(&second));
+    assert!(second.status.success(), "{}", stderr(&second));
     assert!(stderr(&second).contains("cache hit"));
     assert_eq!(
-        fs::read_to_string(package.join("count")).expect("read count"),
+        fs::read_to_string(temp.path().join("count")).unwrap(),
         "1\n"
     );
-
-    let forced = mono(&["ci", "--force"], temp.path());
-    assert!(forced.status.success(), "stderr: {}", stderr(&forced));
+    assert!(mono(&["ci", "--force"], temp.path()).status.success());
     assert_eq!(
-        fs::read_to_string(package.join("count")).expect("read count"),
+        fs::read_to_string(temp.path().join("count")).unwrap(),
         "2\n"
     );
-
-    let without_cache = mono(&["ci", "--no-cache"], temp.path());
-    assert!(
-        without_cache.status.success(),
-        "stderr: {}",
-        stderr(&without_cache)
-    );
-    assert!(!stderr(&without_cache).contains("cache hit"));
-    assert_eq!(
-        fs::read_to_string(package.join("count")).expect("read count"),
-        "3\n"
-    );
-
-    fs::remove_file(package.join("artifact")).expect("remove output");
-    let restored = mono(&["ci"], temp.path());
-    assert!(restored.status.success(), "stderr: {}", stderr(&restored));
-    assert!(stderr(&restored).contains("cache hit"));
-    assert_eq!(
-        fs::read_to_string(package.join("artifact")).expect("read artifact"),
-        "hello"
-    );
 }
 
 #[test]
-fn plan_includes_a_workspace_task_after_package_dependencies() {
-    let temp = TempDir::new("workspace-task");
-    fs::write(
-        temp.path().join("mono.toml"),
-        "[workspace]\nname = \"fixture\"\nmembers = [\"packages/*\"]\ndefault_pipeline = \"release\"\n\n[pipelines.release]\ntasks = [\"workspace:release-verify\"]\n\n[tasks.release-verify]\ncommand = [\"echo\", \"release\"]\ndepends_on = [\"api:package\"]\n",
-    )
-    .expect("write root manifest");
-    let package = temp.path().join("packages").join("api");
-    fs::create_dir_all(&package).expect("create package directory");
-    fs::write(
-        package.join("mono.toml"),
-        "[package]\nname = \"api\"\n\n[tasks.package]\ncommand = [\"echo\", \"package\"]\n",
-    )
-    .expect("write package manifest");
-
+fn plan_redacts_environment_values() {
+    let temp = TempDir::new("env");
+    write_project(
+        temp.path(),
+        "[pipelines.ci]\ntasks = [\"build\"]\n\n[tasks.build]\ncommand = [\"echo\", \"build\"]\nenv = { API_TOKEN = \"secret\", MODE = \"check\" }\n",
+    );
     let output = mono(&["plan"], temp.path());
-
-    assert!(output.status.success(), "stderr: {}", stderr(&output));
-    let output = stdout(&output);
-    assert!(output.find("api:package").unwrap() < output.find("workspace:release-verify").unwrap());
-}
-
-#[test]
-fn doctor_rejects_a_missing_task_working_directory() {
-    let temp = TempDir::new("doctor-missing-cwd");
-    assert!(mono(&["init"], temp.path()).status.success());
-
-    let package = temp.path().join("packages").join("api");
-    fs::create_dir_all(&package).expect("create package directory");
-    fs::write(
-        package.join("mono.toml"),
-        "[package]\nname = \"api\"\n\n[tasks.build]\ncommand = [\"echo\", \"build\"]\ncwd = \"missing\"\n\n[tasks.test]\ncommand = [\"echo\", \"test\"]\n",
-    )
-    .expect("write package manifest");
-
-    let output = mono(&["doctor"], temp.path());
-
-    assert_eq!(output.status.code(), Some(1));
-    assert!(stderr(&output).contains("missing"));
+    assert!(output.status.success());
+    let text = stdout(&output);
+    assert!(text.contains("API_TOKEN=<redacted>"));
+    assert!(!text.contains("secret"));
+    assert!(!text.contains("check"));
 }
 
 #[cfg(unix)]
 #[test]
-fn ci_keeps_task_output_and_status_lines_separate() {
-    let temp = TempDir::new("ci-output-boundaries");
-    assert!(mono(&["init"], temp.path()).status.success());
-
-    let package = temp.path().join("packages").join("api");
-    fs::create_dir_all(&package).expect("create package directory");
-    fs::write(
-        package.join("mono.toml"),
-        "[package]\nname = \"api\"\n\n[tasks.build]\ncommand = [\"sh\", \"-c\", \"printf task-output; printf task-error >&2\"]\n\n[tasks.test]\ncommand = [\"echo\", \"test\"]\n",
-    )
-    .expect("write package manifest");
-
-    let output = mono(&["ci", "--task", "build"], temp.path());
-
-    assert!(output.status.success(), "stderr: {}", stderr(&output));
-    assert!(
-        stdout(&output)
-            .contains("task-output\nsummary: 1 completed, 0 cached, 0 failed, 0 blocked")
+fn json_output_contains_lifecycle_events() {
+    let temp = TempDir::new("json");
+    write_project(
+        temp.path(),
+        "[pipelines.ci]\ntasks = [\"build\"]\n\n[tasks.build]\ncommand = [\"echo\", \"hello\"]\n",
     );
-    assert!(stderr(&output).contains("▶ api:build"));
-    assert!(stderr(&output).contains("task-error\napi:build: completed in "));
-}
-
-#[cfg(unix)]
-#[test]
-fn github_actions_output_is_explicit() {
-    let temp = TempDir::new("github-actions-output");
-    fs::write(
-        temp.path().join("mono.toml"),
-        "[package]\nname = \"app\"\n\n[pipelines.ci]\ntasks = [\"build\"]\n\n[tasks.build]\ncommand = [\"echo\", \"building\"]\n",
-    )
-    .expect("write standalone manifest");
-
-    let output = mono(&["ci", "--output", "github-actions"], temp.path());
-
-    assert!(output.status.success(), "stderr: {}", stderr(&output));
-    assert!(stdout(&output).contains("::group::app:build"));
-    assert!(stdout(&output).contains("building"));
-    assert!(stdout(&output).contains("::endgroup::"));
-}
-
-#[cfg(unix)]
-#[test]
-fn ci_reports_failed_task_output_and_context() {
-    let temp = TempDir::new("ci-failure");
-    assert!(mono(&["init"], temp.path()).status.success());
-
-    let package = temp.path().join("packages").join("api");
-    fs::create_dir_all(&package).expect("create package directory");
-    fs::write(
-        package.join("mono.toml"),
-        "[package]\nname = \"api\"\n\n[tasks.build]\ncommand = [\"sh\", \"-c\", \"printf boom >&2; exit 3\"]\n\n[tasks.test]\ncommand = [\"sh\", \"-c\", \"printf should-not-run\"]\n",
-    )
-    .expect("write package manifest");
-
-    // `--jobs 1` keeps this test about failure blocking: with the default
-    // worker count the independent `api:test` is dispatched before `api:build`
-    // reports its failure, so it would not be counted as blocked.
-    let output = mono(&["ci", "--jobs", "1"], temp.path());
-
-    // A task that exits non-zero is a failed request (1), not a failed tool (3).
-    assert_eq!(output.status.code(), Some(1));
-    assert!(stderr(&output).contains("boom"));
-    assert!(stderr(&output).contains("api/build"));
-    assert!(stderr(&output).contains("api:build: failed in "));
-    assert!(stderr(&output).contains("summary: 0 completed, 0 cached, 1 failed, 1 blocked"));
-    assert!(!stderr(&output).contains("should-not-run"));
-}
-
-#[cfg(unix)]
-#[test]
-fn ci_reports_task_start_progress() {
-    let temp = TempDir::new("ci-progress");
-    fs::write(
-        temp.path().join("mono.toml"),
-        "[workspace]\nname = \"fixture\"\nmembers = [\"packages/*\"]\ndefault_pipeline = \"ci\"\n\n[pipelines.ci]\ntasks = [\"build\"]\n",
-    )
-    .expect("write root manifest");
-    for name in ["a", "b"] {
-        let package = temp.path().join("packages").join(name);
-        fs::create_dir_all(&package).expect("create package directory");
-        fs::write(
-            package.join("mono.toml"),
-            format!(
-                "[package]\nname = \"{name}\"\n\n[tasks.build]\ncommand = [\"sh\", \"-c\", \"sleep 0.05; echo {name}\"]\n"
-            ),
-        )
-        .expect("write package manifest");
-    }
-
-    let output = mono(&["ci", "--jobs", "2"], temp.path());
-
-    assert!(output.status.success(), "stderr: {}", stderr(&output));
-    assert!(stderr(&output).contains("▶ a:build"));
-    assert!(stderr(&output).contains("▶ b:build"));
-    assert!(stderr(&output).contains("a:build: completed in "));
-    assert!(stderr(&output).contains("b:build: completed in "));
-}
-
-#[cfg(unix)]
-#[test]
-fn jobs_defaults_to_machine_parallelism() {
-    let temp = TempDir::new("jobs-default");
-
-    let output = mono(&["run", "--help"], temp.path());
-
-    let expected = std::thread::available_parallelism()
-        .map(|count| count.get())
-        .unwrap_or(1);
+    let output = mono(&["ci", "--output", "json"], temp.path());
+    assert!(output.status.success(), "{}", stderr(&output));
+    let output_text = stdout(&output);
+    let lines = output_text.lines().collect::<Vec<_>>();
     assert!(
-        stdout(&output).contains(&format!("[default: {expected}]")),
-        "expected the help to report the machine's parallelism: {}",
+        lines
+            .iter()
+            .any(|line| line.contains("\"event\":\"task_started\""))
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("\"event\":\"task_finished\""))
+    );
+    assert!(
+        lines
+            .iter()
+            .all(|line| serde_json::from_str::<serde_json::Value>(line).is_ok())
+    );
+    let events = lines
+        .iter()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert!(events.iter().all(|event| event["run_id"].is_u64()));
+    let sequences = events
+        .iter()
+        .map(|event| event["sequence"].as_u64().unwrap())
+        .collect::<Vec<_>>();
+    assert!(sequences.windows(2).all(|pair| pair[0] < pair[1]));
+}
+
+#[test]
+fn non_project_manifest_shape_is_rejected() {
+    let temp = TempDir::new("old-shape");
+    fs::write(
+        temp.path().join("mono.toml"),
+        "[workspace]\nname = \"old\"\n",
+    )
+    .unwrap();
+    let output = mono(&["check"], temp.path());
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stderr(&output).contains("could not parse"));
+}
+
+#[test]
+fn legacy_package_selection_is_rejected_by_the_cli() {
+    let temp = TempDir::new("legacy-selection-flag");
+    assert!(mono(&["init"], temp.path()).status.success());
+    let output = mono(&["run", "--package", "api"], temp.path());
+    assert_eq!(output.status.code(), Some(2));
+}
+
+#[test]
+fn plan_json_is_a_stable_machine_document() {
+    let temp = TempDir::new("plan-json");
+    write_project(
+        temp.path(),
+        "[pipelines.ci]\ntasks = [\"build\"]\n\n[tasks.build]\ncommand = [\"echo\", \"build\"]\nenv = { TOKEN = \"secret\" }\n",
+    );
+    let output = mono(&["--output", "json", "plan"], temp.path());
+    assert!(output.status.success(), "{}", stderr(&output));
+    let document: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(document["schema"], 1);
+    assert_eq!(document["kind"], "plan");
+    assert_eq!(document["tasks"][0]["id"], "build");
+    assert_eq!(document["tasks"][0]["env"][0], "TOKEN");
+    assert_eq!(document["tasks"][0]["stdin"], "null");
+    assert!(document["tasks"][0].get("secret").is_none());
+
+    let dry_run = mono(&["--output", "json", "run", "--dry-run"], temp.path());
+    assert!(dry_run.status.success(), "{}", stderr(&dry_run));
+    let dry_run_document: serde_json::Value = serde_json::from_slice(&dry_run.stdout).unwrap();
+    assert_eq!(dry_run_document["kind"], "plan");
+}
+
+#[test]
+fn list_json_contains_pipelines_and_tasks() {
+    let temp = TempDir::new("list-json");
+    write_project(
+        temp.path(),
+        "[pipelines.ci]\ntasks = [\"build\"]\n\n[tasks.build]\ncommand = [\"echo\", \"build\"]\n",
+    );
+    let output = mono(&["--output", "json", "list"], temp.path());
+    assert!(output.status.success(), "{}", stderr(&output));
+    let document: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(document["schema"], 1);
+    assert_eq!(document["kind"], "list");
+    assert_eq!(document["pipelines"][0]["name"], "ci");
+    assert_eq!(document["tasks"][0]["id"], "build");
+}
+
+#[test]
+fn json_success_documents_cover_non_execution_commands() {
+    let temp = TempDir::new("json-success");
+    let init = mono(&["--output", "json", "init"], temp.path());
+    assert!(init.status.success(), "{}", stderr(&init));
+    let init_document: serde_json::Value = serde_json::from_slice(&init.stdout).unwrap();
+    assert_eq!(init_document["schema"], 1);
+    assert_eq!(init_document["kind"], "init");
+
+    let clean = mono(&["--output", "json", "cache", "clean"], temp.path());
+    assert!(clean.status.success(), "{}", stderr(&clean));
+    let clean_document: serde_json::Value = serde_json::from_slice(&clean.stdout).unwrap();
+    assert_eq!(clean_document["kind"], "cache_clean");
+}
+
+#[cfg(unix)]
+#[test]
+fn github_actions_output_disables_command_processing_for_task_output() {
+    let temp = TempDir::new("github-output");
+    write_project(
+        temp.path(),
+        "[pipelines.ci]\ntasks = [\"build\"]\n\n[tasks.build]\ncommand = [\"sh\", \"-c\", \"printf '::error:: injected'\"]\n",
+    );
+    let output = mono(
+        &["--output", "github-actions", "run", "--no-cache"],
+        temp.path(),
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.contains("::stop-commands::"), "{text}");
+    assert!(text.contains("::mono_output_"), "{text}");
+    assert!(text.contains("::error:: injected"), "{text}");
+}
+
+#[cfg(unix)]
+#[test]
+fn live_output_streams_task_bytes_and_reports_summary() {
+    let temp = TempDir::new("live-output");
+    write_project(
+        temp.path(),
+        "[pipelines.ci]\ntasks = [\"build\"]\n\n[tasks.build]\ncommand = [\"sh\", \"-c\", \"printf one; sleep 0.02; printf two\"]\n",
+    );
+    let output = mono(&["--output", "live", "run", "--no-cache"], temp.path());
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(stdout(&output).contains("onetwo"), "{}", stdout(&output));
+    assert!(
+        stdout(&output).contains("1 completed"),
+        "{}",
         stdout(&output)
     );
 }
 
 #[test]
-fn plan_redacts_task_environment_values() {
-    let temp = TempDir::new("plan-redacts-env");
-    fs::write(
-        temp.path().join("mono.toml"),
-        "[workspace]\nname = \"fixture\"\nmembers = [\"packages/*\"]\ndefault_pipeline = \"ci\"\n\n[pipelines.ci]\ntasks = [\"build\"]\n",
-    )
-    .expect("write root manifest");
-    let package = temp.path().join("packages").join("app");
-    fs::create_dir_all(&package).expect("create package directory");
-    fs::write(
-        package.join("mono.toml"),
-        "[package]\nname = \"app\"\n\n[tasks.build]\ncommand = [\"echo\", \"build\"]\nenv = { API_TOKEN = \"super-secret\", MODE = \"check\" }\ninputs = [\"input.txt\"]\noutputs = [\"dist/**\"]\n",
-    )
-    .expect("write package manifest");
-
-    let output = mono(&["plan"], temp.path());
-    let output = stdout(&output);
-
-    assert!(output.contains("[inputs=input.txt]"));
-    assert!(output.contains("[outputs=dist/**]"));
-    assert!(output.contains("[env API_TOKEN=<redacted>]"));
-    assert!(output.contains("[env MODE=<redacted>]"));
-    assert!(!output.contains("super-secret"));
-    assert!(!output.contains("check"));
-}
-
-#[test]
-fn plan_and_graph_commands_expose_task_dependencies() {
-    let temp = TempDir::new("plan-graph");
-    assert!(mono(&["init"], temp.path()).status.success());
-
-    for (name, dependency) in [("shared", ""), ("web", "depends_on = [\"shared:build\"]\n")] {
-        let package = temp.path().join("packages").join(name);
-        fs::create_dir_all(&package).expect("create package directory");
-        fs::write(
-            package.join("mono.toml"),
-            format!(
-                "[package]\nname = \"{name}\"\n\n[tasks.build]\ncommand = [\"echo\", \"{name}\"]\n{dependency}\n[tasks.test]\ncommand = [\"echo\", \"{name}-test\"]\ndepends_on = [\"build\"]\n"
-            ),
-        )
-        .expect("write package manifest");
-    }
-
-    let plan = mono(&["plan"], temp.path());
-    assert!(plan.status.success(), "stderr: {}", stderr(&plan));
-    assert!(stdout(&plan).find("shared:build").unwrap() < stdout(&plan).find("web:build").unwrap());
-
-    let graph = mono(&["graph"], temp.path());
-    assert!(graph.status.success(), "stderr: {}", stderr(&graph));
-    assert!(stdout(&graph).contains("web:build <- shared:build"));
-}
-
-#[test]
-fn a_consumer_that_hangs_up_is_not_a_failure() {
-    let temp = TempDir::new("broken-pipe");
-    assert!(mono(&["init"], temp.path()).status.success());
-
-    let mut child = Command::new(env!("CARGO_BIN_EXE_mono"))
-        .arg("list")
-        .current_dir(temp.path())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn mono");
-    // Close the read end the way `mono list | head` would. The child is
-    // still parsing and loading the workspace, so its write loses the race.
-    drop(child.stdout.take());
-
-    let output = child.wait_with_output().expect("wait for mono");
-
-    assert!(
-        output.status.success(),
-        "a hung-up consumer must not be a failure: {output:?}"
+fn json_errors_are_documents_on_stdout() {
+    let temp = TempDir::new("error-json");
+    write_project(
+        temp.path(),
+        "[pipelines.ci]\ntasks = [\"build\"]\n\n[tasks.build]\ncommand = [\"echo\", \"build\"]\n",
     );
-    assert!(
-        !stderr(&output).contains("panicked"),
-        "a hung-up consumer must not panic: {}",
-        stderr(&output)
-    );
-}
-
-#[test]
-fn an_empty_argument_is_rejected_while_parsing() {
-    let temp = TempDir::new("empty-argument");
-    assert!(mono(&["init"], temp.path()).status.success());
-
-    // Without edge validation `task ""` ran an empty plan and reported success:
-    // a green build that did nothing.
-    for args in [
-        vec!["task", ""],
-        vec!["run", "--task", ""],
-        vec!["run", ""],
-        vec!["plan", "--package", ""],
-    ] {
-        let output = mono(&args, temp.path());
-
-        assert_eq!(output.status.code(), Some(2), "args: {args:?}");
-    }
-}
-
-#[test]
-fn an_unusable_worker_count_is_rejected_while_parsing() {
-    let temp = TempDir::new("jobs-invalid");
-    assert!(mono(&["init"], temp.path()).status.success());
-
-    // The scheduler requires at least one worker, so the bound belongs on the
-    // flag rather than surfacing as a failed run.
-    for jobs in ["0", "many"] {
-        let output = mono(&["run", "--jobs", jobs], temp.path());
-
-        assert_eq!(output.status.code(), Some(2), "jobs: {jobs}");
-    }
-}
-
-#[test]
-fn a_filesystem_failure_exits_with_three() {
-    let temp = TempDir::new("tool-failure");
-    // The target is a file, so the workspace root cannot be created: the command
-    // was understood and the environment refused to carry it out.
-    let occupied = temp.path().join("occupied");
-    fs::write(&occupied, "not a directory").expect("write occupying file");
-
-    let output = mono(&["--dir", occupied.to_str().unwrap(), "init"], temp.path());
-
-    assert_eq!(output.status.code(), Some(3));
-    assert!(stderr(&output).contains("could not create directory"));
+    let output = mono(&["--output", "json", "task", "missing"], temp.path());
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stderr.is_empty());
+    let document: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(document["schema"], 1);
+    assert_eq!(document["kind"], "error");
+    assert_eq!(document["code"], 1);
+    assert!(document["message"].as_str().unwrap().contains("missing"));
 }

@@ -1,4 +1,6 @@
-[package]
+schema = 1
+
+[project]
 name = "standalone-demo"
 
 [pipelines.ci]

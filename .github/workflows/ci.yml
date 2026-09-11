@@ -20,9 +20,16 @@ env:
 
 jobs:
   ci:
-    name: Validate project
-    runs-on: ubuntu-latest
+    name: Validate project (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+          - windows-latest
     steps:
       - name: Check out repository
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5

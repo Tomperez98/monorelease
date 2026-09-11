@@ -27,11 +27,16 @@ impl Drop for TempDir {
 }
 
 fn mono(args: &[&str], cwd: &Path) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_mono"))
-        .args(args)
-        .current_dir(cwd)
-        .output()
-        .expect("run mono")
+    mono_with_env(args, cwd, &[])
+}
+
+fn mono_with_env(args: &[&str], cwd: &Path, env: &[(&str, &str)]) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_mono"));
+    command.args(args).current_dir(cwd);
+    for (key, value) in env {
+        command.env(key, value);
+    }
+    command.output().expect("run mono")
 }
 
 #[test]
@@ -52,7 +57,7 @@ fn changelog_commands_validate_scaffold_and_render_notes() {
             "notes",
             "--version",
             "v1.0.0",
-            "--output",
+            "--output-file",
             "notes.md",
         ],
         temp.path(),
@@ -110,6 +115,161 @@ fn release_commands_create_and_verify_file_artifacts() {
             "v1.0.0",
             "--commit",
             "abc123",
+        ],
+        temp.path(),
+    );
+    assert!(verify.status.success(), "verify failed: {verify:?}");
+}
+
+/// `release.yml` exports `RELEASE_TAG_OBJECT` unconditionally, so a lightweight
+/// tag reaches the CLI as the empty string. That has to mean "no tag object",
+/// not a tag object that happens to be empty.
+#[test]
+fn release_commands_enforce_an_expected_artifact_inventory() {
+    let temp = TempDir::new("expected-inventory");
+    fs::create_dir_all(temp.path().join("dist")).unwrap();
+    fs::write(temp.path().join("dist/app.tar.gz"), b"app").unwrap();
+    fs::write(temp.path().join("dist/extra.txt"), b"extra").unwrap();
+    fs::write(temp.path().join("expected.txt"), "app.tar.gz\n").unwrap();
+
+    let manifest = mono(
+        &[
+            "release",
+            "manifest",
+            "--directory",
+            "dist",
+            "--expected",
+            "expected.txt",
+            "--tag",
+            "v1.0.0",
+        ],
+        temp.path(),
+    );
+    assert!(
+        !manifest.status.success(),
+        "unexpected artifact passed inventory"
+    );
+
+    fs::write(temp.path().join("expected.txt"), "app.tar.gz\nextra.txt\n").unwrap();
+    let manifest = mono(
+        &[
+            "release",
+            "manifest",
+            "--directory",
+            "dist",
+            "--expected",
+            "expected.txt",
+            "--tag",
+            "v1.0.0",
+        ],
+        temp.path(),
+    );
+    assert!(
+        manifest.status.success(),
+        "expected inventory failed: {manifest:?}"
+    );
+
+    let verify = mono(
+        &[
+            "release",
+            "verify",
+            "--directory",
+            "dist",
+            "--expected",
+            "expected.txt",
+            "--tag",
+            "v1.0.0",
+        ],
+        temp.path(),
+    );
+    assert!(
+        verify.status.success(),
+        "expected verification failed: {verify:?}"
+    );
+}
+
+#[test]
+fn a_lightweight_tag_records_no_tag_object() {
+    let temp = TempDir::new("lightweight-tag");
+    fs::create_dir_all(temp.path().join("dist")).unwrap();
+    fs::write(temp.path().join("dist/artifact.tar.gz"), b"artifact").unwrap();
+
+    let manifest = mono_with_env(
+        &[
+            "release",
+            "manifest",
+            "--directory",
+            "dist",
+            "--tag",
+            "v1.0.0",
+        ],
+        temp.path(),
+        &[("RELEASE_TAG_OBJECT", "")],
+    );
+    assert!(manifest.status.success(), "manifest failed: {manifest:?}");
+
+    let written: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(temp.path().join("dist/BUILD-METADATA.json")).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        written.get("tag_object").is_none(),
+        "a lightweight tag must not be recorded as an empty tag object: {written}"
+    );
+
+    // The validator compares the field whenever it is given one, so an absent
+    // field against an expected object is a mismatch, not a silent pass.
+    let verify = mono(
+        &[
+            "release",
+            "verify",
+            "--directory",
+            "dist",
+            "--tag",
+            "v1.0.0",
+            "--tag-object",
+            "def456",
+        ],
+        temp.path(),
+    );
+    assert!(!verify.status.success(), "verify unexpectedly passed");
+    assert!(
+        String::from_utf8_lossy(&verify.stderr).contains("tag object"),
+        "unexpected error: {verify:?}"
+    );
+}
+
+#[test]
+fn an_annotated_tag_object_round_trips_through_the_cli() {
+    let temp = TempDir::new("annotated-tag");
+    fs::create_dir_all(temp.path().join("dist")).unwrap();
+    fs::write(temp.path().join("dist/artifact.tar.gz"), b"artifact").unwrap();
+
+    let manifest = mono(
+        &[
+            "release",
+            "manifest",
+            "--directory",
+            "dist",
+            "--tag",
+            "v1.0.0",
+            "--tag-object",
+            "def456",
+        ],
+        temp.path(),
+    );
+    assert!(manifest.status.success(), "manifest failed: {manifest:?}");
+
+    let verify = mono(
+        &[
+            "release",
+            "verify",
+            "--directory",
+            "dist",
+            "--tag",
+            "v1.0.0",
+            "--tag-object",
+            "def456",
         ],
         temp.path(),
     );
