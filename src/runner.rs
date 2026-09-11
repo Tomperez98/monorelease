@@ -540,6 +540,26 @@ impl RunnerError {
             | Self::Terminate { .. } => None,
         }
     }
+
+    /// The lifecycle status this failure presents as.
+    ///
+    /// One mapping, next to the error vocabulary, so the JSON `status` field
+    /// and the run summary can never disagree about what a failure was.
+    pub(crate) fn status(&self) -> crate::events::TaskStatus {
+        use crate::events::TaskStatus;
+
+        match self {
+            Self::TimedOut(_) => TaskStatus::TimedOut,
+            Self::OutputLimit(_) => TaskStatus::OutputLimit,
+            Self::Cancelled(_) => TaskStatus::Cancelled,
+            Self::EmptyCommand { .. }
+            | Self::Spawn { .. }
+            | Self::Wait { .. }
+            | Self::OutputRead { .. }
+            | Self::Terminate { .. }
+            | Self::Failed(_) => TaskStatus::Failed,
+        }
+    }
 }
 
 impl fmt::Display for RunnerError {
@@ -838,6 +858,55 @@ mod tests {
         assert!(
             marker.exists(),
             "a successful task killed a detached descendant on Windows"
+        );
+    }
+
+    #[test]
+    fn a_failure_maps_onto_exactly_one_lifecycle_status() {
+        use crate::events::TaskStatus;
+
+        assert_eq!(
+            RunnerError::Cancelled(Box::new(CancelledTask {
+                project: "fixture".to_owned(),
+                task: "build".to_owned(),
+                output: CapturedOutput::default(),
+                elapsed: Duration::ZERO,
+            }))
+            .status(),
+            TaskStatus::Cancelled
+        );
+        assert_eq!(
+            RunnerError::TimedOut(Box::new(TimedOutTask {
+                project: "fixture".to_owned(),
+                task: "build".to_owned(),
+                command: vec!["sleep".to_owned()],
+                cwd: PathBuf::from("/tmp"),
+                timeout: Duration::from_secs(1),
+                output: CapturedOutput::default(),
+                elapsed: Duration::ZERO,
+            }))
+            .status(),
+            TaskStatus::TimedOut
+        );
+        assert_eq!(
+            RunnerError::OutputLimit(Box::new(OutputLimitTask {
+                project: "fixture".to_owned(),
+                task: "build".to_owned(),
+                stream: "stdout",
+                limit: 8,
+                output: CapturedOutput::default(),
+                elapsed: Duration::ZERO,
+            }))
+            .status(),
+            TaskStatus::OutputLimit
+        );
+        assert_eq!(
+            RunnerError::EmptyCommand {
+                project: "fixture".to_owned(),
+                task: "build".to_owned(),
+            }
+            .status(),
+            TaskStatus::Failed
         );
     }
 

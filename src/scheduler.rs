@@ -102,21 +102,8 @@ pub(crate) fn execute_plan(
             if cancellation.is_cancelled() {
                 stopping = true;
             }
-            let finalizers_allowed = if stopping {
-                !active.iter().any(|node| {
-                    !tasks
-                        .get(node)
-                        .expect("active task must exist in the validated plan")
-                        .is_finalizer()
-                })
-            } else {
-                tasks
-                    .iter()
-                    .filter(|(_, task)| !task.is_finalizer())
-                    .all(|(node, _)| results.contains_key(node))
-            };
-            let Some(node) =
-                next_ready(&ready, &tasks, &active_groups, stopping, finalizers_allowed)
+            let finalizers_ready = finalizers_allowed(&tasks, &results, &active, stopping);
+            let Some(node) = next_ready(&ready, &tasks, &active_groups, stopping, finalizers_ready)
             else {
                 break;
             };
@@ -270,48 +257,31 @@ pub(crate) fn execute_plan(
         return Err(SchedulerError::NoReadyWork);
     }
 
-    let mut first_error = None;
-    let mut summary = ExecutionSummary {
-        blocked: plan.len().saturating_sub(results.len()),
-        ..ExecutionSummary::default()
-    };
+    let nodes = plan.iter().map(PlannedTask::node).collect::<Vec<_>>();
+    let (summary, first_error_node) = classify(&nodes, |node| match results.get(node) {
+        None => None,
+        Some(Ok(result)) if result.cached => Some(crate::events::TaskStatus::Cached),
+        Some(Ok(_)) => Some(crate::events::TaskStatus::Completed),
+        Some(Err(error)) => Some(error.status()),
+    });
     for task in plan {
         let node = task.node();
-        let Some(result) = results.remove(&node) else {
-            output
+        match results.get(&node) {
+            None => output
                 .present_blocked(&node)
-                .map_err(SchedulerError::Output)?;
-            continue;
-        };
-        match result {
-            Ok(result) => {
-                if result.cached {
-                    summary.cached += 1;
-                } else {
-                    summary.completed += 1;
-                }
-                output
-                    .present_success(&node, &result)
-                    .map_err(SchedulerError::Output)?;
-            }
-            Err(error) => {
-                if matches!(error, RunnerError::Cancelled(_)) {
-                    summary.cancelled += 1;
-                } else {
-                    summary.failed += 1;
-                }
-                output
-                    .present_failure(&node, &error)
-                    .map_err(SchedulerError::Output)?;
-                first_error.get_or_insert(error);
-            }
+                .map_err(SchedulerError::Output)?,
+            Some(Ok(result)) => output
+                .present_success(&node, result)
+                .map_err(SchedulerError::Output)?,
+            Some(Err(error)) => output
+                .present_failure(&node, error)
+                .map_err(SchedulerError::Output)?,
         }
     }
-    assert_eq!(
-        summary.completed + summary.cached + summary.failed + summary.cancelled + summary.blocked,
-        plan.len(),
-        "scheduler result accounting must cover the entire plan"
-    );
+    let first_error = first_error_node.and_then(|node| match results.remove(&node) {
+        Some(Err(error)) => Some(error),
+        _ => None,
+    });
 
     if let Some(error) = output_error {
         output
@@ -379,6 +349,74 @@ fn has_ready_finalizer(
             .expect("ready task must exist in the validated plan")
             .is_finalizer()
     })
+}
+
+/// Whether a finalizer may start now.
+///
+/// While normal work is running, finalizers wait until every normal task has
+/// a result. Once the run is stopping, they wait only for the normal tasks
+/// still in flight.
+fn finalizers_allowed(
+    tasks: &BTreeMap<TaskNode, Arc<PlannedTask>>,
+    results: &BTreeMap<TaskNode, Result<TaskResult, RunnerError>>,
+    active: &HashSet<TaskNode>,
+    stopping: bool,
+) -> bool {
+    if stopping {
+        !active.iter().any(|node| {
+            !tasks
+                .get(node)
+                .expect("active task must exist in the validated plan")
+                .is_finalizer()
+        })
+    } else {
+        tasks
+            .iter()
+            .filter(|(_, task)| !task.is_finalizer())
+            .all(|(node, _)| results.contains_key(node))
+    }
+}
+
+/// Classify a completed plan in plan order.
+///
+/// `status` answers what happened to a node, or `None` when the node never
+/// ran. The summary parts always add up to the plan length, and the returned
+/// node is the first one that reported an error in plan order.
+///
+/// A cancelled task is counted in `cancelled`, not in `failed`, but it still
+/// counts as the reported error. That distinction is load-bearing: an
+/// interrupted run must fail, not report success. Dropping it makes Ctrl-C
+/// exit `0`, because `execute_plan` then falls through to its `Ok(summary)`
+/// tail instead of returning `SchedulerError::Task`.
+fn classify(
+    nodes: &[TaskNode],
+    status: impl Fn(&TaskNode) -> Option<crate::events::TaskStatus>,
+) -> (ExecutionSummary, Option<TaskNode>) {
+    use crate::events::TaskStatus;
+
+    let mut summary = ExecutionSummary::default();
+    let mut first_error = None;
+    for node in nodes {
+        match status(node) {
+            None | Some(TaskStatus::Blocked) => summary.blocked += 1,
+            Some(TaskStatus::Cached) => summary.cached += 1,
+            Some(TaskStatus::Completed) => summary.completed += 1,
+            Some(TaskStatus::Cancelled) => {
+                summary.cancelled += 1;
+                first_error.get_or_insert_with(|| node.clone());
+            }
+            Some(TaskStatus::Failed | TaskStatus::TimedOut | TaskStatus::OutputLimit) => {
+                summary.failed += 1;
+                first_error.get_or_insert_with(|| node.clone());
+            }
+        }
+    }
+    assert_eq!(
+        summary.completed + summary.cached + summary.failed + summary.cancelled + summary.blocked,
+        nodes.len(),
+        "scheduler result accounting must cover the entire plan"
+    );
+    (summary, first_error)
 }
 
 struct WorkerJob {
@@ -580,5 +618,207 @@ impl StdError for SchedulerError {
 impl From<RunnerError> for SchedulerError {
     fn from(error: RunnerError) -> Self {
         Self::Task(Box::new(error))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::config_path;
+    use crate::events::TaskStatus;
+    use crate::project::Project;
+    use crate::runner::{CapturedOutput, RunnerError, TaskResult};
+    use crate::testing::TempDir;
+    use std::fs;
+    use std::time::Duration;
+
+    fn nodes(ids: &[&str]) -> Vec<TaskNode> {
+        ids.iter().map(|id| TaskNode::new(*id)).collect()
+    }
+
+    fn planned(manifest: &str) -> Vec<PlannedTask> {
+        let temp = TempDir::new();
+        fs::write(config_path(temp.path()), manifest).expect("write manifest");
+        let project = Project::load(temp.path()).expect("project loads");
+        project.plan(None, &[]).expect("plan succeeds")
+    }
+
+    fn task_map(plan: &[PlannedTask]) -> BTreeMap<TaskNode, Arc<PlannedTask>> {
+        plan.iter()
+            .map(|task| (task.node(), Arc::new(task.clone())))
+            .collect()
+    }
+
+    fn succeeded() -> Result<TaskResult, RunnerError> {
+        Ok(TaskResult {
+            output: CapturedOutput::default(),
+            elapsed: Duration::ZERO,
+            cached: false,
+        })
+    }
+
+    #[test]
+    fn a_finished_plan_accounts_for_every_task() {
+        let plan = nodes(&["a", "b", "c"]);
+
+        let (summary, first_error) = classify(&plan, |node| match node.id() {
+            "a" => Some(TaskStatus::Completed),
+            "b" => Some(TaskStatus::Cached),
+            _ => None,
+        });
+
+        assert_eq!(
+            summary,
+            ExecutionSummary {
+                completed: 1,
+                cached: 1,
+                failed: 0,
+                cancelled: 0,
+                blocked: 1,
+            }
+        );
+        assert!(first_error.is_none());
+    }
+
+    #[test]
+    fn every_failure_kind_counts_as_failed_and_the_first_one_wins() {
+        let plan = nodes(&["a", "b", "c"]);
+
+        let (summary, first_error) = classify(&plan, |node| match node.id() {
+            "a" => Some(TaskStatus::TimedOut),
+            "b" => Some(TaskStatus::Failed),
+            _ => Some(TaskStatus::OutputLimit),
+        });
+
+        assert_eq!(summary.failed, 3);
+        assert_eq!(
+            first_error.map(|node| node.id().to_owned()),
+            Some("a".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_cancelled_task_is_counted_separately_and_still_reported() {
+        let plan = nodes(&["a", "b"]);
+
+        let (summary, first_error) = classify(&plan, |node| match node.id() {
+            "a" => Some(TaskStatus::Cancelled),
+            _ => Some(TaskStatus::Failed),
+        });
+
+        assert_eq!(summary.cancelled, 1);
+        assert_eq!(summary.failed, 1);
+        assert_eq!(
+            first_error.map(|node| node.id().to_owned()),
+            Some("a".to_owned()),
+            "an interrupted run must still report an error, or Ctrl-C would exit 0"
+        );
+    }
+
+    #[test]
+    fn a_plan_of_only_cancelled_tasks_still_reports_an_error() {
+        let plan = nodes(&["a", "b"]);
+
+        let (summary, first_error) = classify(&plan, |_| Some(TaskStatus::Cancelled));
+
+        assert_eq!(summary.cancelled, 2);
+        assert_eq!(summary.failed, 0);
+        assert_eq!(
+            first_error.map(|node| node.id().to_owned()),
+            Some("a".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_held_resource_group_blocks_its_next_task() {
+        let plan = planned(
+            "[project]\nname = \"fixture\"\n\n[pipelines.ci]\ntasks = [\"a\", \"b\"]\n\n[tasks.a]\ncommand = [\"echo\", \"a\"]\nresource_group = \"db\"\n\n[tasks.b]\ncommand = [\"echo\", \"b\"]\nresource_group = \"db\"\n",
+        );
+        let tasks = task_map(&plan);
+        let ready = plan.iter().map(PlannedTask::node).collect::<BTreeSet<_>>();
+
+        assert_eq!(
+            next_ready(
+                &ready,
+                &tasks,
+                &HashSet::from(["db".to_owned()]),
+                false,
+                true
+            ),
+            None
+        );
+        assert_eq!(
+            next_ready(&ready, &tasks, &HashSet::new(), false, true),
+            Some(TaskNode::new("a"))
+        );
+    }
+
+    #[test]
+    fn stopping_admits_only_finalizers() {
+        let plan = planned(
+            "[project]\nname = \"fixture\"\n\n[pipelines.ci]\ntasks = [\"build\"]\nfinally = [\"cleanup\"]\n\n[tasks.build]\ncommand = [\"echo\", \"build\"]\n\n[tasks.cleanup]\ncommand = [\"echo\", \"cleanup\"]\n",
+        );
+        let tasks = task_map(&plan);
+        let ready = plan.iter().map(PlannedTask::node).collect::<BTreeSet<_>>();
+
+        assert_eq!(
+            next_ready(&ready, &tasks, &HashSet::new(), true, true),
+            Some(TaskNode::new("cleanup"))
+        );
+    }
+
+    #[test]
+    fn a_finalizer_waits_until_normal_work_is_done() {
+        let plan = planned(
+            "[project]\nname = \"fixture\"\n\n[pipelines.ci]\ntasks = [\"build\"]\nfinally = [\"cleanup\"]\n\n[tasks.build]\ncommand = [\"echo\", \"build\"]\n\n[tasks.cleanup]\ncommand = [\"echo\", \"cleanup\"]\n",
+        );
+        let tasks = task_map(&plan);
+        let ready = BTreeSet::from([TaskNode::new("cleanup")]);
+
+        assert_eq!(
+            next_ready(&ready, &tasks, &HashSet::new(), false, false),
+            None
+        );
+        assert_eq!(
+            next_ready(&ready, &tasks, &HashSet::new(), false, true),
+            Some(TaskNode::new("cleanup"))
+        );
+    }
+
+    #[test]
+    fn a_ready_finalizer_is_detected() {
+        let plan = planned(
+            "[project]\nname = \"fixture\"\n\n[pipelines.ci]\ntasks = [\"build\"]\nfinally = [\"cleanup\"]\n\n[tasks.build]\ncommand = [\"echo\", \"build\"]\n\n[tasks.cleanup]\ncommand = [\"echo\", \"cleanup\"]\n",
+        );
+        let tasks = task_map(&plan);
+
+        assert!(!has_ready_finalizer(
+            &BTreeSet::from([TaskNode::new("build")]),
+            &tasks
+        ));
+        assert!(has_ready_finalizer(
+            &BTreeSet::from([TaskNode::new("cleanup")]),
+            &tasks
+        ));
+    }
+
+    #[test]
+    fn finalizers_wait_for_every_normal_task_while_running() {
+        let plan = planned(
+            "[project]\nname = \"fixture\"\n\n[pipelines.ci]\ntasks = [\"build\"]\nfinally = [\"cleanup\"]\n\n[tasks.build]\ncommand = [\"echo\", \"build\"]\n\n[tasks.cleanup]\ncommand = [\"echo\", \"cleanup\"]\n",
+        );
+        let tasks = task_map(&plan);
+        let results = BTreeMap::new();
+
+        assert!(!finalizers_allowed(
+            &tasks,
+            &results,
+            &HashSet::new(),
+            false
+        ));
+
+        let mut done = BTreeMap::new();
+        done.insert(TaskNode::new("build"), succeeded());
+        assert!(finalizers_allowed(&tasks, &done, &HashSet::new(), false));
     }
 }

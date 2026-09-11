@@ -177,12 +177,7 @@ impl OutputSink {
             write_bytes(&mut writers, &output.stdout, false)?;
             write_bytes(&mut writers, &output.stderr, true)?;
         }
-        let status = match error {
-            RunnerError::TimedOut(_) => TaskStatus::TimedOut,
-            RunnerError::OutputLimit(_) => TaskStatus::OutputLimit,
-            RunnerError::Cancelled(_) => TaskStatus::Cancelled,
-            _ => TaskStatus::Failed,
-        };
+        let status = error.status();
         self.render_event(
             &mut writers,
             &ExecutionEvent::task_finished(node, status, error.elapsed().unwrap_or_default()),
