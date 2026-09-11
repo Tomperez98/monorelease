@@ -1,0 +1,355 @@
+//! A strict, provider-neutral changelog model.
+//!
+//! This module deliberately knows nothing about Git, GitHub, package managers,
+//! or release publication. It parses and renders a structured changelog file;
+//! callers may supply bullets gathered by any provider-specific adapter.
+
+use std::fmt;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+/// A strict `major.minor.patch` version.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Version {
+    major: u64,
+    minor: u64,
+    patch: u64,
+}
+
+impl Version {
+    pub fn parse(text: &str) -> Option<Self> {
+        let mut parts = text.split('.');
+        let major = parse_component(parts.next()?)?;
+        let minor = parse_component(parts.next()?)?;
+        let patch = parse_component(parts.next()?)?;
+        if parts.next().is_some() {
+            return None;
+        }
+        Some(Self {
+            major,
+            minor,
+            patch,
+        })
+    }
+}
+
+fn parse_component(text: &str) -> Option<u64> {
+    if text.is_empty() || (text.len() > 1 && text.starts_with('0')) {
+        return None;
+    }
+    if !text.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    text.parse().ok()
+}
+
+impl fmt::Display for Version {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}.{}.{}", self.major, self.minor, self.patch)
+    }
+}
+
+/// A changelog entry heading.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Heading {
+    Version(Version),
+    Unreleased,
+}
+
+impl Heading {
+    fn parse(text: &str) -> Option<Self> {
+        if text == "(unreleased)" {
+            return Some(Self::Unreleased);
+        }
+        Version::parse(text).map(Self::Version)
+    }
+
+    pub fn heading(&self) -> String {
+        match self {
+            Self::Version(version) => format!("## {version}"),
+            Self::Unreleased => "## (unreleased)".to_owned(),
+        }
+    }
+}
+
+impl fmt::Display for Heading {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.heading())
+    }
+}
+
+/// One changelog entry.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Entry {
+    pub heading: Heading,
+    pub body: String,
+}
+
+/// A requested version, or an unreleased entry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Request {
+    Version(Version),
+    Unreleased,
+}
+
+impl Request {
+    pub fn parse(text: &str) -> Result<Self, String> {
+        let text = text.trim();
+        let version = text.strip_prefix('v').unwrap_or(text);
+        if version == "unreleased" {
+            return Ok(Self::Unreleased);
+        }
+        Version::parse(version)
+            .map(Self::Version)
+            .ok_or_else(|| format!("`{text}` is not `<major>.<minor>.<patch>` or `unreleased`"))
+    }
+
+    pub fn heading(self) -> Heading {
+        match self {
+            Self::Version(version) => Heading::Version(version),
+            Self::Unreleased => Heading::Unreleased,
+        }
+    }
+}
+
+/// The mutation performed by [`Changelog::scaffold`].
+#[derive(Debug, PartialEq, Eq)]
+pub enum Action {
+    Inserted,
+    Renamed { from: Heading, to: Heading },
+}
+
+/// A parsed changelog, with entries ordered newest first.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Changelog {
+    preamble: String,
+    entries: Vec<Entry>,
+}
+
+impl Changelog {
+    pub fn parse(text: &str) -> Result<Self, String> {
+        if !text.starts_with("# Changelog") {
+            return Err("expected the file to start with `# Changelog`".to_owned());
+        }
+
+        let mut preamble = String::new();
+        let mut entries = Vec::new();
+        for line in text.split_inclusive('\n') {
+            match line.strip_prefix("## ") {
+                Some(rest) => {
+                    let heading_text = rest.trim_end_matches(['\n', '\r']);
+                    let heading = Heading::parse(heading_text).ok_or_else(|| {
+                        format!(
+                            "unrecognized entry heading `## {heading_text}`, expected `## <major>.<minor>.<patch>` or `## (unreleased)`"
+                        )
+                    })?;
+                    entries.push(Entry {
+                        heading,
+                        body: String::new(),
+                    });
+                }
+                None => match entries.last_mut() {
+                    Some(entry) => entry.body.push_str(line),
+                    None => preamble.push_str(line),
+                },
+            }
+        }
+
+        if entries.is_empty() {
+            return Err("expected at least one `## ` entry".to_owned());
+        }
+
+        let changelog = Self { preamble, entries };
+        changelog.validate()?;
+        Ok(changelog)
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        for entry in &self.entries {
+            let Heading::Version(version) = entry.heading else {
+                continue;
+            };
+            match entry.body.lines().find(|line| !line.trim().is_empty()) {
+                None => {
+                    return Err(format!(
+                        "entry `## {version}` is empty; it must start with `Released: <yyyy-mm-dd>`"
+                    ));
+                }
+                Some(line) if !line.starts_with("Released: ") => {
+                    return Err(format!(
+                        "entry `## {version}` must start with `Released: <yyyy-mm-dd>`, found `{line}`"
+                    ));
+                }
+                Some(_) => {}
+            }
+        }
+
+        let mut previous = None;
+        for entry in &self.entries {
+            match entry.heading {
+                Heading::Version(version) => {
+                    if let Some(previous) = previous
+                        && version >= previous
+                    {
+                        return Err(format!(
+                            "entries must be newest first: `## {version}` appears after `## {previous}`"
+                        ));
+                    }
+                    previous = Some(version);
+                }
+                Heading::Unreleased if previous.is_some() => {
+                    return Err("`## (unreleased)` must be the newest entry".to_owned());
+                }
+                Heading::Unreleased => {}
+            }
+        }
+        Ok(())
+    }
+
+    pub fn top(&self) -> &Entry {
+        self.entries
+            .first()
+            .expect("a parsed changelog always has an entry")
+    }
+
+    pub fn entry_count(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn entry(&self, heading: Heading) -> Option<&Entry> {
+        self.entries.iter().find(|entry| entry.heading == heading)
+    }
+
+    pub fn replaces_unreleased(&self, request: Request) -> bool {
+        request != Request::Unreleased
+            && self
+                .entries
+                .first()
+                .is_some_and(|entry| entry.heading == Heading::Unreleased)
+    }
+
+    /// Add a new entry, or rename the top `(unreleased)` entry.
+    pub fn scaffold(
+        &mut self,
+        request: Request,
+        date: &str,
+        bullets: &[String],
+    ) -> Result<Action, String> {
+        let heading = request.heading();
+        if self.entries.iter().any(|entry| entry.heading == heading) {
+            return Err(format!("`{}` already exists", heading.heading()));
+        }
+
+        if self.replaces_unreleased(request) {
+            let from = self.entries[0].heading;
+            self.entries[0].heading = heading;
+            return Ok(Action::Renamed { from, to: heading });
+        }
+
+        self.entries.insert(
+            0,
+            Entry {
+                heading,
+                body: new_entry_body(date, bullets),
+            },
+        );
+        Ok(Action::Inserted)
+    }
+
+    pub fn render(&self) -> String {
+        let mut text = self.preamble.clone();
+        for entry in &self.entries {
+            text.push_str(&entry.heading.heading());
+            text.push('\n');
+            text.push_str(&entry.body);
+        }
+        text
+    }
+}
+
+fn new_entry_body(date: &str, bullets: &[String]) -> String {
+    let mut body = format!("Released: {date}\n");
+    if !bullets.is_empty() {
+        body.push('\n');
+        for bullet in bullets {
+            body.push_str(bullet);
+            body.push('\n');
+        }
+    }
+    body.push_str("\n### Features\n\n-\n\n### Fixes\n\n-\n\n### Internals\n\n-\n\n");
+    body
+}
+
+/// Today's UTC date in `yyyy-mm-dd` form.
+pub fn today() -> String {
+    let seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let (year, month, day) = civil_from_days((seconds / 86_400) as i64);
+    format!("{year:04}-{month:02}-{day:02}")
+}
+
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let days = days + 719_468;
+    let era = days.div_euclid(146_097);
+    let day_of_era = days.rem_euclid(146_097);
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = (day_of_year - (153 * month_prime + 2) / 5 + 1) as u32;
+    let month = if month_prime < 10 {
+        month_prime + 3
+    } else {
+        month_prime - 9
+    } as u32;
+    let year = year_of_era + era * 400 + i64::from(month <= 2);
+    (year, month, day)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SAMPLE: &str = "# Changelog\n\n## 1.2.0\nReleased: 2026-09-11\n\n### Features\n\n- New thing.\n\n## 1.1.0\nReleased: 2026-09-10\n\n- Old thing.\n";
+
+    #[test]
+    fn parse_then_render_is_lossless() {
+        assert_eq!(Changelog::parse(SAMPLE).unwrap().render(), SAMPLE);
+    }
+
+    #[test]
+    fn rejects_unrecognized_heading() {
+        let error = Changelog::parse("# Changelog\n\n## beta\n").unwrap_err();
+        assert!(error.contains("unrecognized entry heading"));
+    }
+
+    #[test]
+    fn rejects_unreleased_below_a_version() {
+        let error =
+            Changelog::parse("# Changelog\n\n## 1.0.0\nReleased: 2026-01-01\n\n## (unreleased)\n")
+                .unwrap_err();
+        assert!(error.contains("must be the newest entry"));
+    }
+
+    #[test]
+    fn promotes_unreleased_without_provider_data() {
+        let mut changelog = Changelog::parse(
+            "# Changelog\n\n## (unreleased)\n\n- Pending.\n\n## 1.0.0\nReleased: 2026-01-01\n",
+        )
+        .unwrap();
+        let action = changelog
+            .scaffold(Request::parse("1.1.0").unwrap(), "2026-09-11", &[])
+            .unwrap();
+        assert!(matches!(action, Action::Renamed { .. }));
+        assert!(changelog.render().contains("## 1.1.0\n"));
+    }
+
+    #[test]
+    fn versions_are_strict() {
+        assert!(Version::parse("1.2.3").is_some());
+        assert!(Version::parse("01.2.3").is_none());
+        assert!(Version::parse("1.2").is_none());
+        assert!(Version::parse("1.2.x").is_none());
+    }
+}

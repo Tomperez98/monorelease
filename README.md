@@ -280,14 +280,31 @@ Releasing is a pipeline too, and it is the only place release knowledge lives:
 RELEASE_TAG=v0.1.2 cargo run --locked -- run release
 ```
 
-The tasks call [`xtask/`](xtask), a Rust helper that is deliberately *not* part of the published binary: `monorelease` stays generic and knows nothing about changelogs, release notes, or where a release is published — the same separation [`examples/release-gate`](examples/release-gate/README.md) describes. Run it directly with `cargo run -p xtask -- --help`.
+The tasks call [`xtask/`](xtask), a Rust helper that is deliberately *not* part of the published binary. It contains this repository's project-specific release gates: binary behavior, examples, and release-plan assertions. `monorelease` now provides the provider-neutral changelog and artifact operations that can be reused by any language or package manager.
 
-`release-notes` turns `CHANGELOG.md` into `RELEASE_NOTES.md`, and `release-verify` asserts that the binary reports the version it claims, that this repository's own manifests still validate, that the published `SHA256SUMS` still match when they are available, and that the examples still run. The version of a release is the newest `## ` entry of [`CHANGELOG.md`](CHANGELOG.md), so the notes a reviewer approves are the notes users read. Name that entry `## (unreleased)` to fold a skipped release into the next one.
+### Generic changelog and release commands
 
-To cut a release, scaffold the newest changelog entry from the pull requests merged since the last tag, set the same version in `Cargo.toml`, merge, then push the tag:
+These commands require no additional `monorepo.toml` sections:
 
 ```bash
-VERSION=0.1.2 cargo run --locked -- task changelog   # edit the result
+monorelease changelog validate
+monorelease changelog scaffold --version 0.1.2
+RELEASE_TAG=v0.1.2 monorelease changelog notes --output RELEASE_NOTES.md
+
+monorelease release source --tag v0.1.2 --commit "$GITHUB_SHA"
+monorelease release manifest --directory dist
+monorelease release verify --directory dist --tag v0.1.2
+```
+
+Changelog commands validate and render the repository's structured `CHANGELOG.md`; they do not assume GitHub, pull requests, or a programming language. Release commands operate on files, checksums, and explicit source identity. They do not publish, inspect registries, execute binaries, or assume a package format.
+
+The project's `release-notes` task turns `CHANGELOG.md` into `RELEASE_NOTES.md`, while `release-verify` asserts this repository's project-specific claims: that its binary reports the version it claims, that its own manifests validate, that examples run, and that the documented release plan resolves. The generic `monorelease release verify` command validates published metadata and artifacts separately. The version of a release is the newest `## ` entry of [`CHANGELOG.md`](CHANGELOG.md), so the notes a reviewer approves are the notes users read. Name that entry `## (unreleased)` to fold a skipped release into the next one.
+
+To cut a release, scaffold the newest changelog entry, fill in the user-facing notes, set the same version in `Cargo.toml`, merge, then push the tag:
+
+```bash
+cargo run --locked -- changelog scaffold --version 0.1.2
+# edit CHANGELOG.md
 # CHANGELOG.md: ## 0.1.2  |  Cargo.toml: version = "0.1.2"
 git tag v0.1.2
 git push origin v0.1.2

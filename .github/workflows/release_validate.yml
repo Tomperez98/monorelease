@@ -118,6 +118,17 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
+      - name: Verify published artifact manifest
+        if: ${{ steps.release.outputs.exists == 'true' && hashFiles('dist/BUILD-METADATA.json') != '' }}
+        env:
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          cargo run --locked --quiet -- release verify \
+            --directory dist \
+            --tag "$RELEASE_TAG" \
+            --commit "$(git rev-parse HEAD)" \
+            --repository "$GITHUB_REPOSITORY"
+
       - name: Rebuild released Linux binary
         if: ${{ steps.release.outputs.exists == 'true' && hashFiles('xtask/Cargo.toml') != '' }}
         run: cargo build --locked --release --target x86_64-unknown-linux-gnu
@@ -147,7 +158,6 @@ jobs:
         env:
           RELEASE_TAG: ${{ steps.release.outputs.tag }}
           MONORELEASE_BIN: dist/extracted/monorelease
-          RELEASE_ASSETS: dist
         run: '"$MONORELEASE_BIN" run release --output github-actions'
 
       # Releases cut before the pipeline existed: not much to check, but check it.
