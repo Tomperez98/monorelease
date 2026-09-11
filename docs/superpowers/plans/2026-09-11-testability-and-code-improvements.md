@@ -1061,7 +1061,7 @@ mod tests {
     fn a_finished_plan_accounts_for_every_task() {
         let plan = nodes(&["a", "b", "c"]);
 
-        let (summary, first_failed) = classify(&plan, |node| match node.id() {
+        let (summary, first_error) = classify(&plan, |node| match node.id() {
             "a" => Some(TaskStatus::Completed),
             "b" => Some(TaskStatus::Cached),
             _ => None,
@@ -1077,14 +1077,14 @@ mod tests {
                 blocked: 1,
             }
         );
-        assert!(first_failed.is_none());
+        assert!(first_error.is_none());
     }
 
     #[test]
     fn every_failure_kind_counts_as_failed_and_the_first_one_wins() {
         let plan = nodes(&["a", "b", "c"]);
 
-        let (summary, first_failed) = classify(&plan, |node| match node.id() {
+        let (summary, first_error) = classify(&plan, |node| match node.id() {
             "a" => Some(TaskStatus::TimedOut),
             "b" => Some(TaskStatus::Failed),
             _ => Some(TaskStatus::OutputLimit),
@@ -1092,16 +1092,16 @@ mod tests {
 
         assert_eq!(summary.failed, 3);
         assert_eq!(
-            first_failed.map(|node| node.id().to_owned()),
+            first_error.map(|node| node.id().to_owned()),
             Some("a".to_owned())
         );
     }
 
     #[test]
-    fn a_cancelled_task_is_not_a_failure() {
+    fn a_cancelled_task_is_counted_separately_and_still_reported() {
         let plan = nodes(&["a", "b"]);
 
-        let (summary, first_failed) = classify(&plan, |node| match node.id() {
+        let (summary, first_error) = classify(&plan, |node| match node.id() {
             "a" => Some(TaskStatus::Cancelled),
             _ => Some(TaskStatus::Failed),
         });
@@ -1109,8 +1109,23 @@ mod tests {
         assert_eq!(summary.cancelled, 1);
         assert_eq!(summary.failed, 1);
         assert_eq!(
-            first_failed.map(|node| node.id().to_owned()),
-            Some("b".to_owned())
+            first_error.map(|node| node.id().to_owned()),
+            Some("a".to_owned()),
+            "an interrupted run must still report an error, or Ctrl-C would exit 0"
+        );
+    }
+
+    #[test]
+    fn a_plan_of_only_cancelled_tasks_still_reports_an_error() {
+        let plan = nodes(&["a", "b"]);
+
+        let (summary, first_error) = classify(&plan, |_| Some(TaskStatus::Cancelled));
+
+        assert_eq!(summary.cancelled, 2);
+        assert_eq!(summary.failed, 0);
+        assert_eq!(
+            first_error.map(|node| node.id().to_owned()),
+            Some("a".to_owned())
         );
     }
 
@@ -1276,7 +1291,13 @@ fn finalizers_allowed(
 ///
 /// `status` answers what happened to a node, or `None` when the node never
 /// ran. The summary parts always add up to the plan length, and the returned
-/// node is the first failure in plan order — the one whose error is reported.
+/// node is the first one that reported an error in plan order.
+///
+/// A cancelled task is counted in `cancelled`, not in `failed`, but it still
+/// counts as the reported error. That distinction is load-bearing: an
+/// interrupted run must fail, not report success. Dropping it makes Ctrl-C
+/// exit `0`, because `execute_plan` then falls through to its `Ok(summary)`
+/// tail instead of returning `SchedulerError::Task`.
 fn classify(
     nodes: &[TaskNode],
     status: impl Fn(&TaskNode) -> Option<crate::events::TaskStatus>,
@@ -1284,16 +1305,19 @@ fn classify(
     use crate::events::TaskStatus;
 
     let mut summary = ExecutionSummary::default();
-    let mut first_failed = None;
+    let mut first_error = None;
     for node in nodes {
         match status(node) {
             None | Some(TaskStatus::Blocked) => summary.blocked += 1,
             Some(TaskStatus::Cached) => summary.cached += 1,
             Some(TaskStatus::Completed) => summary.completed += 1,
-            Some(TaskStatus::Cancelled) => summary.cancelled += 1,
+            Some(TaskStatus::Cancelled) => {
+                summary.cancelled += 1;
+                first_error.get_or_insert_with(|| node.clone());
+            }
             Some(TaskStatus::Failed | TaskStatus::TimedOut | TaskStatus::OutputLimit) => {
                 summary.failed += 1;
-                first_failed.get_or_insert_with(|| node.clone());
+                first_error.get_or_insert_with(|| node.clone());
             }
         }
     }
@@ -1302,22 +1326,24 @@ fn classify(
         nodes.len(),
         "scheduler result accounting must cover the entire plan"
     );
-    (summary, first_failed)
+    (summary, first_error)
 }
 ```
 
 In `execute_plan`, replace the inline `finalizers_allowed` computation:
 
 ```rust
-            let finalizers_allowed =
+            let finalizers_ready =
                 finalizers_allowed(&tasks, &results, &active, stopping);
 ```
+
+The local is deliberately named `finalizers_ready`, not `finalizers_allowed`: shadowing the function name with a `bool` compiles (the call resolves before the binding) but breaks the moment anyone adds a second call in the same block. Pass `finalizers_ready` to `next_ready` in place of the old `finalizers_allowed` argument.
 
 and replace the accounting block (from `let mut first_error = None;` through the `assert_eq!`) with:
 
 ```rust
     let nodes = plan.iter().map(PlannedTask::node).collect::<Vec<_>>();
-    let (summary, first_failed) = classify(&nodes, |node| match results.get(node) {
+    let (summary, first_error_node) = classify(&nodes, |node| match results.get(node) {
         None => None,
         Some(Ok(result)) if result.cached => Some(crate::events::TaskStatus::Cached),
         Some(Ok(_)) => Some(crate::events::TaskStatus::Completed),
@@ -1337,7 +1363,7 @@ and replace the accounting block (from `let mut first_error = None;` through the
                 .map_err(SchedulerError::Output)?,
         }
     }
-    let first_error = first_failed.and_then(|node| match results.remove(&node) {
+    let first_error = first_error_node.and_then(|node| match results.remove(&node) {
         Some(Err(error)) => Some(error),
         _ => None,
     });
@@ -1352,6 +1378,40 @@ Expected: all PASS.
 
 Run: `cargo test --workspace --all-targets --all-features`
 Expected: PASS. `tests/cli.rs::json_output_contains_lifecycle_events` proves the JSON status field still comes out right.
+
+**As-built note — a plan bug found in execution, and the fix (required).**
+
+The version of `classify` originally specified here set its first-error node only for `Failed`/`TimedOut`/`OutputLimit`, and counted `Cancelled` without recording it. That silently changed behavior. The original inline loop ran `first_error.get_or_insert(error)` for **every** `Err`, including `RunnerError::Cancelled`:
+
+```rust
+            Err(error) => {
+                if matches!(error, RunnerError::Cancelled(_)) {
+                    summary.cancelled += 1;
+                } else {
+                    summary.failed += 1;
+                }
+                output.present_failure(&node, &error).map_err(SchedulerError::Output)?;
+                first_error.get_or_insert(error);   // runs for Cancelled too
+            }
+```
+
+With the original (buggy) `classify`, `first_error` stayed `None` for a cancelled run, so `execute_plan` skipped its `Err(SchedulerError::Task(..))` tail and reached `if cancellation.is_cancelled() && summary.cancelled == 0 && summary.blocked > 0` — false, because `summary.cancelled > 0` — and returned `Ok(summary)`. **A Ctrl-C'd pipeline would exit `0` with a green summary.** No test failed, because nothing covered the cancellation path.
+
+The fix, now reflected in the `classify` code above: a cancelled node increments `cancelled` **and** claims the first-error slot. The two summary counters stay separate (`cancelled` is not `failed`), but both claim the reported error. Verified end to end by signalling a running `mono`:
+
+```console
+$ ./target/debug/mono --dir "$tmp" ci --no-cache &   # task: sleep 30
+$ sleep 2; kill -INT $!
+$ wait $!; echo $?
+1
+▶ slow
+slow: cancelled in 1739ms
+mono: cancel/slow was cancelled
+```
+
+`tests/cli.rs::an_interrupted_run_does_not_report_success` now pins this: it spawns `mono`, sends `SIGINT`, and asserts the exit code is not `0`. It asserts "not success" rather than `Some(1)` so it still means something if the signal lands before the handler is installed and the process dies by signal.
+
+**Generalizable rule for the remaining tasks:** when extracting a pure function out of a loop, the burden of proof is on the extraction to reproduce *every* side effect of the original, including the ones the summary counters do not name. Diff the old branch-by-branch, not just the totals.
 
 - [ ] **Step 6: Commit**
 

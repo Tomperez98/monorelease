@@ -348,3 +348,44 @@ fn json_errors_are_documents_on_stdout() {
     assert_eq!(document["code"], 1);
     assert!(document["message"].as_str().unwrap().contains("missing"));
 }
+
+/// A refactor once made `scheduler::classify` stop treating a cancelled task as
+/// the reported error, so an interrupted run fell through to `Ok(summary)` and
+/// exited `0`. Nothing failed, because no test covered the Ctrl-C path. This
+/// pins it. The exit code is asserted as "not success" rather than `Some(1)` so
+/// the test still means something if the signal lands before the handler is
+/// installed and the process dies by signal (`code() == None`).
+#[cfg(unix)]
+#[test]
+fn an_interrupted_run_does_not_report_success() {
+    let temp = TempDir::new("cancel");
+    write_project(
+        temp.path(),
+        "[pipelines.ci]\ntasks = [\"slow\"]\n\n[tasks.slow]\ncommand = [\"sleep\", \"30\"]\n",
+    );
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_mono"))
+        .args(["ci", "--no-cache"])
+        .current_dir(temp.path())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn mono");
+
+    // Long enough for the Ctrl-C handler to be installed and the task to start.
+    std::thread::sleep(std::time::Duration::from_millis(2000));
+    let signaled = Command::new("kill")
+        .args(["-INT", &child.id().to_string()])
+        .status()
+        .expect("send SIGINT");
+    assert!(signaled.success(), "could not signal mono");
+
+    let status = child.wait().expect("wait for mono");
+
+    assert_ne!(
+        status.code(),
+        Some(0),
+        "an interrupted run reported success; a cancelled task must still be the \
+         reported error in scheduler::classify"
+    );
+}
