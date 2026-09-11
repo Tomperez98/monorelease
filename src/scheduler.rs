@@ -135,6 +135,7 @@ fn execute_plan_with_options(
 
     let mut cache_error = None;
     let mut output_error = None;
+    let mut presented_live = HashSet::new();
 
     while state.has_active_or_ready() {
         assert!(
@@ -202,6 +203,17 @@ fn execute_plan_with_options(
                 key,
                 cache_error: store_error,
             } => {
+                if output.is_live() {
+                    let presentation = match &result {
+                        Ok(result) => output.present_success(&node, result),
+                        Err(error) => output.present_failure(&node, error),
+                    };
+                    presented_live.insert(node.clone());
+                    if let Err(error) = presentation {
+                        output_error = Some(error);
+                        state.stopping = true;
+                    }
+                }
                 if let Some(error) = state.complete(node, result, key, store_error) {
                     cache_error = Some(error);
                 }
@@ -262,6 +274,9 @@ fn execute_plan_with_options(
 
     for task in plan {
         let node = task.node();
+        if output.is_live() && presented_live.contains(&node) {
+            continue;
+        }
         match state.results.get(&node) {
             None => output
                 .present_blocked(&node)

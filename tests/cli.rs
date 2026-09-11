@@ -272,21 +272,24 @@ fn json_success_documents_cover_non_execution_commands() {
 
 #[cfg(unix)]
 #[test]
-fn github_actions_output_disables_command_processing_for_task_output() {
-    let temp = TempDir::new("github-output");
+fn stream_output_prefixes_task_bytes_and_reports_summary() {
+    let temp = TempDir::new("stream-output");
     write_project(
         temp.path(),
-        "[pipelines.ci]\ntasks = [\"build\"]\n\n[tasks.build]\ncommand = [\"sh\", \"-c\", \"printf '::error:: injected'\"]\n",
+        "[pipelines.ci]\ntasks = [\"build\"]\n\n[tasks.build]\ncommand = [\"sh\", \"-c\", \"printf 'output'\"]\n",
     );
-    let output = mono(
-        &["--output", "github-actions", "run", "--no-cache"],
-        temp.path(),
-    );
+    let output = mono(&["--ui", "stream", "run", "--no-cache"], temp.path());
     assert!(output.status.success(), "{}", stderr(&output));
-    let text = stdout(&output);
-    assert!(text.contains("::stop-commands::"), "{text}");
-    assert!(text.contains("::mono_output_"), "{text}");
-    assert!(text.contains("::error:: injected"), "{text}");
+    assert!(
+        stdout(&output).contains("[build] output"),
+        "{}",
+        stdout(&output)
+    );
+    assert!(
+        stderr(&output).contains("└─ build: completed"),
+        "{}",
+        stderr(&output)
+    );
 }
 
 #[cfg(unix)]
@@ -297,9 +300,13 @@ fn live_output_streams_task_bytes_and_reports_summary() {
         temp.path(),
         "[pipelines.ci]\ntasks = [\"build\"]\n\n[tasks.build]\ncommand = [\"sh\", \"-c\", \"printf one; sleep 0.02; printf two\"]\n",
     );
-    let output = mono(&["--output", "live", "run", "--no-cache"], temp.path());
+    let output = mono(&["--ui", "stream", "run", "--no-cache"], temp.path());
     assert!(output.status.success(), "{}", stderr(&output));
-    assert!(stdout(&output).contains("onetwo"), "{}", stdout(&output));
+    assert!(
+        stdout(&output).contains("[build] onetwo"),
+        "{}",
+        stdout(&output)
+    );
     assert!(
         stdout(&output).contains("1 completed"),
         "{}",

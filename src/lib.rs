@@ -22,8 +22,10 @@ mod project;
 mod release;
 mod runner;
 mod scheduler;
+mod stream_output;
 #[cfg(test)]
 mod testing;
+mod tui;
 
 use std::error::Error as StdError;
 use std::fmt;

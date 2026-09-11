@@ -15,7 +15,7 @@
 //! | `2`  | the command line was wrong; emitted by `clap` while parsing  |
 //! | `3`  | `mono` or its environment failed                      |
 
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -41,31 +41,38 @@ struct Cli {
     #[arg(long = "dir", global = true, default_value = ".")]
     root: PathBuf,
     /// Output contract for command summaries and execution events.
-    #[arg(long, global = true, value_enum, default_value_t = OutputFormat::Terminal)]
+    #[arg(long, global = true, value_enum, default_value_t = OutputFormat::Text)]
     output: OutputFormat,
+    /// Human task presentation for run and task commands.
+    #[arg(long, global = true, value_enum, default_value_t = UiFormat::Auto)]
+    ui: UiFormat,
     #[command(subcommand)]
     command: Option<Commands>,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
 enum OutputFormat {
-    #[value(name = "terminal")]
-    Terminal,
+    #[value(name = "text")]
+    Text,
     #[value(name = "json")]
     Json,
-    #[value(name = "github-actions")]
-    GithubActions,
-    #[value(name = "live")]
-    Live,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum UiFormat {
+    #[value(name = "auto")]
+    Auto,
+    #[value(name = "tui")]
+    Tui,
+    #[value(name = "stream")]
+    Stream,
 }
 
 impl From<OutputFormat> for OutputMode {
     fn from(format: OutputFormat) -> Self {
         match format {
-            OutputFormat::Terminal => Self::Terminal,
+            OutputFormat::Text => Self::Terminal,
             OutputFormat::Json => Self::Json,
-            OutputFormat::GithubActions => Self::GithubActions,
-            OutputFormat::Live => Self::Live,
         }
     }
 }
@@ -333,6 +340,7 @@ fn main() -> ExitCode {
     let Cli {
         root,
         output,
+        ui,
         command,
     } = Cli::parse();
     let output = output.into();
@@ -346,7 +354,7 @@ fn main() -> ExitCode {
         return ExitCode::from(EXIT_TOOL);
     }
 
-    let code = match dispatch(root, output, command, cancellation) {
+    let code = match dispatch(root, output, ui, command, cancellation) {
         Ok(summary) => emit_summary(&mut io::stdout().lock(), &summary),
         Err(error) if output == OutputMode::Json => {
             emit_error(&mut io::stdout().lock(), &error, output)
@@ -517,11 +525,12 @@ const NO_TASK_FILTER: &[String] = &[];
 fn dispatch(
     root: PathBuf,
     output: OutputMode,
+    ui: UiFormat,
     command: Option<Commands>,
     cancellation: CancellationToken,
 ) -> Result<String, Error> {
     match command {
-        None => run_default_pipeline(&root, output, cancellation),
+        None => run_default_pipeline(&root, output, ui, cancellation),
         Some(Commands::Init) => run_init(&root, output),
         Some(Commands::Run {
             pipeline,
@@ -533,10 +542,11 @@ fn dispatch(
             &tasks,
             options,
             output,
+            ui,
             cancellation,
         ),
         Some(Commands::Task { tasks, options }) => {
-            execute_pipeline(&root, None, &tasks, options, output, cancellation)
+            execute_pipeline(&root, None, &tasks, options, output, ui, cancellation)
         }
         Some(Commands::Check) => run_check(&root, output),
         Some(Commands::List) => run_list(&root, output),
@@ -552,6 +562,7 @@ fn dispatch(
 fn run_default_pipeline(
     root: &Path,
     output: OutputMode,
+    ui: UiFormat,
     cancellation: CancellationToken,
 ) -> Result<String, Error> {
     execute_pipeline(
@@ -560,6 +571,7 @@ fn run_default_pipeline(
         NO_TASK_FILTER,
         ExecutionOptions::default(),
         output,
+        ui,
         cancellation,
     )
 }
@@ -580,6 +592,7 @@ fn execute_pipeline(
     tasks: &[String],
     options: ExecutionOptions,
     output: OutputMode,
+    ui: UiFormat,
     cancellation: CancellationToken,
 ) -> Result<String, Error> {
     Ok(mono::run_pipeline_with_mode(
@@ -590,10 +603,30 @@ fn execute_pipeline(
         options.jobs,
         PipelineExecution {
             cache: cache_mode(options.no_cache, options.force),
-            output,
+            output: resolve_execution_output(output, ui),
             cancellation,
         },
     )?)
+}
+
+fn resolve_execution_output(output: OutputMode, ui: UiFormat) -> OutputMode {
+    if output == OutputMode::Json {
+        return OutputMode::Json;
+    }
+    match ui {
+        UiFormat::Stream => OutputMode::Stream,
+        UiFormat::Tui | UiFormat::Auto => {
+            if interactive_terminal() {
+                OutputMode::Tui
+            } else {
+                OutputMode::Stream
+            }
+        }
+    }
+}
+
+fn interactive_terminal() -> bool {
+    io::stdin().is_terminal() && io::stdout().is_terminal() && std::env::var_os("CI").is_none()
 }
 
 fn run_check(root: &Path, output: OutputMode) -> Result<String, Error> {
@@ -1018,6 +1051,7 @@ mod tests {
         let error = dispatch(
             PathBuf::from("does-not-exist"),
             OutputMode::Terminal,
+            UiFormat::Stream,
             Some(Commands::Run {
                 pipeline: None,
                 tasks: Vec::new(),

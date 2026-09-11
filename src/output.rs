@@ -1,8 +1,8 @@
-//! Deterministic task output presentation.
+//! Task output presentation.
 //!
 //! Each output mode renders [`ExecutionEvent`] values through its own adapter,
-//! so the scheduler never needs to know about terminals, JSON streams, or CI
-//! providers.
+//! so the scheduler never needs to know about terminal prefixes, JSON streams,
+//! or interactive panes.
 
 use std::io::{self, Write};
 use std::path::Path;
@@ -11,19 +11,21 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::events::{ExecutionEvent, TaskStatus, TaskStream};
 use crate::project::TaskNode;
-use crate::runner::{RunnerError, TaskResult};
+use crate::runner::{CancellationToken, RunnerError, TaskResult};
+use crate::stream_output::StreamFormatter;
+use crate::tui::TuiController;
 
 /// Selects the output contract for a pipeline run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputMode {
-    /// Human-readable terminal output with status on stderr.
+    /// Human-readable buffered text output with status on stderr.
     Terminal,
     /// Newline-delimited JSON execution events on stdout.
     Json,
-    /// GitHub Actions log groups with status on stdout.
-    GithubActions,
-    /// Stream task output as it arrives while keeping status on stderr.
-    Live,
+    /// Stream task output as it arrives with task prefixes.
+    Stream,
+    /// Interactive task list and per-task output panes.
+    Tui,
 }
 
 /// Owns task presentation so worker threads never write directly to the
@@ -34,6 +36,7 @@ pub enum OutputMode {
 pub(crate) struct OutputSink {
     mode: OutputMode,
     writers: Mutex<Writers>,
+    tui: Option<TuiController>,
     run_id: u64,
     sequence: AtomicU64,
 }
@@ -41,6 +44,7 @@ pub(crate) struct OutputSink {
 struct Writers {
     out: Box<dyn Write + Send>,
     err: Box<dyn Write + Send>,
+    stream: StreamFormatter,
 }
 
 impl std::fmt::Debug for OutputSink {
@@ -49,36 +53,40 @@ impl std::fmt::Debug for OutputSink {
             .debug_struct("OutputSink")
             .field("mode", &self.mode)
             .field("run_id", &self.run_id)
+            .field("tui", &self.tui.is_some())
             .finish_non_exhaustive()
     }
 }
 
 impl OutputSink {
     /// Render to the real process handles.
-    pub(crate) fn new(mode: OutputMode) -> Self {
-        Self::with_writers(mode, Box::new(io::stdout()), Box::new(io::stderr()))
+    pub(crate) fn new(mode: OutputMode, cancellation: CancellationToken) -> io::Result<Self> {
+        let tui = (mode == OutputMode::Tui)
+            .then(|| TuiController::start(cancellation))
+            .transpose()?;
+        Ok(Self::with_writers_and_tui(
+            mode,
+            tui,
+            Box::new(io::stdout()),
+            Box::new(io::stderr()),
+        ))
     }
 
-    /// Render to caller-owned handles. A test passes buffers; the CLI passes
-    /// the process stdio.
-    pub(crate) fn with_writers(
+    fn with_writers_and_tui(
         mode: OutputMode,
-        out: Box<dyn Write + Send>,
-        err: Box<dyn Write + Send>,
-    ) -> Self {
-        Self::with_identity(mode, run_identity(), out, err)
-    }
-
-    fn with_identity(
-        mode: OutputMode,
-        run_id: u64,
+        tui: Option<TuiController>,
         out: Box<dyn Write + Send>,
         err: Box<dyn Write + Send>,
     ) -> Self {
         Self {
             mode,
-            writers: Mutex::new(Writers { out, err }),
-            run_id,
+            writers: Mutex::new(Writers {
+                out,
+                err,
+                stream: StreamFormatter::default(),
+            }),
+            tui,
+            run_id: run_identity(),
             sequence: AtomicU64::new(0),
         }
     }
@@ -91,7 +99,9 @@ impl OutputSink {
         out: Box<dyn Write + Send>,
         err: Box<dyn Write + Send>,
     ) -> Self {
-        Self::with_identity(mode, run_id, out, err)
+        let mut sink = Self::with_writers_and_tui(mode, None, out, err);
+        sink.run_id = run_id;
+        sink
     }
 
     pub(crate) fn present_start(&self, node: &TaskNode) -> io::Result<()> {
@@ -101,8 +111,8 @@ impl OutputSink {
 
     pub(crate) fn present_success(&self, node: &TaskNode, result: &TaskResult) -> io::Result<()> {
         let mut writers = self.writers.lock().expect("output lock is not poisoned");
-        if matches!(self.mode, OutputMode::Json | OutputMode::GithubActions) {
-            // Emit separate TaskOutput events so the JSON stream and CI log are lossless.
+        if self.mode == OutputMode::Json {
+            // Emit separate TaskOutput events so the JSON stream is lossless.
             if !result.output.stdout.is_empty() {
                 self.render_event(
                     &mut writers,
@@ -123,7 +133,30 @@ impl OutputSink {
                     ),
                 )?;
             }
-        } else if self.mode != OutputMode::Live || result.cached {
+        } else if self.mode == OutputMode::Stream {
+            if result.cached {
+                if !result.output.stdout.is_empty() {
+                    self.render_event(
+                        &mut writers,
+                        &ExecutionEvent::task_output(
+                            node,
+                            TaskStream::Stdout,
+                            result.output.stdout.clone(),
+                        ),
+                    )?;
+                }
+                if !result.output.stderr.is_empty() {
+                    self.render_event(
+                        &mut writers,
+                        &ExecutionEvent::task_output(
+                            node,
+                            TaskStream::Stderr,
+                            result.output.stderr.clone(),
+                        ),
+                    )?;
+                }
+            }
+        } else if self.mode != OutputMode::Tui {
             write_bytes(&mut writers, &result.output.stdout, false)?;
             write_bytes(&mut writers, &result.output.stderr, true)?;
         }
@@ -148,7 +181,7 @@ impl OutputSink {
 
     pub(crate) fn present_failure(&self, node: &TaskNode, error: &RunnerError) -> io::Result<()> {
         let mut writers = self.writers.lock().expect("output lock is not poisoned");
-        if matches!(self.mode, OutputMode::Json | OutputMode::GithubActions) {
+        if self.mode == OutputMode::Json {
             if let Some(output) = error.output() {
                 if !output.stdout.is_empty() {
                     self.render_event(
@@ -171,7 +204,7 @@ impl OutputSink {
                     )?;
                 }
             }
-        } else if self.mode != OutputMode::Live
+        } else if !matches!(self.mode, OutputMode::Stream | OutputMode::Tui)
             && let Some(output) = error.output()
         {
             write_bytes(&mut writers, &output.stdout, false)?;
@@ -185,7 +218,7 @@ impl OutputSink {
     }
 
     pub(crate) fn is_live(&self) -> bool {
-        self.mode == OutputMode::Live
+        matches!(self.mode, OutputMode::Stream | OutputMode::Tui)
     }
 
     pub(crate) fn present_attempt(
@@ -231,8 +264,8 @@ impl OutputSink {
         // `run_pipeline_with_mode` returns the human-readable summary to the
         // CLI transport, which writes it once to stdout. JSON must receive the
         // lifecycle event here because the transport deliberately returns no
-        // second summary line in that mode. Avoid sending a second terminal or
-        // GitHub Actions summary to stderr/stdout from the scheduler.
+        // second summary line in that mode. Avoid sending a second text
+        // summary to stderr/stdout from the scheduler.
         if self.mode == OutputMode::Json {
             self.render_event(
                 &mut writers,
@@ -244,6 +277,11 @@ impl OutputSink {
                     summary.blocked,
                 ),
             )
+        } else if self.mode == OutputMode::Tui {
+            self.tui
+                .as_ref()
+                .expect("TUI output has a controller")
+                .finish()
         } else {
             Ok(())
         }
@@ -258,8 +296,8 @@ impl OutputSink {
                 &mut *writers.out,
             ),
             OutputMode::Terminal => self.render_terminal(writers, event),
-            OutputMode::GithubActions => self.render_github_actions(writers, event),
-            OutputMode::Live => self.render_live(writers, event),
+            OutputMode::Stream => self.render_stream(writers, event),
+            OutputMode::Tui => self.render_tui(event),
         }
     }
 
@@ -308,69 +346,16 @@ impl OutputSink {
         }
     }
 
-    fn render_live(&self, writers: &mut Writers, event: &ExecutionEvent) -> io::Result<()> {
+    fn render_stream(&self, writers: &mut Writers, event: &ExecutionEvent) -> io::Result<()> {
         match event {
-            ExecutionEvent::TaskOutput { bytes, stream, .. } => {
-                if matches!(stream, TaskStream::Stderr) {
-                    writers.err.write_all(bytes)?;
-                    writers.err.flush()
-                } else {
-                    writers.out.write_all(bytes)?;
-                    writers.out.flush()
-                }
-            }
-            _ => self.render_terminal(writers, event),
-        }
-    }
-
-    fn render_github_actions(
-        &self,
-        writers: &mut Writers,
-        event: &ExecutionEvent,
-    ) -> io::Result<()> {
-        match event {
-            ExecutionEvent::TaskStarted { task, .. } => {
-                writeln!(&mut *writers.out, "::group::{task}")?;
-                writeln!(&mut *writers.out, "▶ {task}")?;
-                writers.out.flush()
-            }
-            ExecutionEvent::TaskOutput { bytes, stream, .. } => {
-                if bytes.is_empty() {
-                    return Ok(());
-                }
-                let token = format!(
-                    "mono_output_{}_{}",
-                    self.run_id,
-                    self.sequence.fetch_add(1, Ordering::Relaxed)
-                );
-                writeln!(&mut *writers.out, "::stop-commands::{token}")?;
-                writers.out.flush()?;
-                let result = if matches!(stream, TaskStream::Stderr) {
-                    write_line_terminated(&mut *writers.err, bytes)
-                        .and_then(|()| writers.err.flush())
-                } else {
-                    write_line_terminated(&mut *writers.out, bytes)
-                        .and_then(|()| writers.out.flush())
-                };
-                writeln!(&mut *writers.out, "::{token}::")?;
-                writers.out.flush()?;
-                result
-            }
-            ExecutionEvent::TaskAttemptStarted {
+            ExecutionEvent::TaskOutput {
                 task,
-                attempt,
-                max_attempts,
+                bytes,
+                stream,
                 ..
             } => {
-                if *attempt > 1 {
-                    writeln!(
-                        &mut *writers.out,
-                        "↻ {task}: retry {attempt}/{max_attempts}"
-                    )?;
-                    writers.out.flush()
-                } else {
-                    Ok(())
-                }
+                let framed = writers.stream.push(task, *stream, bytes);
+                write_stream_bytes(writers, *stream, &framed)
             }
             ExecutionEvent::TaskFinished {
                 task,
@@ -378,21 +363,38 @@ impl OutputSink {
                 elapsed_ms,
                 ..
             } => {
+                for (stream, bytes) in writers.stream.finish(task) {
+                    write_stream_bytes(writers, stream, &bytes)?;
+                }
                 writeln!(
-                    &mut *writers.out,
-                    "{task}: {} in {elapsed_ms}ms",
+                    &mut *writers.err,
+                    "└─ {task}: {} in {elapsed_ms}ms",
                     status.label()
-                )?;
-                writeln!(&mut *writers.out, "::endgroup::")?;
-                writers.out.flush()
+                )
             }
-            // `present_run_finished` emits this event only for JSON. The CLI
-            // transport prints the summary for every other mode, so rendering
-            // it here would either duplicate the line or drift from
-            // `commands::ci::format_summary`.
-            ExecutionEvent::RunFinished { .. } => Ok(()),
-            ExecutionEvent::RunStarted { .. } => Ok(()),
+            ExecutionEvent::TaskAttemptStarted {
+                task,
+                attempt,
+                max_attempts,
+                ..
+            } if *attempt > 1 => {
+                for (stream, bytes) in writers.stream.finish(task) {
+                    write_stream_bytes(writers, stream, &bytes)?;
+                }
+                writeln!(
+                    &mut *writers.err,
+                    "↻ {task}: retry {attempt}/{max_attempts}"
+                )
+            }
+            _ => self.render_terminal(writers, event),
         }
+    }
+
+    fn render_tui(&self, event: &ExecutionEvent) -> io::Result<()> {
+        self.tui
+            .as_ref()
+            .expect("TUI output has a controller")
+            .send(event.clone())
     }
 }
 
@@ -440,6 +442,19 @@ fn write_bytes(writers: &mut Writers, bytes: &[u8], to_stderr: bool) -> io::Resu
         &mut *writers.out
     };
     write_line_terminated(handle, bytes)?;
+    handle.flush()
+}
+
+fn write_stream_bytes(writers: &mut Writers, stream: TaskStream, bytes: &[u8]) -> io::Result<()> {
+    if bytes.is_empty() {
+        return Ok(());
+    }
+    let handle: &mut dyn Write = if matches!(stream, TaskStream::Stderr) {
+        &mut *writers.err
+    } else {
+        &mut *writers.out
+    };
+    handle.write_all(bytes)?;
     handle.flush()
 }
 
@@ -538,7 +553,7 @@ mod tests {
 
     #[test]
     fn live_streams_bytes_once_and_keeps_status_on_stderr() {
-        let (sink, out, err) = captured(OutputMode::Live, 1);
+        let (sink, out, err) = captured(OutputMode::Stream, 1);
         let node = TaskNode::new("build");
 
         sink.present_start(&node).expect("start renders");
@@ -547,28 +562,27 @@ mod tests {
         sink.present_success(&node, &result(b"streamed", false))
             .expect("success does not repeat live bytes");
 
-        assert_eq!(text(&out), "streamed");
-        assert_eq!(text(&err), "\u{25b6} build\nbuild: completed in 42ms\n");
+        assert_eq!(text(&out), "[build] streamed\n");
+        assert_eq!(text(&err), "\u{25b6} build\n└─ build: completed in 42ms\n");
     }
 
     #[test]
-    fn github_actions_wraps_task_output_in_stop_and_resume_markers() {
-        let (sink, out, _err) = captured(OutputMode::GithubActions, 7);
-        let node = TaskNode::new("build");
+    fn live_frames_interleaved_tasks_and_flushes_each_partial_line() {
+        let (sink, out, err) = captured(OutputMode::Stream, 1);
+        let api = TaskNode::new("api");
+        let web = TaskNode::new("web");
 
-        sink.present_start(&node).expect("start renders");
-        sink.present_success(&node, &result(b"::error:: injected\n", false))
-            .expect("success renders");
+        sink.present_live_output(&api, TaskStream::Stdout, b"api ".to_vec())
+            .expect("api output renders");
+        sink.present_live_output(&web, TaskStream::Stdout, b"web\n".to_vec())
+            .expect("web output renders");
+        sink.present_live_output(&api, TaskStream::Stdout, b"done".to_vec())
+            .expect("api completion output renders");
+        sink.present_success(&api, &result(b"api done", false))
+            .expect("api success renders");
 
-        let rendered = text(&out);
-        assert!(rendered.starts_with("::group::build\n"), "{rendered}");
-        assert!(rendered.contains("::stop-commands::"), "{rendered}");
-        assert!(rendered.contains("::mono_output_7_"), "{rendered}");
-        assert!(rendered.contains("::error:: injected\n"), "{rendered}");
-        assert!(
-            rendered.ends_with("build: completed in 42ms\n::endgroup::\n"),
-            "{rendered}"
-        );
+        assert_eq!(text(&out), "[web] web\n[api] api done\n");
+        assert!(text(&err).contains("└─ api: completed"), "{}", text(&err));
     }
 
     #[test]
@@ -655,12 +669,7 @@ mod tests {
     fn every_mode_renders_a_blocked_task() {
         let node = TaskNode::new("build");
 
-        for mode in [
-            OutputMode::Terminal,
-            OutputMode::Json,
-            OutputMode::GithubActions,
-            OutputMode::Live,
-        ] {
+        for mode in [OutputMode::Terminal, OutputMode::Json, OutputMode::Stream] {
             let (sink, out, err) = captured(mode, 1);
             sink.present_blocked(&node).expect("blocked renders");
             let rendered = format!("{}{}", text(&out), text(&err));
@@ -678,11 +687,7 @@ mod tests {
             blocked: 0,
         };
 
-        for mode in [
-            OutputMode::Terminal,
-            OutputMode::GithubActions,
-            OutputMode::Live,
-        ] {
+        for mode in [OutputMode::Terminal, OutputMode::Stream] {
             let (sink, out, err) = captured(mode, 1);
             sink.present_run_finished(&summary)
                 .expect("summary renders");

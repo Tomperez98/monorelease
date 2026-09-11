@@ -78,17 +78,26 @@ mono --dir services/api task api-test
 | `mono changelog ...` | Apply Mono's documented changelog conventions. |
 | `mono release ...` | Create or verify provider-neutral artifact metadata. |
 
-All commands accept the global `--output terminal|live|json|github-actions` option.
-Terminal output is buffered for deterministic presentation, while `live` streams
-raw task output as it arrives. JSON output is a versioned,
-newline-delimited machine contract. `run` and `task` additionally emit
-execution lifecycle events (`run_started`, `task_started`, `task_output`,
-`task_finished`, and `run_finished`). `plan`, `graph`, `list`, and `check`
-return one JSON document with `schema = 1` and a command-specific `kind`.
-Failures in JSON mode are emitted as `{"schema":1,"kind":"error",...}` and
-retain the same process exit code as terminal mode. Environment values are
-never included in plan or list output; only configured variable names are
-reported.
+Commands accept `--output text|json`. Execution commands also accept
+`--ui auto|tui|stream`:
+
+- `auto` (the default) uses the interactive task UI on a terminal and
+  task-prefixed streaming output in pipes and CI.
+- `tui` explicitly requests the interactive task list and per-task log view;
+  it falls back to streaming output when no interactive terminal is available.
+- `stream` writes task-prefixed lines as they arrive, so concurrent output
+  remains attributable to its task.
+
+`json` is a versioned, newline-delimited machine contract and never starts the
+TUI. Human stream output buffers partial lines until a newline or task
+completion, then prefixes each line with its task id. `run` and `task`
+additionally emit execution lifecycle events (`run_started`, `task_started`,
+`task_output`, `task_finished`, and `run_finished`). `plan`, `graph`, `list`,
+and `check` return one JSON document with `schema = 1` and a command-specific
+`kind`. Failures in JSON mode are emitted as
+`{"schema":1,"kind":"error",...}` and retain the same process exit code as
+text mode. Environment values are never included in plan or list output; only
+configured variable names are reported.
 
 `run` and `task` support:
 
@@ -98,7 +107,8 @@ reported.
 | `--dry-run` | Resolve and print the plan without running commands. |
 | `--no-cache` | Skip cache reads and writes. |
 | `--force` | Ignore cache hits and refresh successful entries. |
-| `--output terminal\|live\|json\|github-actions` | Select the output contract. |
+| `--output text\|json` | Select the human or machine output contract. |
+| `--ui auto\|tui\|stream` | Select the execution presentation for human output. |
 
 ## Manifest model
 
@@ -168,7 +178,7 @@ Task fields:
 - A normal task failure stops new normal work. In-flight tasks finish, then pipeline finalizers run as cleanup work.
 - Finalizers are not cacheable because a cache hit must not skip cleanup side effects.
 - Timeouts terminate the complete child process tree using Unix process groups or Windows Job Objects.
-- Output is captured and presented in deterministic plan order by default. `live` streams task bytes while preserving lifecycle summaries. JSON output is newline-delimited and preserves non-UTF-8 task output as byte arrays.
+- Human execution uses the TUI on interactive terminals and task-prefixed stream output elsewhere. Partial output lines are flushed with their task prefix when a task completes. JSON output is newline-delimited and preserves non-UTF-8 task output as byte arrays.
 - Ctrl-C cancels running normal tasks, terminates their process trees, and still permits finalizer tasks to run.
 - Direct execution never changes Mono's process-global working directory.
 

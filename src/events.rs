@@ -9,7 +9,7 @@ use crate::project::TaskNode;
 /// Version of the newline-delimited execution event contract.
 pub const EXECUTION_EVENT_SCHEMA: u32 = crate::JSON_OUTPUT_SCHEMA;
 
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskStream {
     Stdout,

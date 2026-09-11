@@ -21,12 +21,18 @@ pub(crate) struct PipelineServices {
 }
 
 impl PipelineServices {
-    fn production(project: &Project, output: OutputMode) -> Self {
-        Self {
+    fn production(
+        project: &Project,
+        output: OutputMode,
+        cancellation: &CancellationToken,
+    ) -> Result<Self, CiError> {
+        let output = OutputSink::new(output, cancellation.clone())
+            .map_err(|error| CiError::Scheduler(Box::new(SchedulerError::Output(error))))?;
+        Ok(Self {
             runner: Arc::new(Runner::new()),
-            output: Arc::new(OutputSink::new(output)),
+            output: Arc::new(output),
             scheduler: production_services(&project.root),
-        }
+        })
     }
 }
 
@@ -69,7 +75,8 @@ pub fn run_pipeline_with_mode(
         };
     }
 
-    let services = PipelineServices::production(&project, execution.output);
+    let services =
+        PipelineServices::production(&project, execution.output, &execution.cancellation)?;
     let summary = execute_loaded_pipeline(&project, &plan, jobs, &execution, &services)?;
     if execution.output == OutputMode::Json {
         Ok(String::new())
