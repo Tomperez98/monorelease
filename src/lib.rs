@@ -12,6 +12,9 @@ mod commands;
 mod config;
 mod discovery;
 pub(crate) mod events;
+
+/// Version of Mono's machine-readable JSON output contracts.
+pub const JSON_OUTPUT_SCHEMA: u32 = 1;
 mod output;
 pub(crate) mod process;
 mod release;
@@ -34,18 +37,19 @@ pub use commands::changelog::{
     scaffold as changelog_scaffold, validate as changelog_validate,
 };
 pub use commands::ci::{
-    CiError, PipelineExecution, clean_cache, graph, plan, run_pipeline_with_mode,
+    CiError, PipelineExecution, clean_cache, graph, graph_with_output, plan, plan_with_output,
+    run_pipeline_with_mode,
 };
 pub use commands::doctor::{DoctorError, doctor};
-pub use commands::init::{InitError, init, init_standalone};
-pub use commands::list::{ListError, list};
+pub use commands::init::{InitError, init};
+pub use commands::list::{ListError, list, list_with_output};
 pub use commands::release::{
     DEFAULT_DIRECTORY as DEFAULT_RELEASE_DIRECTORY, ReleaseCommandError,
     manifest as release_manifest, source as release_source, verify as release_verify,
 };
 pub use config::{
-    CONFIG_FILE_NAME, MonoConfig, PackageConfig, PipelineConfig, SUPPORTED_SCHEMA, TaskConfig,
-    WORKSPACE_PACKAGE_NAME, WorkspaceConfig, config_path, render_config,
+    CONFIG_FILE_NAME, MonoConfig, PipelineConfig, ProjectConfig, SUPPORTED_SCHEMA, TaskConfig,
+    config_path, render_config,
 };
 pub use output::OutputMode;
 // `CiError::Scheduler` already exposes this type in its public variant; naming it
@@ -56,7 +60,7 @@ pub use release::{
     verify_manifest_with_expected, verify_source,
 };
 pub use scheduler::SchedulerError;
-pub use workspace::{Package, PlannedTask, TaskNode, Workspace, WorkspaceError};
+pub use workspace::{PlannedTask, Project, TaskNode, Workspace, WorkspaceError};
 
 /// Every expected failure a `mono` command can report.
 ///

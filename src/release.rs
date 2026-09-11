@@ -583,6 +583,12 @@ fn read_to_string(path: &Path) -> Result<String, ReleaseError> {
     })
 }
 
+/// Publish a generated release file through a same-directory temporary file.
+///
+/// Unix renames replace the destination atomically. Windows does not expose the
+/// same replacement semantics through `std::fs::rename`, so the fallback removes
+/// an existing destination before renaming; callers still get crash-safe
+/// temporary-file cleanup, but not an atomic replacement guarantee on Windows.
 fn write_file(path: &Path, contents: &str) -> Result<(), ReleaseError> {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let temporary = path.with_file_name(format!(
@@ -611,29 +617,35 @@ fn write_file(path: &Path, contents: &str) -> Result<(), ReleaseError> {
             })?;
         drop(file);
 
-        match fs::rename(&temporary, path) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                fs::remove_file(path).map_err(|source| ReleaseError::Write {
-                    path: path.to_path_buf(),
-                    source,
-                })?;
-                fs::rename(&temporary, path).map_err(|source| ReleaseError::Write {
-                    path: path.to_path_buf(),
-                    source,
-                })
-            }
-            Err(source) => Err(ReleaseError::Write {
-                path: path.to_path_buf(),
-                source,
-            }),
-        }
+        replace_file(&temporary, path).map_err(|source| ReleaseError::Write {
+            path: path.to_path_buf(),
+            source,
+        })
     })();
 
     if result.is_err() {
         let _ = fs::remove_file(&temporary);
     }
     result
+}
+
+fn replace_file(temporary: &Path, destination: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        fs::rename(temporary, destination)
+    }
+
+    #[cfg(not(unix))]
+    {
+        match fs::rename(temporary, destination) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                fs::remove_file(destination)?;
+                fs::rename(temporary, destination)
+            }
+            Err(error) => Err(error),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -673,6 +685,27 @@ mod tests {
             },
         )
         .unwrap();
+    }
+
+    #[test]
+    fn replaces_existing_release_metadata_without_leaving_temporary_files() {
+        let temp = TempDir::new();
+        let artifact = temp.path().join("artifact");
+        fs::write(&artifact, b"before").unwrap();
+        create_manifest(temp.path(), ReleaseIdentity::default()).unwrap();
+        let before = fs::read_to_string(temp.path().join(METADATA_FILE_NAME)).unwrap();
+
+        fs::write(&artifact, b"after").unwrap();
+        create_manifest(temp.path(), ReleaseIdentity::default()).unwrap();
+        let after = fs::read_to_string(temp.path().join(METADATA_FILE_NAME)).unwrap();
+
+        assert_ne!(before, after);
+        let temporary_files = fs::read_dir(temp.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".tmp"))
+            .collect::<Vec<_>>();
+        assert!(temporary_files.is_empty());
     }
 
     #[test]

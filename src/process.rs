@@ -102,7 +102,13 @@ impl Drop for ManagedChild {
         // descendants don't become orphans, then do a blocking reap.
         // On Windows the job handle is closed *after* the wait.
         if self.child.try_wait().ok().flatten().is_none() {
-            let _ = self.terminate_tree();
+            if self.terminate_tree().is_err() {
+                // The public runner reports the tree-termination error, but
+                // Drop must still prevent the direct child from surviving its
+                // owner. Descendants may require separate cleanup, which is
+                // why the original error remains visible to the caller.
+                let _ = self.child.kill();
+            }
             let _ = self.child.wait();
         }
         #[cfg(windows)]
@@ -176,21 +182,16 @@ impl ManagedChild {
         })
     }
 
-    fn terminate_tree_unix(_child: &mut Child, platform: &UnixState) -> io::Result<()> {
+    fn terminate_tree_unix(child: &mut Child, platform: &UnixState) -> io::Result<()> {
         let pgid = platform.pgid;
         if pgid <= 0 {
             return Err(io::Error::other("invalid process group id"));
         }
 
-        // Send SIGTERM to the whole process group.
-        let ret = unsafe { libc::kill(-pgid, libc::SIGTERM) };
-        if ret == -1 {
-            let err = io::Error::last_os_error();
-            // ESRCH means the group no longer exists — that's fine.
-            if err.raw_os_error() != Some(libc::ESRCH) {
-                return Err(err);
-            }
-        }
+        // Send SIGTERM to the whole process group. Some platforms can reject
+        // the graceful signal for a short-lived or already-changing group;
+        // that is not a termination failure if the hard kill below succeeds.
+        let _ = unsafe { libc::kill(-pgid, libc::SIGTERM) };
 
         // Give processes a moment to react to SIGTERM, then SIGKILL survivors.
         // Use a short sleep so that well-behaved processes exit gracefully.
@@ -199,11 +200,17 @@ impl ManagedChild {
         if ret == -1 {
             let err = io::Error::last_os_error();
             if err.raw_os_error() != Some(libc::ESRCH) {
-                return Err(err);
+                // A group can disappear between SIGTERM and SIGKILL while
+                // macOS still reports EPERM for the stale group handle. If
+                // the direct child is already gone, cleanup succeeded from
+                // the runner's perspective and wait() can reap it normally.
+                if child.try_wait()?.is_none() {
+                    return Err(err);
+                }
             }
         }
 
-        // NOTE: we do NOT reap here.  The caller must call wait() after
+        // NOTE: we do NOT reap here. The caller must call wait() after
         // terminate_tree() to reap the direct child exactly once.
         Ok(())
     }

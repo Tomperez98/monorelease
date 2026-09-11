@@ -1,30 +1,22 @@
-//! The fixed, language-agnostic `mono.toml` schema.
+//! The fixed, language-agnostic root `mono.toml` schema.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-/// Name of the configuration file, relative to a repository or package root.
+/// Name of the configuration file at a project root.
 pub const CONFIG_FILE_NAME: &str = "mono.toml";
-/// Namespace used by task references for tasks declared in the root manifest.
-pub const WORKSPACE_PACKAGE_NAME: &str = "workspace";
-
-/// Version of the `mono.toml` schema, not the project or package version.
+/// Version of the on-disk manifest schema.
 pub const SUPPORTED_SCHEMA: u32 = 1;
 
-/// The fixed on-disk `mono.toml` schema.
+/// One root manifest describes one complete execution graph.
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct MonoConfig {
-    /// Version of the `mono.toml` schema, not the project or package version.
     #[serde(default = "default_schema")]
     pub schema: u32,
-    #[serde(default)]
-    pub workspace: Option<WorkspaceConfig>,
-    #[serde(default)]
-    pub package: Option<PackageConfig>,
-    /// Tasks declared at the workspace root run once from the workspace root.
+    pub project: ProjectConfig,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub tasks: BTreeMap<String, TaskConfig>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -32,114 +24,55 @@ pub struct MonoConfig {
 }
 
 impl MonoConfig {
-    /// The root config [`crate::init`] writes into a fresh repository.
+    /// A valid root-only project template.
     pub fn template() -> Self {
-        let mut pipelines = BTreeMap::new();
-        pipelines.insert("ci".to_owned(), PipelineConfig::ci_template());
-
-        Self {
-            schema: default_schema(),
-            workspace: Some(WorkspaceConfig::template()),
-            package: None,
-            tasks: BTreeMap::new(),
-            pipelines,
-        }
-    }
-
-    /// A valid standalone project config using one caller-supplied command.
-    pub fn standalone_template(name: String, command: Vec<String>) -> Self {
-        assert!(
-            !name.is_empty(),
-            "standalone package name must not be empty"
-        );
-        assert!(
-            !name.contains(':'),
-            "standalone package name cannot contain ':'"
-        );
-        assert!(
-            !command.is_empty(),
-            "standalone build command must not be empty"
-        );
-        assert!(
-            !command[0].is_empty(),
-            "standalone build command executable must not be empty"
-        );
-
         let mut tasks = BTreeMap::new();
         tasks.insert(
-            "build".to_owned(),
+            "check".to_owned(),
             TaskConfig {
-                command,
-                depends_on: Vec::new(),
-                cwd: None,
-                env: BTreeMap::new(),
-                cache: false,
-                inputs: Vec::new(),
-                outputs: Vec::new(),
-                cache_env: Vec::new(),
-                timeout_seconds: default_timeout_seconds(),
-                max_output_bytes: default_max_output_bytes(),
-                resource_group: None,
-                retries: 0,
-                retry_backoff_seconds: 0,
-                artifacts: Vec::new(),
-                matrix: BTreeMap::new(),
+                command: vec!["echo".to_owned(), "configure this task".to_owned()],
+                timeout_seconds: 600,
+                max_output_bytes: 16 * 1024 * 1024,
+                ..TaskConfig::default()
             },
         );
         let mut pipelines = BTreeMap::new();
         pipelines.insert(
             "ci".to_owned(),
             PipelineConfig {
-                tasks: vec!["build".to_owned()],
+                tasks: vec!["check".to_owned()],
                 finally: Vec::new(),
             },
         );
-
         Self {
-            schema: default_schema(),
-            workspace: None,
-            package: Some(PackageConfig { name }),
+            schema: SUPPORTED_SCHEMA,
+            project: ProjectConfig {
+                name: "project".to_owned(),
+                default_pipeline: "ci".to_owned(),
+            },
             tasks,
             pipelines,
         }
     }
 
-    /// Parse a manifest from TOML.
+    /// Parse a root manifest from TOML.
     pub fn parse(contents: &str) -> Result<Self, toml::de::Error> {
         toml::from_str(contents)
     }
 }
 
-/// Root-workspace settings.
+/// Project identity and the default pipeline.
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct WorkspaceConfig {
+pub struct ProjectConfig {
     pub name: String,
-    #[serde(default)]
-    pub members: Vec<String>,
     #[serde(default = "default_pipeline")]
     pub default_pipeline: String,
 }
 
-impl WorkspaceConfig {
-    pub fn template() -> Self {
-        Self {
-            name: "mono".to_owned(),
-            members: vec!["apps/*".to_owned(), "packages/*".to_owned()],
-            default_pipeline: default_pipeline(),
-        }
-    }
-}
-
-/// Package identity. Build behavior belongs entirely to [`TaskConfig`].
-#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct PackageConfig {
-    pub name: String,
-}
-
-/// A task command and its orchestration metadata.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+/// A task command and orchestration metadata. Every path is relative to the
+/// project root unless the command itself receives an absolute value.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct TaskConfig {
     pub command: Vec<String>,
@@ -149,59 +82,35 @@ pub struct TaskConfig {
     pub cwd: Option<String>,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
-    /// Whether successful task results may be reused from the local cache.
     #[serde(default)]
     pub cache: bool,
-    /// Relative file globs included in the task fingerprint.
     #[serde(default)]
     pub inputs: Vec<String>,
-    /// Relative file globs copied into and restored from the cache.
     #[serde(default)]
     pub outputs: Vec<String>,
-    /// Environment variables whose values affect the task fingerprint.
     #[serde(default)]
     pub cache_env: Vec<String>,
-    /// Maximum runtime for one invocation, in seconds.
     #[serde(default = "default_timeout_seconds")]
     pub timeout_seconds: u64,
-    /// Maximum captured stdout or stderr per invocation.
     #[serde(default = "default_max_output_bytes")]
     pub max_output_bytes: u64,
-    /// Tasks sharing a resource group never run concurrently.
     #[serde(default)]
     pub resource_group: Option<String>,
-    /// Number of additional attempts after a failed invocation.
     #[serde(default)]
     pub retries: u32,
-    /// Delay between retry attempts, in seconds.
     #[serde(default)]
     pub retry_backoff_seconds: u64,
-    /// Files produced for release or distribution workflows. Unlike `outputs`,
-    /// these are metadata only and are never restored by the task cache.
-    #[serde(default)]
-    pub artifacts: Vec<String>,
-    /// Opaque string dimensions used to create independent task instances.
     #[serde(default)]
     pub matrix: BTreeMap<String, Vec<String>>,
 }
 
-/// A named workspace pipeline made of task names.
+/// A named root task pipeline.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct PipelineConfig {
     pub tasks: Vec<String>,
-    /// Tasks that run after the normal pipeline, even when a normal task fails.
     #[serde(default)]
     pub finally: Vec<String>,
-}
-
-impl PipelineConfig {
-    pub fn ci_template() -> Self {
-        Self {
-            tasks: vec!["build".to_owned(), "test".to_owned()],
-            finally: Vec::new(),
-        }
-    }
 }
 
 fn default_schema() -> u32 {
@@ -220,7 +129,7 @@ fn default_max_output_bytes() -> u64 {
     16 * 1024 * 1024
 }
 
-/// Path of the config file inside `dir`.
+/// Path of the root config inside `dir`.
 pub fn config_path(dir: &Path) -> PathBuf {
     dir.join(CONFIG_FILE_NAME)
 }
@@ -230,8 +139,8 @@ pub fn render_config(config: &MonoConfig) -> String {
     toml::to_string_pretty(config).expect("MonoConfig must serialize to TOML")
 }
 
-/// Return a manifest validation message when a value cannot be passed to a
-/// child process safely.
+/// Return a validation message when a value cannot be passed to a child
+/// process safely.
 pub(crate) fn validate_process_value(value: &str, field: &str) -> Result<(), String> {
     if value.contains('\0') {
         return Err(format!("{field} must not contain a NUL byte"));
@@ -249,84 +158,38 @@ mod tests {
         let parsed = MonoConfig::parse(&rendered).expect("rendered config parses");
 
         assert_eq!(parsed, MonoConfig::template());
+        assert_eq!(parsed.schema, 1);
     }
 
     #[test]
     fn config_path_joins_the_file_name_onto_the_directory() {
         assert_eq!(
             config_path(Path::new("repo")),
-            Path::new("repo").join(CONFIG_FILE_NAME),
+            Path::new("repo").join(CONFIG_FILE_NAME)
         );
-    }
-
-    #[test]
-    fn standalone_template_round_trips_through_toml() {
-        let config = MonoConfig::standalone_template(
-            "app".to_owned(),
-            vec!["cargo".to_owned(), "build".to_owned()],
-        );
-        let rendered = render_config(&config);
-        let parsed = MonoConfig::parse(&rendered).expect("standalone config parses");
-
-        assert_eq!(parsed, config);
     }
 
     #[test]
     fn task_defaults_to_no_dependencies_or_environment() {
         let parsed = MonoConfig::parse(
-            "[package]\nname = \"worker\"\n\n[tasks.build]\ncommand = [\"make\", \"build\"]\n",
+            "[project]\nname = \"worker\"\n\n[tasks.build]\ncommand = [\"make\", \"build\"]\n",
         )
-        .expect("package parses");
+        .expect("project parses");
 
-        assert_eq!(
-            parsed.tasks["build"],
-            TaskConfig {
-                command: vec!["make".to_owned(), "build".to_owned()],
-                depends_on: Vec::new(),
-                cwd: None,
-                env: BTreeMap::new(),
-                cache: false,
-                inputs: Vec::new(),
-                outputs: Vec::new(),
-                cache_env: Vec::new(),
-                timeout_seconds: 600,
-                max_output_bytes: default_max_output_bytes(),
-                resource_group: None,
-                retries: 0,
-                retry_backoff_seconds: 0,
-                artifacts: Vec::new(),
-                matrix: BTreeMap::new(),
-            }
-        );
+        assert_eq!(parsed.tasks["build"].timeout_seconds, 600);
+        assert_eq!(parsed.tasks["build"].max_output_bytes, 16 * 1024 * 1024);
+        assert!(parsed.tasks["build"].depends_on.is_empty());
     }
 
     #[test]
-    fn omitted_schema_defaults_to_version_one() {
-        let parsed = MonoConfig::parse(
-            "[package]\nname = \"worker\"\n\n[tasks.build]\ncommand = [\"make\", \"build\"]\n",
-        )
-        .expect("package parses");
-
+    fn schema_defaults_to_version_one() {
+        let parsed = MonoConfig::parse("[project]\nname = \"worker\"\n").unwrap();
         assert_eq!(parsed.schema, 1);
     }
 
     #[test]
-    fn schema_round_trips_through_toml() {
-        let config = MonoConfig::template();
-        let rendered = render_config(&config);
-        assert!(rendered.starts_with("schema = 1\n"));
-        assert_eq!(MonoConfig::parse(&rendered).unwrap(), config);
-    }
-
-    #[test]
-    fn rejects_unknown_top_level_fields_but_accepts_schema() {
-        let accepted = MonoConfig::parse(
-            "schema = 1\n\n[workspace]\nname = \"repo\"\n\n[pipelines.ci]\ntasks = [\"build\"]\n",
-        );
-        assert!(accepted.is_ok());
-
-        let rejected = MonoConfig::parse("version = 1\n\n[workspace]\nname = \"repo\"\n")
-            .expect_err("version is not the manifest schema field");
-        assert!(rejected.to_string().contains("unknown field"));
+    fn old_workspace_and_package_shapes_are_not_root_projects() {
+        assert!(MonoConfig::parse("[workspace]\nname = \"repo\"\n").is_err());
+        assert!(MonoConfig::parse("[package]\nname = \"app\"\n").is_err());
     }
 }

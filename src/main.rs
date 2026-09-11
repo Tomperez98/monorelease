@@ -1,4 +1,4 @@
-//! `mono` — language agnostic project and workspace tooling.
+//! `mono` — language-agnostic root-project tooling.
 //!
 //! This is the transport edge: it parses the command line, calls into
 //! [`mono`], and maps the single error vocabulary onto stdout, stderr,
@@ -32,13 +32,16 @@ use mono::{
 #[command(
     name = "mono",
     version = env!("CARGO_PKG_VERSION"),
-    about = "Language agnostic project and workspace tooling",
+    about = "Language-agnostic root-project tooling",
     after_help = "Run `mono help <command>` for command details."
 )]
 struct Cli {
-    /// Project or workspace directory.
+    /// Project directory or a path nested inside one.
     #[arg(long = "dir", global = true, default_value = ".")]
     root: PathBuf,
+    /// Output contract for command summaries and execution events.
+    #[arg(long, global = true, value_enum, default_value_t = OutputFormat::Terminal)]
+    output: OutputFormat,
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -65,9 +68,6 @@ impl From<OutputFormat> for OutputMode {
 
 #[derive(Args)]
 struct ExecutionOptions {
-    /// Package the pipeline run is limited to.
-    #[arg(long, value_parser = NonEmptyStringValueParser::new())]
-    package: Option<String>,
     #[arg(long)]
     dry_run: bool,
     /// Skip reading and writing the local task cache.
@@ -79,9 +79,6 @@ struct ExecutionOptions {
     /// Maximum number of independent tasks to execute concurrently.
     #[arg(long, default_value_t = default_jobs(), value_parser = parse_jobs)]
     jobs: usize,
-    /// Output contract to use for task status and grouping.
-    #[arg(long, value_enum, default_value_t = OutputFormat::Terminal)]
-    output: OutputFormat,
 }
 
 impl Default for ExecutionOptions {
@@ -89,12 +86,10 @@ impl Default for ExecutionOptions {
     /// pipeline, terminal output, a read/write cache, and machine parallelism.
     fn default() -> Self {
         Self {
-            package: None,
             dry_run: false,
             no_cache: false,
             force: false,
             jobs: default_jobs(),
-            output: OutputFormat::Terminal,
         }
     }
 }
@@ -102,19 +97,7 @@ impl Default for ExecutionOptions {
 #[derive(Subcommand)]
 enum Commands {
     /// Write a fresh manifest in the selected directory.
-    Init {
-        /// Create a standalone project instead of a workspace.
-        #[arg(long)]
-        standalone: bool,
-        /// Command argument used by the generated standalone build task.
-        #[arg(
-            long = "command",
-            num_args = 1,
-            requires = "standalone",
-            value_parser = NonEmptyStringValueParser::new()
-        )]
-        command: Vec<String>,
-    },
+    Init,
     /// Run a named pipeline, or the default pipeline when omitted.
     #[command(alias = "ci")]
     Run {
@@ -137,24 +120,20 @@ enum Commands {
         #[command(flatten)]
         options: ExecutionOptions,
     },
-    /// Validate the selected project or workspace.
+    /// Validate the selected root project.
     #[command(alias = "doctor")]
     Check,
-    /// List pipelines, packages, tasks, and common commands.
+    /// List pipelines, tasks, and common commands.
     List,
     /// Print the resolved plan for the default or named pipeline.
     Plan {
         #[arg(value_name = "PIPELINE", value_parser = NonEmptyStringValueParser::new())]
         pipeline: Option<String>,
-        #[arg(long, value_parser = NonEmptyStringValueParser::new())]
-        package: Option<String>,
     },
     /// Print dependency edges for the default or named pipeline.
     Graph {
         #[arg(value_name = "PIPELINE", value_parser = NonEmptyStringValueParser::new())]
         pipeline: Option<String>,
-        #[arg(long, value_parser = NonEmptyStringValueParser::new())]
-        package: Option<String>,
     },
     /// Manage the local task cache.
     Cache {
@@ -211,8 +190,12 @@ enum ChangelogCommands {
         version: String,
         #[arg(long, default_value = DEFAULT_CHANGELOG_PATH)]
         file: PathBuf,
-        #[arg(long, default_value = DEFAULT_RELEASE_NOTES_PATH)]
-        output: PathBuf,
+        #[arg(
+            long = "output-file",
+            alias = "notes-output",
+            default_value = DEFAULT_RELEASE_NOTES_PATH
+        )]
+        output_file: PathBuf,
     },
 }
 
@@ -343,11 +326,19 @@ fn parse_jobs(value: &str) -> Result<usize, String> {
 }
 
 fn main() -> ExitCode {
-    let Cli { root, command } = Cli::parse();
+    let Cli {
+        root,
+        output,
+        command,
+    } = Cli::parse();
+    let output = output.into();
 
-    let code = match run(root, command) {
+    let code = match run(root, output, command) {
         Ok(summary) => emit_summary(&mut io::stdout().lock(), &summary),
-        Err(error) => emit_error(&mut io::stderr().lock(), &error),
+        Err(error) if output == OutputMode::Json => {
+            emit_error(&mut io::stdout().lock(), &error, output)
+        }
+        Err(error) => emit_error(&mut io::stderr().lock(), &error, output),
     };
     ExitCode::from(code)
 }
@@ -380,8 +371,19 @@ fn emit_summary(sink: &mut impl Write, summary: &str) -> u8 {
 ///
 /// A closed stderr must never mask the failure, so the write is best effort and
 /// the code comes from the error alone.
-fn emit_error(sink: &mut impl Write, error: &Error) -> u8 {
-    let _ = writeln!(sink, "mono: {error}");
+fn emit_error(sink: &mut impl Write, error: &Error, output: OutputMode) -> u8 {
+    if output == OutputMode::Json {
+        let document = serde_json::json!({
+            "schema": mono::JSON_OUTPUT_SCHEMA,
+            "kind": "error",
+            "code": exit_code(error),
+            "message": error.to_string(),
+        });
+        let _ = serde_json::to_writer(&mut *sink, &document);
+        let _ = sink.write_all(b"\n");
+    } else {
+        let _ = writeln!(sink, "mono: {error}");
+    }
     exit_code(error)
 }
 
@@ -396,9 +398,10 @@ fn exit_code(error: &Error) -> u8 {
         Error::Init(error) => init_exit_code(error),
         Error::Ci(CiError::InvalidJobs) => EXIT_USAGE,
         Error::Ci(CiError::Scheduler(error)) => scheduler_exit_code(error),
+        Error::Ci(CiError::Json { .. }) => EXIT_TOOL,
         Error::Changelog(error) => changelog_exit_code(error),
         Error::Release(ReleaseCommandError::Release(error)) => release_exit_code(error),
-        // A workspace failure is a rejected request, not a failed tool.
+        // A project failure is a rejected request, not a failed tool.
         //
         // `WorkspaceError::Io` is overloaded: it covers failing to read a
         // manifest *and* failing to resolve a directory the manifest declares,
@@ -415,7 +418,7 @@ fn init_exit_code(error: &InitError) -> u8 {
     match error {
         // The requested directory or file could not be written.
         InitError::CreateDir { .. } | InitError::WriteConfig { .. } => EXIT_TOOL,
-        InitError::StandaloneCommandRequired | InitError::AlreadyInitialized(_) => EXIT_FAILED,
+        InitError::AlreadyInitialized(_) => EXIT_FAILED,
     }
 }
 
@@ -478,27 +481,22 @@ const NO_TASK_FILTER: &[String] = &[];
 ///
 /// Each subcommand owns a small helper below, so this match reads as a dispatch
 /// table and each helper documents the failure space it can surface.
-fn run(root: PathBuf, command: Option<Commands>) -> Result<String, Error> {
+fn run(root: PathBuf, output: OutputMode, command: Option<Commands>) -> Result<String, Error> {
     match command {
-        None => run_default_pipeline(&root),
-        Some(Commands::Init {
-            standalone,
-            command,
-        }) => run_init(&root, standalone, command),
+        None => run_default_pipeline(&root, output),
+        Some(Commands::Init) => run_init(&root),
         Some(Commands::Run {
             pipeline,
             tasks,
             options,
-        }) => execute_pipeline(&root, pipeline.as_deref(), &tasks, options),
-        Some(Commands::Task { tasks, options }) => execute_pipeline(&root, None, &tasks, options),
-        Some(Commands::Check) => run_check(&root),
-        Some(Commands::List) => run_list(&root),
-        Some(Commands::Plan { pipeline, package }) => {
-            run_plan(&root, pipeline.as_deref(), package.as_deref())
+        }) => execute_pipeline(&root, pipeline.as_deref(), &tasks, options, output),
+        Some(Commands::Task { tasks, options }) => {
+            execute_pipeline(&root, None, &tasks, options, output)
         }
-        Some(Commands::Graph { pipeline, package }) => {
-            run_graph(&root, pipeline.as_deref(), package.as_deref())
-        }
+        Some(Commands::Check) => run_check(&root, output),
+        Some(Commands::List) => run_list(&root, output),
+        Some(Commands::Plan { pipeline }) => run_plan(&root, pipeline.as_deref(), output),
+        Some(Commands::Graph { pipeline }) => run_graph(&root, pipeline.as_deref(), output),
         Some(Commands::Cache { command }) => run_cache(&root, command),
         Some(Commands::Changelog { command }) => run_changelog(&root, command),
         Some(Commands::Release { command }) => run_release(&root, command),
@@ -506,16 +504,18 @@ fn run(root: PathBuf, command: Option<Commands>) -> Result<String, Error> {
 }
 
 /// Run the default pipeline when no subcommand is given.
-fn run_default_pipeline(root: &Path) -> Result<String, Error> {
-    execute_pipeline(root, None, NO_TASK_FILTER, ExecutionOptions::default())
+fn run_default_pipeline(root: &Path, output: OutputMode) -> Result<String, Error> {
+    execute_pipeline(
+        root,
+        None,
+        NO_TASK_FILTER,
+        ExecutionOptions::default(),
+        output,
+    )
 }
 
-fn run_init(root: &Path, standalone: bool, command: Vec<String>) -> Result<String, Error> {
-    let written = if standalone {
-        mono::init_standalone(root, command)?
-    } else {
-        mono::init(root)?
-    };
+fn run_init(root: &Path) -> Result<String, Error> {
+    let written = mono::init(root)?;
     Ok(format!("initialized {}", written.display()))
 }
 
@@ -525,36 +525,55 @@ fn execute_pipeline(
     pipeline: Option<&str>,
     tasks: &[String],
     options: ExecutionOptions,
+    output: OutputMode,
 ) -> Result<String, Error> {
     Ok(mono::run_pipeline_with_mode(
         root,
         pipeline,
-        options.package.as_deref(),
         tasks,
         options.dry_run,
         options.jobs,
         PipelineExecution {
             cache: cache_mode(options.no_cache, options.force),
-            output: options.output.into(),
+            output,
         },
     )?)
 }
 
-fn run_check(root: &Path) -> Result<String, Error> {
-    mono::doctor(root)?;
-    Ok(format!("checked {}", root.display()))
+fn run_check(root: &Path, output: OutputMode) -> Result<String, Error> {
+    let project = mono::Workspace::load(root).map_err(mono::DoctorError::from)?;
+    if output == OutputMode::Json {
+        Ok(format!(
+            "{{\"schema\":{},\"kind\":\"check\",\"status\":\"ok\",\"project\":{}}}",
+            mono::JSON_OUTPUT_SCHEMA,
+            serde_json::to_string(&project.root.display().to_string())
+                .expect("path is serializable")
+        ))
+    } else {
+        Ok(format!("checked {}", project.root.display()))
+    }
 }
 
-fn run_list(root: &Path) -> Result<String, Error> {
-    Ok(mono::list(root)?)
+fn run_list(root: &Path, output: OutputMode) -> Result<String, Error> {
+    Ok(mono::list_with_output(root, output)?)
 }
 
-fn run_plan(root: &Path, pipeline: Option<&str>, package: Option<&str>) -> Result<String, Error> {
-    Ok(mono::plan(root, pipeline, package, NO_TASK_FILTER)?)
+fn run_plan(root: &Path, pipeline: Option<&str>, output: OutputMode) -> Result<String, Error> {
+    Ok(mono::plan_with_output(
+        root,
+        pipeline,
+        NO_TASK_FILTER,
+        output,
+    )?)
 }
 
-fn run_graph(root: &Path, pipeline: Option<&str>, package: Option<&str>) -> Result<String, Error> {
-    Ok(mono::graph(root, pipeline, package, NO_TASK_FILTER)?)
+fn run_graph(root: &Path, pipeline: Option<&str>, output: OutputMode) -> Result<String, Error> {
+    Ok(mono::graph_with_output(
+        root,
+        pipeline,
+        NO_TASK_FILTER,
+        output,
+    )?)
 }
 
 fn run_cache(root: &Path, command: CacheCommands) -> Result<String, Error> {
@@ -572,11 +591,11 @@ fn run_changelog(root: &Path, command: ChangelogCommands) -> Result<String, Erro
         ChangelogCommands::Notes {
             version,
             file,
-            output,
+            output_file,
         } => Ok(changelog_notes(
             &resolve_path(root, file),
             &version,
-            &resolve_path(root, output),
+            &resolve_path(root, output_file),
         )?),
     }
 }
@@ -697,7 +716,10 @@ mod tests {
         let error = Error::Ci(CiError::InvalidJobs);
         let mut sink = Vec::new();
 
-        assert_eq!(emit_error(&mut sink, &error), EXIT_USAGE);
+        assert_eq!(
+            emit_error(&mut sink, &error, OutputMode::Terminal),
+            EXIT_USAGE
+        );
         assert_eq!(
             String::from_utf8(sink).unwrap(),
             "mono: --jobs must be greater than zero\n"
@@ -709,18 +731,21 @@ mod tests {
         let error = Error::Doctor(DoctorError::Workspace(missing_root()));
         let mut sink = FailingWriter(io::ErrorKind::BrokenPipe);
 
-        assert_eq!(emit_error(&mut sink, &error), EXIT_FAILED);
+        assert_eq!(
+            emit_error(&mut sink, &error, OutputMode::Terminal),
+            EXIT_FAILED
+        );
     }
 
     #[test]
     fn requests_that_were_understood_fail_with_one() {
         for error in [
-            Error::Init(InitError::StandaloneCommandRequired),
+            Error::Init(InitError::AlreadyInitialized(PathBuf::from("mono.toml"))),
             Error::Init(InitError::AlreadyInitialized(PathBuf::from("mono.toml"))),
             Error::Doctor(DoctorError::Workspace(missing_root())),
             Error::Doctor(DoctorError::Workspace(missing_declared_directory())),
-            Error::List(ListError::Workspace(WorkspaceError::UnknownPackage {
-                name: "api".to_owned(),
+            Error::List(ListError::Workspace(WorkspaceError::MissingTask {
+                task: "missing".to_owned(),
                 suggestion: None,
             })),
             Error::Changelog(ChangelogError::Invalid("no entries".to_owned())),

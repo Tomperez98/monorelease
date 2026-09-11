@@ -57,7 +57,7 @@ fn changelog_commands_validate_scaffold_and_render_notes() {
             "notes",
             "--version",
             "v1.0.0",
-            "--output",
+            "--output-file",
             "notes.md",
         ],
         temp.path(),

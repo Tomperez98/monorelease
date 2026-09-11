@@ -1,18 +1,15 @@
-//! Central, language-agnostic workspace orchestration commands.
+//! Root-project orchestration commands.
 
-use std::collections::BTreeSet;
 use std::error::Error as StdError;
 use std::fmt;
 use std::path::Path;
 
 use crate::cache::CacheMode;
 use crate::output::{OutputMode, OutputSink};
-use crate::runner::Runner;
-use crate::runner::format_command;
+use crate::runner::{Runner, format_command};
 use crate::scheduler::{ExecutionSummary, SchedulerError, execute_plan};
 use crate::workspace::{PlannedTask, TaskNode, Workspace, WorkspaceError};
 
-/// Selects the cache and output contracts for a pipeline run.
 #[derive(Debug, Clone, Copy)]
 pub struct PipelineExecution {
     pub cache: CacheMode,
@@ -20,8 +17,6 @@ pub struct PipelineExecution {
 }
 
 impl Default for PipelineExecution {
-    /// The contract used when no flag selects one: terminal output with the
-    /// normal read/write cache.
     fn default() -> Self {
         Self {
             cache: CacheMode::ReadWrite,
@@ -30,15 +25,9 @@ impl Default for PipelineExecution {
     }
 }
 
-/// Run a pipeline with an explicit execution contract.
-///
-/// This is the single entry point for workspace orchestration: every cache and
-/// output choice travels in `execution`, and `jobs == 0` is rejected here so no
-/// caller can reach the scheduler with an invalid worker count.
 pub fn run_pipeline_with_mode(
     path: &Path,
     pipeline: Option<&str>,
-    selected_package: Option<&str>,
     requested_tasks: &[String],
     dry_run: bool,
     jobs: usize,
@@ -47,49 +36,48 @@ pub fn run_pipeline_with_mode(
     if jobs == 0 {
         return Err(CiError::InvalidJobs);
     }
-
-    let workspace = Workspace::load(path)?;
-    let plan = workspace.plan(selected_package, pipeline, requested_tasks)?;
-
+    let project = Workspace::load(path)?;
+    let plan = project.plan(pipeline, requested_tasks)?;
     if dry_run {
-        return Ok(format_plan(&workspace, &plan));
+        return Ok(format_plan(&project, &plan));
     }
 
     let runner = Runner::new();
     let output = OutputSink::new(execution.output);
-    let summary = execute_plan(&workspace, &plan, jobs, &runner, &output, execution.cache)?;
-
-    let package_count = plan
-        .iter()
-        .map(|task| task.package())
-        .collect::<BTreeSet<_>>()
-        .len();
-
-    if execution.output == crate::output::OutputMode::Json {
-        // JSON mode emits a run_finished event; the text summary would
-        // break the newline-delimited JSON contract.
+    let summary = execute_plan(&project, &plan, jobs, &runner, &output, execution.cache)?;
+    if execution.output == OutputMode::Json {
         Ok(String::new())
     } else {
-        Ok(format_summary(&summary, package_count))
+        Ok(format_summary(&summary))
     }
 }
 
-/// Return the resolved execution plan without running commands.
 pub fn plan(
     path: &Path,
     pipeline: Option<&str>,
-    selected_package: Option<&str>,
     requested_tasks: &[String],
 ) -> Result<String, CiError> {
-    let workspace = Workspace::load(path)?;
-    let plan = workspace.plan(selected_package, pipeline, requested_tasks)?;
-    Ok(format_plan(&workspace, &plan))
+    plan_with_output(path, pipeline, requested_tasks, OutputMode::Terminal)
 }
 
-/// Remove local cache entries while preserving the workspace and ignore file.
+pub fn plan_with_output(
+    path: &Path,
+    pipeline: Option<&str>,
+    requested_tasks: &[String],
+    output_mode: OutputMode,
+) -> Result<String, CiError> {
+    let project = Workspace::load(path)?;
+    let plan = project.plan(pipeline, requested_tasks)?;
+    if output_mode == OutputMode::Json {
+        return serde_json::to_string(&PlanDocument::from((&project, plan.as_slice())))
+            .map_err(|source| CiError::Json { source });
+    }
+    Ok(format_plan(&project, &plan))
+}
+
 pub fn clean_cache(path: &Path) -> Result<String, CiError> {
-    let workspace = Workspace::load(path)?;
-    let cache_path = workspace.root.join(".mono").join("cache");
+    let project = Workspace::load(path)?;
+    let cache_path = project.root.join(".mono").join("cache");
     match std::fs::remove_dir_all(&cache_path) {
         Ok(()) => Ok(format!("removed cache {}", cache_path.display())),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -102,30 +90,56 @@ pub fn clean_cache(path: &Path) -> Result<String, CiError> {
     }
 }
 
-/// Return task-DAG edges without running commands.
 pub fn graph(
     path: &Path,
     pipeline: Option<&str>,
-    selected_package: Option<&str>,
     requested_tasks: &[String],
 ) -> Result<String, CiError> {
-    let workspace = Workspace::load(path)?;
-    let edges = workspace.graph(selected_package, pipeline, requested_tasks)?;
+    graph_with_output(path, pipeline, requested_tasks, OutputMode::Terminal)
+}
+
+pub fn graph_with_output(
+    path: &Path,
+    pipeline: Option<&str>,
+    requested_tasks: &[String],
+    output_mode: OutputMode,
+) -> Result<String, CiError> {
+    let project = Workspace::load(path)?;
+    let edges = project.graph(pipeline, requested_tasks)?;
+    if output_mode == OutputMode::Json {
+        return serde_json::to_string(&GraphDocument {
+            schema: crate::events::EXECUTION_EVENT_SCHEMA,
+            kind: "graph",
+            project: project.name.clone(),
+            root: project.root.display().to_string(),
+            edges: edges
+                .into_iter()
+                .map(|(task, dependencies)| GraphEdge {
+                    task: task.id().to_owned(),
+                    depends_on: dependencies
+                        .into_iter()
+                        .map(|dependency| dependency.id().to_owned())
+                        .collect(),
+                })
+                .collect(),
+        })
+        .map_err(|source| CiError::Json { source });
+    }
     let mut output = format!(
         "{} {} ({})",
-        workspace.scope_label(),
-        workspace.name,
-        workspace.root.display()
+        project.scope_label(),
+        project.name,
+        project.root.display()
     );
     for (node, dependencies) in edges {
         output.push('\n');
-        output.push_str(&format_node(&node));
+        output.push_str(node.id());
         if !dependencies.is_empty() {
             output.push_str(" <- ");
             output.push_str(
                 &dependencies
                     .iter()
-                    .map(format_node)
+                    .map(TaskNode::id)
                     .collect::<Vec<_>>()
                     .join(", "),
             );
@@ -134,18 +148,95 @@ pub fn graph(
     Ok(output)
 }
 
-fn format_plan(workspace: &Workspace, plan: &[PlannedTask]) -> String {
+#[derive(serde::Serialize)]
+struct PlanDocument {
+    schema: u32,
+    kind: &'static str,
+    project: String,
+    root: String,
+    tasks: Vec<PlanTask>,
+}
+
+#[derive(serde::Serialize)]
+struct PlanTask {
+    id: String,
+    command: Vec<String>,
+    cwd: String,
+    cache: bool,
+    inputs: Vec<String>,
+    outputs: Vec<String>,
+    cache_env: Vec<String>,
+    timeout_seconds: u64,
+    max_output_bytes: usize,
+    resource_group: Option<String>,
+    retries: u32,
+    retry_backoff_seconds: u64,
+    finalizer: bool,
+    depends_on: Vec<String>,
+    env: Vec<String>,
+}
+
+impl<'a> From<(&'a Workspace, &'a [PlannedTask])> for PlanDocument {
+    fn from((project, plan): (&'a Workspace, &'a [PlannedTask])) -> Self {
+        Self {
+            schema: crate::events::EXECUTION_EVENT_SCHEMA,
+            kind: "plan",
+            project: project.name.clone(),
+            root: project.root.display().to_string(),
+            tasks: plan
+                .iter()
+                .map(|task| PlanTask {
+                    id: task.id().to_owned(),
+                    command: task.command().to_vec(),
+                    cwd: task.cwd().display().to_string(),
+                    cache: task.cache(),
+                    inputs: task.inputs().to_vec(),
+                    outputs: task.outputs().to_vec(),
+                    cache_env: task.cache_env().to_vec(),
+                    timeout_seconds: task.timeout().as_secs(),
+                    max_output_bytes: task.max_output_bytes(),
+                    resource_group: task.resource_group().map(str::to_owned),
+                    retries: task.retries(),
+                    retry_backoff_seconds: task.retry_backoff().as_secs(),
+                    finalizer: task.is_finalizer(),
+                    depends_on: task
+                        .depends_on()
+                        .iter()
+                        .map(|dependency| dependency.id().to_owned())
+                        .collect(),
+                    env: task.env().keys().cloned().collect(),
+                })
+                .collect(),
+        }
+    }
+}
+
+#[derive(serde::Serialize)]
+struct GraphDocument {
+    schema: u32,
+    kind: &'static str,
+    project: String,
+    root: String,
+    edges: Vec<GraphEdge>,
+}
+
+#[derive(serde::Serialize)]
+struct GraphEdge {
+    task: String,
+    depends_on: Vec<String>,
+}
+
+fn format_plan(project: &Workspace, plan: &[PlannedTask]) -> String {
     let mut output = format!(
         "{} {} ({})",
-        workspace.scope_label(),
-        workspace.name,
-        workspace.root.display()
+        project.scope_label(),
+        project.name,
+        project.root.display()
     );
     for task in plan {
         output.push('\n');
         output.push_str(&format!(
-            "would run {}:{} in {}: {}",
-            task.package(),
+            "would run {} in {}: {}",
             task.task(),
             task.cwd().display(),
             format_command(task.command())
@@ -160,9 +251,6 @@ fn format_plan(workspace: &Workspace, plan: &[PlannedTask]) -> String {
         }
         if !task.outputs().is_empty() {
             output.push_str(&format!(" [outputs={}]", task.outputs().join(", ")));
-        }
-        if !task.artifacts().is_empty() {
-            output.push_str(&format!(" [artifacts={}]", task.artifacts().join(", ")));
         }
         if task.retries() > 0 {
             output.push_str(&format!(" [retries={}]", task.retries()));
@@ -183,23 +271,19 @@ fn format_plan(workspace: &Workspace, plan: &[PlannedTask]) -> String {
     output
 }
 
-fn format_summary(summary: &ExecutionSummary, package_count: usize) -> String {
+fn format_summary(summary: &ExecutionSummary) -> String {
     format!(
-        "summary: {} completed, {} cached, {} failed, {} blocked across {package_count} package(s)",
+        "summary: {} completed, {} cached, {} failed, {} blocked",
         summary.completed, summary.cached, summary.failed, summary.blocked
     )
 }
 
-fn format_node(node: &TaskNode) -> String {
-    format!("{}:{}", node.package, node.task)
-}
-
-/// Expected failures of the orchestration commands.
 #[derive(Debug)]
 pub enum CiError {
     InvalidJobs,
     Workspace(WorkspaceError),
     Scheduler(Box<SchedulerError>),
+    Json { source: serde_json::Error },
 }
 
 impl fmt::Display for CiError {
@@ -208,6 +292,7 @@ impl fmt::Display for CiError {
             Self::InvalidJobs => write!(f, "--jobs must be greater than zero"),
             Self::Workspace(error) => error.fmt(f),
             Self::Scheduler(error) => error.fmt(f),
+            Self::Json { source } => write!(f, "could not serialize JSON output: {source}"),
         }
     }
 }
@@ -217,6 +302,7 @@ impl StdError for CiError {
         match self {
             Self::Workspace(error) => Some(error),
             Self::Scheduler(error) => Some(error),
+            Self::Json { source } => Some(source),
             Self::InvalidJobs => None,
         }
     }
@@ -244,62 +330,29 @@ mod tests {
     #[test]
     fn dry_run_reports_dependency_order_and_commands() {
         let temp = TempDir::new();
-        fs::write(
-            config_path(temp.path()),
-            "[workspace]\nname = \"fixture\"\nmembers = [\"packages/*\"]\n\n[pipelines.ci]\ntasks = [\"build\"]\n",
-        )
-        .expect("write root manifest");
-        for (name, dependency) in [("base", ""), ("app", "depends_on = [\"base:build\"]\n")] {
-            let package = temp.path().join("packages").join(name);
-            fs::create_dir_all(&package).expect("create package");
-            fs::write(
-                config_path(&package),
-                format!(
-                    "[package]\nname = \"{name}\"\n\n[tasks.build]\ncommand = [\"echo\", \"{name}\"]\n{dependency}"
-                ),
-            )
-            .expect("write package manifest");
-        }
-
+        fs::write(config_path(temp.path()), "[project]\nname = \"fixture\"\n\n[pipelines.ci]\ntasks = [\"app-build\"]\n\n[tasks.base-build]\ncommand = [\"echo\", \"base\"]\n\n[tasks.app-build]\ncommand = [\"echo\", \"app\"]\ndepends_on = [\"base-build\"]\n").unwrap();
         let output = run_pipeline_with_mode(
             temp.path(),
-            None,
             None,
             &[],
             true,
             1,
             PipelineExecution::default(),
         )
-        .expect("dry run succeeds");
-
-        assert!(output.find("base:build").unwrap() < output.find("app:build").unwrap());
-        assert!(output.contains("would run app:build"));
+        .unwrap();
+        assert!(output.find("base-build").unwrap() < output.find("app-build").unwrap());
+        assert!(output.contains("would run app-build"));
     }
 
     #[cfg(unix)]
     #[test]
     fn retries_a_failed_task_before_reporting_failure() {
         let temp = TempDir::new();
-        fs::write(
-            config_path(temp.path()),
-            "[workspace]\nname = \"fixture\"\nmembers = [\"packages/*\"]\n\n[pipelines.ci]\ntasks = [\"build\"]\n",
-        )
-        .expect("write root manifest");
-        let package = temp.path().join("packages/app");
-        fs::create_dir_all(&package).expect("create package");
-        let marker = package.join("attempted");
+        let marker = temp.path().join("attempted");
         let marker = marker.to_string_lossy();
-        fs::write(
-            config_path(&package),
-            format!(
-                "[package]\nname = \"app\"\n\n[tasks.build]\ncommand = [\"sh\", \"-c\", \"if [ ! -e '{marker}' ]; then touch '{marker}'; exit 7; fi; printf success\"]\nretries = 1\n"
-            ),
-        )
-        .expect("write package manifest");
-
+        fs::write(config_path(temp.path()), format!("[project]\nname = \"fixture\"\n\n[pipelines.ci]\ntasks = [\"build\"]\n\n[tasks.build]\ncommand = [\"sh\", \"-c\", \"if [ ! -e '{marker}' ]; then touch '{marker}'; exit 7; fi; printf success\"]\nretries = 1\n")).unwrap();
         let output = run_pipeline_with_mode(
             temp.path(),
-            None,
             None,
             &[],
             false,
@@ -309,7 +362,7 @@ mod tests {
                 output: OutputMode::Terminal,
             },
         )
-        .expect("retry succeeds");
+        .unwrap();
         assert!(output.contains("1 completed"));
     }
 
@@ -319,17 +372,9 @@ mod tests {
         let temp = TempDir::new();
         let marker = temp.path().join("cleanup-ran");
         let marker_text = marker.to_string_lossy();
-        fs::write(
-            config_path(temp.path()),
-            format!(
-                "[package]\nname = \"app\"\n\n[pipelines.ci]\ntasks = [\"build\"]\nfinally = [\"cleanup\"]\n\n[tasks.build]\ncommand = [\"sh\", \"-c\", \"exit 7\"]\n\n[tasks.cleanup]\ncommand = [\"sh\", \"-c\", \"touch '{marker_text}'\"]\n"
-            ),
-        )
-        .expect("write manifest");
-
+        fs::write(config_path(temp.path()), format!("[project]\nname = \"fixture\"\n\n[pipelines.ci]\ntasks = [\"build\"]\nfinally = [\"cleanup\"]\n\n[tasks.build]\ncommand = [\"sh\", \"-c\", \"exit 7\"]\n\n[tasks.cleanup]\ncommand = [\"touch\", \"{marker_text}\"]\n")).unwrap();
         let error = run_pipeline_with_mode(
             temp.path(),
-            None,
             None,
             &[],
             false,
@@ -339,62 +384,45 @@ mod tests {
                 output: OutputMode::Terminal,
             },
         )
-        .expect_err("failed task remains a failed run");
+        .unwrap_err();
         assert!(matches!(error, CiError::Scheduler(_)));
-        assert!(marker.exists(), "finalizer did not run");
+        assert!(marker.exists());
     }
 
     #[cfg(unix)]
     #[test]
-    fn resource_groups_prevent_overlapping_tasks() {
+    fn finalizer_dependencies_run_after_a_normal_failure() {
         let temp = TempDir::new();
-        fs::write(
-            config_path(temp.path()),
-            "[workspace]\nname = \"fixture\"\nmembers = [\"packages/*\"]\n\n[pipelines.ci]\ntasks = [\"build\"]\n",
-        )
-        .expect("write root manifest");
-        let lock = temp.path().join("resource.lock");
-        let lock = lock.to_string_lossy();
-        for (name, command) in [
-            ("a", format!("touch '{lock}'; sleep 0.2; rm '{lock}'")),
-            ("b", format!("sleep 0.05; test ! -e '{lock}'")),
-        ] {
-            let package = temp.path().join("packages").join(name);
-            fs::create_dir_all(&package).expect("create package");
-            fs::write(
-                config_path(&package),
-                format!(
-                    "[package]\nname = \"{name}\"\n\n[tasks.build]\ncommand = [\"sh\", \"-c\", \"{command}\"]\nresource_group = \"integration\"\n"
-                ),
-            )
-            .expect("write package manifest");
-        }
-
-        run_pipeline_with_mode(
+        let marker = temp.path().join("cleanup-ran");
+        let marker_text = marker.to_string_lossy();
+        fs::write(config_path(temp.path()), format!("[project]\nname = \"fixture\"\n\n[pipelines.ci]\ntasks = [\"build\"]\nfinally = [\"cleanup\"]\n\n[tasks.build]\ncommand = [\"sh\", \"-c\", \"exit 7\"]\n\n[tasks.prepare-cleanup]\ncommand = [\"touch\", \"prepared\"]\n\n[tasks.cleanup]\ncommand = [\"sh\", \"-c\", \"test -f prepared && touch '{marker_text}'\"]\ndepends_on = [\"prepare-cleanup\"]\n")).unwrap();
+        let error = run_pipeline_with_mode(
             temp.path(),
-            None,
             None,
             &[],
             false,
-            2,
-            PipelineExecution::default(),
+            1,
+            PipelineExecution {
+                cache: CacheMode::NoCache,
+                output: OutputMode::Terminal,
+            },
         )
-        .expect("resource group serializes tasks");
+        .unwrap_err();
+        assert!(matches!(error, CiError::Scheduler(_)));
+        assert!(marker.exists(), "finalizer dependency closure did not run");
     }
 
     #[test]
-    fn rejects_zero_workers_before_loading_the_workspace() {
+    fn rejects_zero_workers_before_loading_the_project() {
         let error = run_pipeline_with_mode(
             Path::new("."),
-            None,
             None,
             &[],
             false,
             0,
             PipelineExecution::default(),
         )
-        .expect_err("zero workers are invalid");
-
+        .unwrap_err();
         assert!(matches!(error, CiError::InvalidJobs));
     }
 }

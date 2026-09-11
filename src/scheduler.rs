@@ -98,7 +98,22 @@ pub(crate) fn execute_plan(
     {
         assert!(active.len() <= jobs, "scheduler exceeded its worker limit");
         while active.len() < jobs {
-            let Some(node) = next_ready(&ready, &tasks, &active_groups, stopping) else {
+            let finalizers_allowed = if stopping {
+                !active.iter().any(|node| {
+                    !tasks
+                        .get(node)
+                        .expect("active task must exist in the validated plan")
+                        .is_finalizer()
+                })
+            } else {
+                tasks
+                    .iter()
+                    .filter(|(_, task)| !task.is_finalizer())
+                    .all(|(node, _)| results.contains_key(node))
+            };
+            let Some(node) =
+                next_ready(&ready, &tasks, &active_groups, stopping, finalizers_allowed)
+            else {
                 break;
             };
             ready.remove(&node);
@@ -184,6 +199,23 @@ pub(crate) fn execute_plan(
             WorkerReport::CacheFailed(error) => {
                 cache_error = Some(error);
                 stopping = true;
+                if let Some(children) = dependents.get(&node) {
+                    for child in children {
+                        if tasks
+                            .get(child)
+                            .expect("dependent must exist in the validated plan")
+                            .is_finalizer()
+                        {
+                            let count = remaining_dependencies
+                                .get_mut(child)
+                                .expect("dependent must exist in the validated plan");
+                            *count -= 1;
+                            if *count == 0 {
+                                ready.insert(child.clone());
+                            }
+                        }
+                    }
+                }
                 continue;
             }
         };
@@ -299,12 +331,16 @@ fn next_ready(
     tasks: &BTreeMap<TaskNode, Arc<PlannedTask>>,
     active_groups: &HashSet<String>,
     stopping: bool,
+    finalizers_allowed: bool,
 ) -> Option<TaskNode> {
     let available = |node: &TaskNode| {
         let task = tasks
             .get(node)
             .expect("ready task must exist in the validated plan");
         if stopping && !task.is_finalizer() {
+            return false;
+        }
+        if task.is_finalizer() && !finalizers_allowed {
             return false;
         }
         match task.resource_group() {
@@ -474,8 +510,8 @@ impl fmt::Display for SchedulerError {
             Self::Cache(error) => error.fmt(f),
             Self::UnresolvedDependency { task, dependency } => write!(
                 f,
-                "scheduler could not resolve '{}:{}' for '{}:{}'",
-                dependency.package, dependency.task, task.package, task.task
+                "scheduler could not resolve '{}' for '{}'",
+                dependency.id, task.id
             ),
             Self::NoReadyWork => write!(f, "scheduler found no ready task in the execution plan"),
             Self::Output(error) => write!(f, "could not write task output: {error}"),

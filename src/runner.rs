@@ -1,4 +1,4 @@
-//! Structured subprocess execution for workspace tasks.
+//! Structured subprocess execution for root-project tasks.
 
 use std::error::Error as StdError;
 use std::fmt;
@@ -35,7 +35,7 @@ pub struct TaskResult {
     pub cached: bool,
 }
 
-/// Executes package tasks without changing the process-global working directory.
+/// Executes root-project tasks without changing the process-global working directory.
 #[derive(Debug, Clone, Default)]
 pub struct Runner;
 
@@ -55,14 +55,14 @@ impl Runner {
                 .command()
                 .split_first()
                 .ok_or_else(|| RunnerError::EmptyCommand {
-                    package: planned.package().to_owned(),
+                    project: planned.project().to_owned(),
                     task: planned.task().to_owned(),
                 })?;
         assert!(planned.timeout() > Duration::ZERO);
         assert!(planned.max_output_bytes() > 0);
-        assert!(planned.package_path().starts_with(workspace_root));
+        assert!(planned.root().starts_with(workspace_root));
         assert!(planned.cwd().is_absolute());
-        assert!(planned.cwd().starts_with(planned.package_path()));
+        assert!(planned.cwd().starts_with(planned.root()));
 
         let started = Instant::now();
         let mut command = Command::new(program);
@@ -76,7 +76,7 @@ impl Runner {
 
         let mut managed =
             ManagedChild::spawn(&mut command).map_err(|source| RunnerError::Spawn {
-                package: planned.package().to_owned(),
+                project: planned.project().to_owned(),
                 task: planned.task().to_owned(),
                 command: planned.command().to_vec(),
                 cwd: planned.cwd().to_path_buf(),
@@ -128,20 +128,25 @@ impl Runner {
             if let Some(stream_name) = exceeded_stream {
                 // Terminate the tree so pipe-holding descendants release
                 // the readers, then join them and report the overflow.
-                let _ = managed.terminate_tree();
+                terminate_tree(
+                    &mut managed,
+                    planned.project(),
+                    planned.task(),
+                    "output limit",
+                )?;
                 managed.wait().map_err(|source| RunnerError::Wait {
-                    package: planned.package().to_owned(),
+                    project: planned.project().to_owned(),
                     task: planned.task().to_owned(),
                     source,
                 })?;
                 let joined = join_output(
-                    planned.package(),
+                    planned.project(),
                     planned.task(),
                     stdout_reader,
                     stderr_reader,
                 )?;
                 return Err(RunnerError::OutputLimit(Box::new(OutputLimitTask {
-                    package: planned.package().to_owned(),
+                    project: planned.project().to_owned(),
                     task: planned.task().to_owned(),
                     stream: stream_name,
                     limit: output_limit,
@@ -157,26 +162,31 @@ impl Runner {
                     // still holds a pipe open and we must terminate the tree
                     // to unblock the readers.
                     if reader_done.load(Ordering::Acquire) < 2 {
-                        let _ = managed.terminate_tree();
+                        terminate_tree(
+                            &mut managed,
+                            planned.project(),
+                            planned.task(),
+                            "descendant cleanup",
+                        )?;
                     }
                     break status;
                 }
                 Ok(WaitResult::Running) if started.elapsed() >= planned.timeout() => {
-                    let _ = managed.terminate_tree();
+                    terminate_tree(&mut managed, planned.project(), planned.task(), "timeout")?;
                     managed.wait().map_err(|source| RunnerError::Wait {
-                        package: planned.package().to_owned(),
+                        project: planned.project().to_owned(),
                         task: planned.task().to_owned(),
                         source,
                     })?;
                     let output = join_output(
-                        planned.package(),
+                        planned.project(),
                         planned.task(),
                         stdout_reader,
                         stderr_reader,
                     )?
                     .output;
                     return Err(RunnerError::TimedOut(Box::new(TimedOutTask {
-                        package: planned.package().to_owned(),
+                        project: planned.project().to_owned(),
                         task: planned.task().to_owned(),
                         command: planned.command().to_vec(),
                         cwd: planned.cwd().to_path_buf(),
@@ -191,11 +201,20 @@ impl Runner {
                     poll_interval = (poll_interval * 2).min(POLL_INTERVAL_MAX);
                 }
                 Err(source) => {
-                    let _ = managed.terminate_tree();
+                    if let Err(error) = terminate_tree(
+                        &mut managed,
+                        planned.project(),
+                        planned.task(),
+                        "wait error",
+                    ) {
+                        let _ = stdout_reader.join();
+                        let _ = stderr_reader.join();
+                        return Err(error);
+                    }
                     let _ = stdout_reader.join();
                     let _ = stderr_reader.join();
                     return Err(RunnerError::Wait {
-                        package: planned.package().to_owned(),
+                        project: planned.project().to_owned(),
                         task: planned.task().to_owned(),
                         source,
                     });
@@ -204,7 +223,7 @@ impl Runner {
         };
 
         let joined = join_output(
-            planned.package(),
+            planned.project(),
             planned.task(),
             stdout_reader,
             stderr_reader,
@@ -212,7 +231,7 @@ impl Runner {
         let elapsed = started.elapsed();
         if let Some(stream) = joined.exceeded_stream {
             return Err(RunnerError::OutputLimit(Box::new(OutputLimitTask {
-                package: planned.package().to_owned(),
+                project: planned.project().to_owned(),
                 task: planned.task().to_owned(),
                 stream,
                 limit: output_limit,
@@ -223,7 +242,7 @@ impl Runner {
         let output = joined.output;
         if !status.success() {
             return Err(RunnerError::Failed(Box::new(FailedTask {
-                package: planned.package().to_owned(),
+                project: planned.project().to_owned(),
                 task: planned.task().to_owned(),
                 command: planned.command().to_vec(),
                 cwd: planned.cwd().to_path_buf(),
@@ -249,6 +268,22 @@ struct StreamCapture {
 struct JoinedOutput {
     output: CapturedOutput,
     exceeded_stream: Option<&'static str>,
+}
+
+fn terminate_tree(
+    managed: &mut ManagedChild,
+    project: &str,
+    task: &str,
+    operation: &'static str,
+) -> Result<(), RunnerError> {
+    managed
+        .terminate_tree()
+        .map_err(|source| RunnerError::Terminate {
+            project: project.to_owned(),
+            task: task.to_owned(),
+            operation,
+            source,
+        })
 }
 
 fn read_stream(
@@ -284,7 +319,7 @@ fn read_stream(
 }
 
 fn join_output(
-    package: &str,
+    project: &str,
     task: &str,
     stdout_reader: thread::JoinHandle<io::Result<StreamCapture>>,
     stderr_reader: thread::JoinHandle<io::Result<StreamCapture>>,
@@ -293,7 +328,7 @@ fn join_output(
         .join()
         .expect("stdout reader thread panicked")
         .map_err(|source| RunnerError::OutputRead {
-            package: package.to_owned(),
+            project: project.to_owned(),
             task: task.to_owned(),
             stream: "stdout",
             source,
@@ -302,7 +337,7 @@ fn join_output(
         .join()
         .expect("stderr reader thread panicked")
         .map_err(|source| RunnerError::OutputRead {
-            package: package.to_owned(),
+            project: project.to_owned(),
             task: task.to_owned(),
             stream: "stderr",
             source,
@@ -323,7 +358,7 @@ fn join_output(
 /// Details shared by a process that exited unsuccessfully.
 #[derive(Debug)]
 pub struct FailedTask {
-    package: String,
+    project: String,
     task: String,
     command: Vec<String>,
     cwd: PathBuf,
@@ -335,7 +370,7 @@ pub struct FailedTask {
 /// Details shared by a process that exceeded its configured timeout.
 #[derive(Debug)]
 pub struct TimedOutTask {
-    package: String,
+    project: String,
     task: String,
     command: Vec<String>,
     cwd: PathBuf,
@@ -346,7 +381,7 @@ pub struct TimedOutTask {
 
 #[derive(Debug)]
 pub struct OutputLimitTask {
-    package: String,
+    project: String,
     task: String,
     stream: &'static str,
     limit: usize,
@@ -354,29 +389,35 @@ pub struct OutputLimitTask {
     elapsed: Duration,
 }
 
-/// Expected failures while spawning or executing a package task.
+/// Expected failures while spawning or executing a project task.
 #[derive(Debug)]
 pub enum RunnerError {
     EmptyCommand {
-        package: String,
+        project: String,
         task: String,
     },
     Spawn {
-        package: String,
+        project: String,
         task: String,
         command: Vec<String>,
         cwd: PathBuf,
         source: io::Error,
     },
     Wait {
-        package: String,
+        project: String,
         task: String,
         source: io::Error,
     },
     OutputRead {
-        package: String,
+        project: String,
         task: String,
         stream: &'static str,
+        source: io::Error,
+    },
+    Terminate {
+        project: String,
+        task: String,
+        operation: &'static str,
         source: io::Error,
     },
     OutputLimit(Box<OutputLimitTask>),
@@ -393,7 +434,8 @@ impl RunnerError {
             Self::EmptyCommand { .. }
             | Self::Spawn { .. }
             | Self::Wait { .. }
-            | Self::OutputRead { .. } => None,
+            | Self::OutputRead { .. }
+            | Self::Terminate { .. } => None,
         }
     }
 
@@ -405,7 +447,8 @@ impl RunnerError {
             Self::EmptyCommand { .. }
             | Self::Spawn { .. }
             | Self::Wait { .. }
-            | Self::OutputRead { .. } => None,
+            | Self::OutputRead { .. }
+            | Self::Terminate { .. } => None,
         }
     }
 }
@@ -413,41 +456,50 @@ impl RunnerError {
 impl fmt::Display for RunnerError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::EmptyCommand { package, task } => {
-                write!(f, "package '{package}' task '{task}' has an empty command")
+            Self::EmptyCommand { project, task } => {
+                write!(f, "project '{project}' task '{task}' has an empty command")
             }
             Self::Spawn {
-                package,
+                project,
                 task,
                 command,
                 cwd,
                 source,
             } => write!(
                 f,
-                "could not start {package}/{task} ({}) in {}: {source}",
+                "could not start {project}/{task} ({}) in {}: {source}",
                 format_command(command),
                 cwd.display()
             ),
             Self::Wait {
-                package,
+                project,
                 task,
                 source,
-            } => write!(f, "could not wait for {package}/{task}: {source}"),
+            } => write!(f, "could not wait for {project}/{task}: {source}"),
             Self::OutputRead {
-                package,
+                project,
                 task,
                 stream,
                 source,
-            } => write!(f, "could not read {stream} for {package}/{task}: {source}"),
+            } => write!(f, "could not read {stream} for {project}/{task}: {source}"),
+            Self::Terminate {
+                project,
+                task,
+                operation,
+                source,
+            } => write!(
+                f,
+                "could not terminate {project}/{task} during {operation}: {source}"
+            ),
             Self::OutputLimit(details) => write!(
                 f,
                 "{}/{} exceeded the {} output limit of {} bytes",
-                details.package, details.task, details.stream, details.limit
+                details.project, details.task, details.stream, details.limit
             ),
             Self::Failed(details) => write!(
                 f,
                 "{}/{} ({}) failed in {} with exit status {}",
-                details.package,
+                details.project,
                 details.task,
                 format_command(&details.command),
                 details.cwd.display(),
@@ -459,7 +511,7 @@ impl fmt::Display for RunnerError {
             Self::TimedOut(details) => write!(
                 f,
                 "{}/{} ({}) timed out after {}s in {}",
-                details.package,
+                details.project,
                 details.task,
                 format_command(&details.command),
                 details.timeout.as_secs(),
@@ -474,7 +526,8 @@ impl StdError for RunnerError {
         match self {
             Self::Spawn { source, .. }
             | Self::Wait { source, .. }
-            | Self::OutputRead { source, .. } => Some(source),
+            | Self::OutputRead { source, .. }
+            | Self::Terminate { source, .. } => Some(source),
             _ => None,
         }
     }
@@ -508,32 +561,23 @@ mod tests {
 
     fn workspace_with_task(command: &str, timeout_seconds: Option<u64>) -> (TempDir, Workspace) {
         let temp = TempDir::new();
-        fs::write(
-            config_path(temp.path()),
-            "[workspace]\nname = \"fixture\"\nmembers = [\"packages/*\"]\n\n[pipelines.ci]\ntasks = [\"build\"]\n",
-        )
-        .expect("write root manifest");
-        let package = temp.path().join("packages/app");
-        fs::create_dir_all(&package).expect("create package");
         let timeout = timeout_seconds
             .map(|seconds| format!("timeout_seconds = {seconds}\n"))
             .unwrap_or_default();
         fs::write(
-            config_path(&package),
-            format!(
-                "[package]\nname = \"app\"\n\n[tasks.build]\ncommand = [\"sh\", \"-c\", \"{command}\"]\n{timeout}"
-            ),
+            config_path(temp.path()),
+            format!("[project]\nname = \"fixture\"\n\n[pipelines.ci]\ntasks = [\"build\"]\n\n[tasks.build]\ncommand = [\"sh\", \"-c\", \"{command}\"]\n{timeout}"),
         )
-        .expect("write package manifest");
-        let workspace = Workspace::load(temp.path()).expect("workspace loads");
-        (temp, workspace)
+        .expect("write project manifest");
+        let project = Workspace::load(temp.path()).expect("project loads");
+        (temp, project)
     }
 
     #[cfg(unix)]
     #[test]
     fn runs_a_task_and_returns_captured_output_without_printing() {
         let (_temp, workspace) = workspace_with_task("printf stdout; printf stderr >&2", None);
-        let plan = workspace.plan(None, None, &[]).expect("plan succeeds");
+        let plan = workspace.plan(None, &[]).expect("plan succeeds");
         let result = Runner::new()
             .run(&workspace.root, &plan[0])
             .expect("task succeeds");
@@ -546,12 +590,12 @@ mod tests {
     #[test]
     fn returns_failed_task_output_for_the_presenter() {
         let (_temp, workspace) = workspace_with_task("printf failed >&2; exit 7", None);
-        let plan = workspace.plan(None, None, &[]).expect("plan succeeds");
+        let plan = workspace.plan(None, &[]).expect("plan succeeds");
         let error = Runner::new()
             .run(&workspace.root, &plan[0])
             .expect_err("task must fail");
 
-        assert!(error.to_string().contains("app/build"));
+        assert!(error.to_string().contains("project/build"));
         assert_eq!(
             error.output().expect("failed output is captured").stderr,
             b"failed"
@@ -562,7 +606,7 @@ mod tests {
     #[test]
     fn terminates_a_task_that_exceeds_its_timeout() {
         let (_temp, workspace) = workspace_with_task("sleep 2", Some(1));
-        let plan = workspace.plan(None, None, &[]).expect("plan succeeds");
+        let plan = workspace.plan(None, &[]).expect("plan succeeds");
         let error = Runner::new()
             .run(&workspace.root, &plan[0])
             .expect_err("task must time out");
@@ -581,7 +625,7 @@ mod tests {
             &format!("(sleep 5; printf leaked > '{marker_text}') & wait"),
             Some(1),
         );
-        let plan = workspace.plan(None, None, &[]).expect("plan succeeds");
+        let plan = workspace.plan(None, &[]).expect("plan succeeds");
 
         let error = Runner::new()
             .run(&workspace.root, &plan[0])
@@ -611,7 +655,7 @@ mod tests {
             ),
             None,
         );
-        let plan = workspace.plan(None, None, &[]).expect("plan succeeds");
+        let plan = workspace.plan(None, &[]).expect("plan succeeds");
         Runner::new()
             .run(&workspace.root, &plan[0])
             .expect("task succeeds");
@@ -628,14 +672,11 @@ mod tests {
     fn stops_and_reports_when_task_output_exceeds_the_limit() {
         let (_temp, mut workspace) = workspace_with_task("printf 123456789", None);
         workspace
-            .packages
-            .get_mut("app")
-            .expect("fixture package exists")
             .tasks
             .get_mut("build")
             .expect("fixture task exists")
             .max_output_bytes = 8;
-        let plan = workspace.plan(None, None, &[]).expect("plan succeeds");
+        let plan = workspace.plan(None, &[]).expect("plan succeeds");
         let error = Runner::new()
             .run(&workspace.root, &plan[0])
             .expect_err("task output must be bounded");
@@ -671,13 +712,13 @@ mod tests {
         fs::write(
             config_path(temp.path()),
             format!(
-                "[package]\nname = \"app\"\n\n[pipelines.ci]\ntasks = [\"build\"]\n\n[tasks.build]\ncommand = [\"cmd\", \"/c\", \"spawn_and_exit.bat\"]\n"
+                "[project]\nname = \"app\"\n\n[pipelines.ci]\ntasks = [\"build\"]\n\n[tasks.build]\ncommand = [\"cmd\", \"/c\", \"spawn_and_exit.bat\"]\n"
             ),
         )
         .expect("write manifest");
 
         let workspace = Workspace::load(temp.path()).expect("workspace loads");
-        let plan = workspace.plan(None, None, &[]).expect("plan succeeds");
+        let plan = workspace.plan(None, &[]).expect("plan succeeds");
         Runner::new()
             .run(&workspace.root, &plan[0])
             .expect("task succeeds");

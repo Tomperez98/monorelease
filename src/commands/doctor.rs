@@ -1,4 +1,4 @@
-//! `mono doctor` — validate the complete workspace manifest graph.
+//! `mono doctor` — validate the complete root-project task graph.
 
 use std::error::Error as StdError;
 use std::fmt;
@@ -6,7 +6,7 @@ use std::path::Path;
 
 use crate::workspace::{Workspace, WorkspaceError};
 
-/// Validate that `dir` resolves to a healthy manifest-driven workspace.
+/// Validate that `dir` resolves to a healthy root-project manifest.
 pub fn doctor(dir: &Path) -> Result<(), DoctorError> {
     Workspace::load(dir)?;
     Ok(())
@@ -48,20 +48,13 @@ mod tests {
     use std::fs;
 
     #[test]
-    fn validates_a_root_and_package_manifest() {
+    fn validates_a_root_project_manifest() {
         let temp = TempDir::new();
         fs::write(
             config_path(temp.path()),
-            "[workspace]\nname = \"fixture\"\nmembers = [\"packages/*\"]\n\n[pipelines.ci]\ntasks = [\"build\", \"test\"]\n",
+            "[project]\nname = \"fixture\"\n\n[pipelines.ci]\ntasks = [\"build\", \"test\"]\n\n[tasks.build]\ncommand = [\"echo\", \"app\"]\n\n[tasks.test]\ncommand = [\"echo\", \"app\"]\n",
         )
-        .expect("write root manifest");
-        let package = temp.path().join("packages/app");
-        fs::create_dir_all(&package).expect("create package");
-        fs::write(
-            config_path(&package),
-            "[package]\nname = \"app\"\n\n[tasks.build]\ncommand = [\"echo\", \"app\"]\n\n[tasks.test]\ncommand = [\"echo\", \"app\"]\n",
-        )
-        .expect("write package manifest");
+        .expect("write project manifest");
 
         doctor(temp.path()).expect("doctor succeeds");
     }

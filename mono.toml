@@ -1,12 +1,12 @@
-[package]
+schema = 1
+
+[project]
 name = "mono"
+default_pipeline = "ci"
 
 [pipelines.ci]
 tasks = ["changelog-validate", "fmt", "check", "test", "clippy"]
 
-# Release gates. `.github/workflows/release.yml` runs this pipeline before it
-# builds anything, and `release_validate.yml` runs it again with the published
-# binary against the released tag.
 [pipelines.release]
 tasks = ["release-verify"]
 
@@ -33,20 +33,14 @@ command = ["cargo", "clippy", "--workspace", "--all-targets", "--all-features", 
 depends_on = ["test"]
 timeout_seconds = 120
 
-# Turn CHANGELOG.md into RELEASE_NOTES.md for the tag in RELEASE_TAG. The
-# workflow uploads the file and publishes it with `gh release create`.
 [tasks.release-notes]
 command = ["cargo", "run", "--locked", "--quiet", "--", "changelog", "notes"]
 timeout_seconds = 60
 
-# Preparation, run by hand before a release:
-#   mono changelog scaffold --version 0.1.2
 [tasks.changelog]
 command = ["cargo", "run", "--locked", "--quiet", "--", "changelog", "scaffold"]
 timeout_seconds = 60
 
-# The release gate: the binary must report the version it claims, accept this
-# repository's manifests, and behave on the examples.
 [tasks.release-verify]
 command = ["cargo", "run", "--locked", "--quiet", "-p", "xtask", "--", "verify"]
 depends_on = ["release-notes"]

@@ -7,6 +7,7 @@
 use std::io::{self, Write};
 use std::path::Path;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::events::{ExecutionEvent, TaskStatus, TaskStream};
 use crate::runner::{RunnerError, TaskResult};
@@ -29,6 +30,8 @@ pub enum OutputMode {
 pub(crate) struct OutputSink {
     mode: OutputMode,
     lock: Mutex<()>,
+    run_id: u64,
+    sequence: AtomicU64,
     #[cfg(test)]
     json_lines: Option<std::sync::Arc<std::sync::Mutex<Vec<String>>>>,
 }
@@ -38,6 +41,8 @@ impl OutputSink {
         Self {
             mode,
             lock: Mutex::new(()),
+            run_id: run_identity(),
+            sequence: AtomicU64::new(0),
             #[cfg(test)]
             json_lines: None,
         }
@@ -139,12 +144,22 @@ impl OutputSink {
         summary: &crate::scheduler::ExecutionSummary,
     ) -> io::Result<()> {
         let _guard = self.lock.lock().expect("output lock is not poisoned");
-        self.render_event(&ExecutionEvent::run_finished(
-            summary.completed,
-            summary.cached,
-            summary.failed,
-            summary.blocked,
-        ))
+
+        // `run_pipeline_with_mode` returns the human-readable summary to the
+        // CLI transport, which writes it once to stdout. JSON must receive the
+        // lifecycle event here because the transport deliberately returns no
+        // second summary line in that mode. Avoid sending a second terminal or
+        // GitHub Actions summary to stderr/stdout from the scheduler.
+        if self.mode == OutputMode::Json {
+            self.render_event(&ExecutionEvent::run_finished(
+                summary.completed,
+                summary.cached,
+                summary.failed,
+                summary.blocked,
+            ))
+        } else {
+            Ok(())
+        }
     }
 
     fn render_event(&self, event: &ExecutionEvent) -> io::Result<()> {
@@ -153,7 +168,12 @@ impl OutputSink {
                 #[cfg(test)]
                 if let Some(ref lines) = self.json_lines {
                     let mut buf = Vec::new();
-                    write_json_event(event, &mut buf)?;
+                    write_json_event_with_identity(
+                        event,
+                        self.run_id,
+                        self.sequence.fetch_add(1, Ordering::Relaxed),
+                        &mut buf,
+                    )?;
                     let line = String::from_utf8(buf).map_err(|_| {
                         io::Error::new(io::ErrorKind::InvalidData, "non-UTF-8 JSON")
                     })?;
@@ -161,7 +181,12 @@ impl OutputSink {
                     return Ok(());
                 }
                 let mut stdout = io::stdout().lock();
-                write_json_event(event, &mut stdout)
+                write_json_event_with_identity(
+                    event,
+                    self.run_id,
+                    self.sequence.fetch_add(1, Ordering::Relaxed),
+                    &mut stdout,
+                )
             }
             OutputMode::Terminal => self.render_terminal(event),
             OutputMode::GithubActions => self.render_github_actions(event),
@@ -171,25 +196,20 @@ impl OutputSink {
     fn render_terminal(&self, event: &ExecutionEvent) -> io::Result<()> {
         let mut stderr = io::stderr().lock();
         match event {
-            ExecutionEvent::TaskStarted { package, task, .. } => {
-                writeln!(stderr, "▶ {package}:{task}")
+            ExecutionEvent::TaskStarted { task, .. } => {
+                writeln!(stderr, "▶ {task}")
             }
             ExecutionEvent::TaskOutput { .. } => {
                 let _ = event;
                 Ok(())
             }
             ExecutionEvent::TaskFinished {
-                package,
                 task,
                 status,
                 elapsed_ms,
                 ..
             } => {
-                writeln!(
-                    stderr,
-                    "{package}:{task}: {} in {elapsed_ms}ms",
-                    status.label()
-                )
+                writeln!(stderr, "{task}: {} in {elapsed_ms}ms", status.label())
             }
             ExecutionEvent::RunFinished {
                 completed,
@@ -207,10 +227,10 @@ impl OutputSink {
 
     fn render_github_actions(&self, event: &ExecutionEvent) -> io::Result<()> {
         match event {
-            ExecutionEvent::TaskStarted { package, task, .. } => {
+            ExecutionEvent::TaskStarted { task, .. } => {
                 let mut stdout = io::stdout().lock();
-                writeln!(stdout, "::group::{package}:{task}")?;
-                writeln!(stdout, "▶ {package}:{task}")?;
+                writeln!(stdout, "::group::{task}")?;
+                writeln!(stdout, "▶ {task}")?;
                 stdout.flush()
             }
             ExecutionEvent::TaskOutput { bytes, stream, .. } => {
@@ -228,18 +248,13 @@ impl OutputSink {
                 }
             }
             ExecutionEvent::TaskFinished {
-                package,
                 task,
                 status,
                 elapsed_ms,
                 ..
             } => {
                 let mut stdout = io::stdout().lock();
-                writeln!(
-                    stdout,
-                    "{package}:{task}: {} in {elapsed_ms}ms",
-                    status.label()
-                )?;
+                writeln!(stdout, "{task}: {} in {elapsed_ms}ms", status.label())?;
                 writeln!(stdout, "::endgroup::")?;
                 stdout.flush()
             }
@@ -298,9 +313,44 @@ impl OutputSink {
     }
 }
 
+#[derive(serde::Serialize)]
+struct JsonEvent<'a> {
+    run_id: u64,
+    sequence: u64,
+    #[serde(flatten)]
+    event: &'a ExecutionEvent,
+}
+
+#[cfg(test)]
 fn write_json_event(event: &ExecutionEvent, writer: &mut impl Write) -> io::Result<()> {
     serde_json::to_writer(&mut *writer, event).map_err(io::Error::other)?;
     writer.write_all(b"\n")
+}
+
+fn write_json_event_with_identity(
+    event: &ExecutionEvent,
+    run_id: u64,
+    sequence: u64,
+    writer: &mut impl Write,
+) -> io::Result<()> {
+    serde_json::to_writer(
+        &mut *writer,
+        &JsonEvent {
+            run_id,
+            sequence,
+            event,
+        },
+    )
+    .map_err(io::Error::other)?;
+    writer.write_all(b"\n")
+}
+
+fn run_identity() -> u64 {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock is after the epoch")
+        .as_nanos();
+    (nanos as u64) ^ u64::from(std::process::id())
 }
 
 fn write_bytes(bytes: &[u8], to_stderr: bool) -> io::Result<()> {
@@ -338,14 +388,13 @@ mod tests {
         let sink = OutputSink {
             mode: OutputMode::Json,
             lock: Mutex::new(()),
+            run_id: 1,
+            sequence: AtomicU64::new(0),
             json_lines: Some(lines.clone()),
         };
 
-        sink.present_start(&TaskNode {
-            package: "app".to_owned(),
-            task: "build".to_owned(),
-        })
-        .expect("start event writes");
+        sink.present_start(&TaskNode::new("build"))
+            .expect("start event writes");
 
         let captured = lines.lock().unwrap();
         assert_eq!(captured.len(), 1);
@@ -353,7 +402,6 @@ mod tests {
             serde_json::from_str(&captured[0]).expect("valid JSON event");
         assert_eq!(event["event"], "task_started");
         assert_eq!(event["schema"], crate::events::EXECUTION_EVENT_SCHEMA);
-        assert_eq!(event["package"], "app");
         assert_eq!(event["task"], "build");
     }
 
@@ -363,6 +411,8 @@ mod tests {
         let sink = OutputSink {
             mode: OutputMode::Json,
             lock: Mutex::new(()),
+            run_id: 1,
+            sequence: AtomicU64::new(0),
             json_lines: Some(lines.clone()),
         };
 
@@ -383,6 +433,8 @@ mod tests {
         let sink = OutputSink {
             mode: OutputMode::Json,
             lock: Mutex::new(()),
+            run_id: 1,
+            sequence: AtomicU64::new(0),
             json_lines: Some(lines.clone()),
         };
 
@@ -410,6 +462,8 @@ mod tests {
         let sink = OutputSink {
             mode: OutputMode::Json,
             lock: Mutex::new(()),
+            run_id: 1,
+            sequence: AtomicU64::new(0),
             json_lines: Some(lines.clone()),
         };
 
@@ -435,13 +489,12 @@ mod tests {
         let sink = OutputSink {
             mode: OutputMode::Json,
             lock: Mutex::new(()),
+            run_id: 1,
+            sequence: AtomicU64::new(0),
             json_lines: Some(lines.clone()),
         };
 
-        let node = TaskNode {
-            package: "app".to_owned(),
-            task: "build".to_owned(),
-        };
+        let node = TaskNode::new("build");
 
         let result = TaskResult {
             output: crate::runner::CapturedOutput {
@@ -463,7 +516,6 @@ mod tests {
             serde_json::from_str(&captured[0]).expect("valid JSON event");
         assert_eq!(event["event"], "task_output");
         assert_eq!(event["stream"], "stdout");
-        assert_eq!(event["package"], "app");
         assert_eq!(event["task"], "build");
 
         let event: serde_json::Value =
@@ -479,13 +531,12 @@ mod tests {
         let sink = OutputSink {
             mode: OutputMode::Json,
             lock: Mutex::new(()),
+            run_id: 1,
+            sequence: AtomicU64::new(0),
             json_lines: Some(lines.clone()),
         };
 
-        let node = TaskNode {
-            package: "app".to_owned(),
-            task: "build".to_owned(),
-        };
+        let node = TaskNode::new("build");
 
         // Bytes that are not valid UTF-8: null byte (0), raw byte 255, newline (10)
         let result = TaskResult {
@@ -547,7 +598,6 @@ mod tests {
 
         let event = ExecutionEvent::TaskOutput {
             schema: crate::events::EXECUTION_EVENT_SCHEMA,
-            package: "app".to_owned(),
             task: "build".to_owned(),
             stream: TaskStream::Stdout,
             bytes: vec![0u8, 255u8, 10u8],

@@ -56,12 +56,6 @@ jobs:
           }
 
           checkout_commit="$(git rev-parse HEAD)"
-          tag_commit="$(git rev-parse "$RELEASE_TAG^{commit}")"
-          test "$checkout_commit" = "$tag_commit" || {
-            echo "checked out $checkout_commit, but $RELEASE_TAG resolves to $tag_commit" >&2
-            exit 1
-          }
-
           tag_object=''
           if [[ "$(git cat-file -t "$RELEASE_TAG")" == tag ]]; then
             tag_object="$(git rev-parse "$RELEASE_TAG^{tag}")"
@@ -92,6 +86,12 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-
+
+      - name: Verify release source with Mono
+        run: |
+          cargo run --locked --quiet -- release source \
+            --tag "$RELEASE_TAG" \
+            --commit "$(git rev-parse HEAD)"
 
       - name: Check tag matches Cargo package version
         shell: bash

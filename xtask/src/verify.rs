@@ -20,7 +20,7 @@ const WORKLOADS: &[(&str, &[&str])] = &[
             "--dir",
             "examples/echo",
             "task",
-            "build",
+            "app-build",
             "--jobs",
             "2",
             "--no-cache",
@@ -41,7 +41,7 @@ const WORKLOADS: &[(&str, &[&str])] = &[
 ];
 
 const PLAN: &[&str] = &["--dir", "examples/release-gate", "plan", "release"];
-const PLAN_EXPECTED: &str = "workspace:release-verify";
+const PLAN_EXPECTED: &str = "release-verify";
 
 pub fn run(tag: &Tag, binary: &Path) -> Result<(), Error> {
     if !binary.exists() {
