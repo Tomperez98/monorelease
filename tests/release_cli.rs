@@ -8,10 +8,8 @@ struct TempDir(PathBuf);
 
 impl TempDir {
     fn new(name: &str) -> Self {
-        let path = std::env::temp_dir().join(format!(
-            "monorelease-release-cli-{}-{name}",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("mono-release-cli-{}-{name}", std::process::id()));
         let _ = fs::remove_dir_all(&path);
         fs::create_dir_all(&path).expect("create temp directory");
         Self(path)
@@ -28,12 +26,12 @@ impl Drop for TempDir {
     }
 }
 
-fn monorelease(args: &[&str], cwd: &Path) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_monorelease"))
+fn mono(args: &[&str], cwd: &Path) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_mono"))
         .args(args)
         .current_dir(cwd)
         .output()
-        .expect("run monorelease")
+        .expect("run mono")
 }
 
 #[test]
@@ -45,10 +43,10 @@ fn changelog_commands_validate_scaffold_and_render_notes() {
     )
     .unwrap();
 
-    let validate = monorelease(&["changelog", "validate"], temp.path());
+    let validate = mono(&["changelog", "validate"], temp.path());
     assert!(validate.status.success(), "validate failed: {validate:?}");
 
-    let notes = monorelease(
+    let notes = mono(
         &[
             "changelog",
             "notes",
@@ -66,7 +64,7 @@ fn changelog_commands_validate_scaffold_and_render_notes() {
             .contains("- Shipped.")
     );
 
-    let scaffold = monorelease(
+    let scaffold = mono(
         &["changelog", "scaffold", "--version", "1.1.0"],
         temp.path(),
     );
@@ -85,7 +83,7 @@ fn release_commands_create_and_verify_file_artifacts() {
     fs::write(temp.path().join("dist/app.tar.gz"), b"app").unwrap();
     fs::write(temp.path().join("dist/nested/license"), b"license").unwrap();
 
-    let manifest = monorelease(
+    let manifest = mono(
         &[
             "release",
             "manifest",
@@ -102,7 +100,7 @@ fn release_commands_create_and_verify_file_artifacts() {
     assert!(temp.path().join("dist/BUILD-METADATA.json").is_file());
     assert!(temp.path().join("dist/SHA256SUMS").is_file());
 
-    let verify = monorelease(
+    let verify = mono(
         &[
             "release",
             "verify",

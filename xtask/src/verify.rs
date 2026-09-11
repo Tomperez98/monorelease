@@ -2,7 +2,7 @@
 //!
 //! These gates assert claims made by this repository's release. Generic
 //! changelog, source, checksum, and artifact-manifest checks are provided by
-//! the published `monorelease` CLI instead of being duplicated here.
+//! the published `mono` CLI instead of being duplicated here.
 
 use std::path::Path;
 
@@ -46,7 +46,7 @@ const PLAN_EXPECTED: &str = "workspace:release-verify";
 pub fn run(tag: &Tag, binary: &Path) -> Result<(), Error> {
     if !binary.exists() {
         return Err(Error::Invalid(format!(
-            "{} does not exist; run `cargo build` or set MONORELEASE_BIN",
+            "{} does not exist; run `cargo build` or set MONO_BIN",
             binary.display()
         )));
     }
@@ -65,7 +65,7 @@ pub fn run(tag: &Tag, binary: &Path) -> Result<(), Error> {
 fn identity(tag: &Tag, binary: &Path) -> Result<(), Error> {
     let output = capture(binary, &["--version"])?;
     let reported = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-    let expected = format!("monorelease {}", tag.version);
+    let expected = format!("mono {}", tag.version);
 
     if !output.status.success() || reported != expected {
         return Err(Error::Command(format!(

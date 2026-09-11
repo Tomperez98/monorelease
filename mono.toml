@@ -1,5 +1,5 @@
 [package]
-name = "monorelease"
+name = "mono"
 
 [pipelines.ci]
 tasks = ["fmt", "check", "test", "clippy"]
@@ -36,7 +36,7 @@ command = ["cargo", "run", "--locked", "--quiet", "--", "changelog", "notes"]
 timeout_seconds = 60
 
 # Preparation, run by hand before a release:
-#   monorelease changelog scaffold --version 0.1.2
+#   mono changelog scaffold --version 0.1.2
 [tasks.changelog]
 command = ["cargo", "run", "--locked", "--quiet", "--", "changelog", "scaffold"]
 timeout_seconds = 60

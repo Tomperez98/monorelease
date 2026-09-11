@@ -1,4 +1,4 @@
-//! `monorelease init` — scaffold a fresh repository.
+//! `mono init` — scaffold a fresh repository.
 
 use std::error::Error as StdError;
 use std::fmt;
@@ -8,14 +8,14 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::config::{CONFIG_FILE_NAME, MonorepoConfig, config_path, render_config};
+use crate::config::{CONFIG_FILE_NAME, MonoConfig, config_path, render_config};
 
-/// Create `dir` if needed and write a fresh monorepo [`MonorepoConfig`] into it.
+/// Create `dir` if needed and write a fresh [`MonoConfig`] into it.
 ///
 /// Returns the config file that was written. Refuses to touch an existing
 /// config, so a mistyped `init` can never destroy a real one.
 pub fn init(dir: &Path) -> Result<PathBuf, InitError> {
-    write_config(dir, render_config(&MonorepoConfig::template()))
+    write_config(dir, render_config(&MonoConfig::template()))
 }
 
 /// Create a standalone project config using one caller-supplied command.
@@ -25,7 +25,7 @@ pub fn init_standalone(dir: &Path, command: Vec<String>) -> Result<PathBuf, Init
     }
     write_config(
         dir,
-        render_config(&MonorepoConfig::standalone_template(
+        render_config(&MonoConfig::standalone_template(
             "project".to_owned(),
             command,
         )),
@@ -137,9 +137,9 @@ mod tests {
     use crate::config::CONFIG_FILE_NAME;
     use crate::testing::TempDir;
 
-    fn read_config(path: &Path) -> MonorepoConfig {
+    fn read_config(path: &Path) -> MonoConfig {
         let contents = fs::read_to_string(path).expect("config is readable");
-        MonorepoConfig::parse(&contents).expect("config parses")
+        MonoConfig::parse(&contents).expect("config parses")
     }
 
     #[test]
@@ -150,7 +150,7 @@ mod tests {
         let written = init(&target).expect("init succeeds");
 
         assert_eq!(written, target.join(CONFIG_FILE_NAME));
-        assert_eq!(read_config(&written), MonorepoConfig::template());
+        assert_eq!(read_config(&written), MonoConfig::template());
     }
 
     #[test]

@@ -1,7 +1,7 @@
 //! Project-specific release gates for this repository.
 //!
 //! Generic changelog, release-source, checksum, and artifact-manifest
-//! operations live in the published `monorelease` CLI. This binary retains
+//! operations live in the published `mono` CLI. This binary retains
 //! only checks that are specific to this repository: the binary's behavior,
 //! examples, and release plan.
 
@@ -15,16 +15,16 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use monorelease::Version;
+use mono::Version;
 
 const VERIFY_COMPONENT: &str = "release-verify";
-const BINARY_DEFAULT: &str = "target/debug/monorelease";
+const BINARY_DEFAULT: &str = "target/debug/mono";
 
 #[derive(Parser)]
 #[command(
     name = "xtask",
     version,
-    about = "Repository-specific release gates for monorelease",
+    about = "Repository-specific release gates for mono",
     after_help = "Run `cargo run -p xtask -- verify` for the release gates."
 )]
 struct Cli {
@@ -34,7 +34,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Run this repository's gates against the binary in MONORELEASE_BIN.
+    /// Run this repository's gates against the binary in MONO_BIN.
     Verify,
 }
 
@@ -99,7 +99,7 @@ fn verify_command() -> Result<(), Error> {
 }
 
 fn binary_path() -> PathBuf {
-    path_from_env("MONORELEASE_BIN", BINARY_DEFAULT)
+    path_from_env("MONO_BIN", BINARY_DEFAULT)
 }
 
 fn path_from_env(name: &str, default: &str) -> PathBuf {

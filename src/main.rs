@@ -1,7 +1,7 @@
-//! `monorelease` — language agnostic project and monorepo tooling.
+//! `mono` — language agnostic project and workspace tooling.
 //!
 //! This is the transport edge: it parses the command line, calls into
-//! [`monorelease`], and maps the single error vocabulary onto stdout, stderr,
+//! [`mono`], and maps the single error vocabulary onto stdout, stderr,
 //! and an exit code — in exactly one place.
 //!
 //! Every argument is validated while parsing, so [`run`] only ever sees
@@ -13,7 +13,7 @@
 //! | `0`  | the command succeeded                                        |
 //! | `1`  | the command was understood and failed                        |
 //! | `2`  | the command line was wrong; emitted by `clap` while parsing  |
-//! | `3`  | `monorelease` or its environment failed                      |
+//! | `3`  | `mono` or its environment failed                      |
 
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -21,7 +21,7 @@ use std::process::ExitCode;
 
 use clap::builder::NonEmptyStringValueParser;
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use monorelease::{
+use mono::{
     CacheMode, ChangelogError, CiError, DEFAULT_CHANGELOG_PATH, DEFAULT_RELEASE_DIRECTORY,
     DEFAULT_RELEASE_NOTES_PATH, Error, InitError, OutputMode, PipelineExecution,
     ReleaseCommandError, ReleaseError, ReleaseIdentity, SchedulerError, changelog_notes,
@@ -30,13 +30,13 @@ use monorelease::{
 
 #[derive(Parser)]
 #[command(
-    name = "monorelease",
+    name = "mono",
     version = env!("CARGO_PKG_VERSION"),
-    about = "Language agnostic project and monorepo tooling",
-    after_help = "Run `monorelease help <command>` for command details."
+    about = "Language agnostic project and workspace tooling",
+    after_help = "Run `mono help <command>` for command details."
 )]
 struct Cli {
-    /// Project or monorepo directory.
+    /// Project or workspace directory.
     #[arg(long = "dir", global = true, default_value = ".")]
     root: PathBuf,
     #[command(subcommand)]
@@ -100,7 +100,7 @@ impl Default for ExecutionOptions {
 enum Commands {
     /// Write a fresh manifest in the selected directory.
     Init {
-        /// Create a standalone project instead of a monorepo workspace.
+        /// Create a standalone project instead of a workspace.
         #[arg(long)]
         standalone: bool,
         /// Command argument used by the generated standalone build task.
@@ -117,7 +117,7 @@ enum Commands {
     Run {
         #[arg(value_name = "PIPELINE", value_parser = NonEmptyStringValueParser::new())]
         pipeline: Option<String>,
-        /// Compatibility spelling for task selection; prefer `monorelease task`.
+        /// Compatibility spelling for task selection; prefer `mono task`.
         #[arg(long = "task", hide = true, value_parser = NonEmptyStringValueParser::new())]
         tasks: Vec<String>,
         #[command(flatten)]
@@ -134,7 +134,7 @@ enum Commands {
         #[command(flatten)]
         options: ExecutionOptions,
     },
-    /// Validate the selected project or monorepo.
+    /// Validate the selected project or workspace.
     #[command(alias = "doctor")]
     Check,
     /// List pipelines, packages, tasks, and common commands.
@@ -294,7 +294,7 @@ const EXIT_FAILED: u8 = 1;
 /// here for the one usage failure the library owns.
 const EXIT_USAGE: u8 = 2;
 
-/// Exit code for `monorelease` or its environment failing.
+/// Exit code for `mono` or its environment failing.
 const EXIT_TOOL: u8 = 3;
 
 /// Worker count used when `--jobs` is omitted.
@@ -333,7 +333,7 @@ fn main() -> ExitCode {
 
 /// Write a command's summary to `sink`.
 ///
-/// A consumer that hangs up early — `monorelease plan | head` — closes the pipe
+/// A consumer that hangs up early — `mono plan | head` — closes the pipe
 /// before this write lands. That is an expected outcome, not a broken
 /// invariant, so it is reported as success instead of panicking the way
 /// `println!` would over the process-global handle. Taking `sink` as an
@@ -343,7 +343,7 @@ fn emit_summary(sink: &mut impl Write, summary: &str) -> u8 {
         Ok(()) => 0,
         Err(error) if error.kind() == io::ErrorKind::BrokenPipe => 0,
         Err(error) => {
-            let _ = writeln!(io::stderr().lock(), "monorelease: {error}");
+            let _ = writeln!(io::stderr().lock(), "mono: {error}");
             EXIT_TOOL
         }
     }
@@ -354,14 +354,14 @@ fn emit_summary(sink: &mut impl Write, summary: &str) -> u8 {
 /// A closed stderr must never mask the failure, so the write is best effort and
 /// the code comes from the error alone.
 fn emit_error(sink: &mut impl Write, error: &Error) -> u8 {
-    let _ = writeln!(sink, "monorelease: {error}");
+    let _ = writeln!(sink, "mono: {error}");
     exit_code(error)
 }
 
 /// Map the single error vocabulary onto this CLI's exit code, once.
 ///
 /// The vocabulary splits into two kinds of failure: the command was understood
-/// and the request failed (`1`), or `monorelease` and its environment failed to
+/// and the request failed (`1`), or `mono` and its environment failed to
 /// carry it out (`3`). `clap` rejects a malformed command line with `2` before
 /// this runs; the one usage failure the library owns is classified here too.
 fn exit_code(error: &Error) -> u8 {
@@ -375,7 +375,7 @@ fn exit_code(error: &Error) -> u8 {
         //
         // `WorkspaceError::Io` is overloaded: it covers failing to read a
         // manifest *and* failing to resolve a directory the manifest declares,
-        // such as a task `cwd`. The second is exactly the defect `monorelease
+        // such as a task `cwd`. The second is exactly the defect `mono
         // check` exists to report, so the variant cannot be split by exit code
         // here. A genuine environment failure surfaces as a write error, which
         // is classified in `init_exit_code`, `changelog_exit_code`, and
@@ -485,9 +485,9 @@ fn run_default_pipeline(root: &Path) -> Result<String, Error> {
 
 fn run_init(root: &Path, standalone: bool, command: Vec<String>) -> Result<String, Error> {
     let written = if standalone {
-        monorelease::init_standalone(root, command)?
+        mono::init_standalone(root, command)?
     } else {
-        monorelease::init(root)?
+        mono::init(root)?
     };
     Ok(format!("initialized {}", written.display()))
 }
@@ -499,7 +499,7 @@ fn execute_pipeline(
     tasks: &[String],
     options: ExecutionOptions,
 ) -> Result<String, Error> {
-    Ok(monorelease::run_pipeline_with_mode(
+    Ok(mono::run_pipeline_with_mode(
         root,
         pipeline,
         options.package.as_deref(),
@@ -514,25 +514,25 @@ fn execute_pipeline(
 }
 
 fn run_check(root: &Path) -> Result<String, Error> {
-    monorelease::doctor(root)?;
+    mono::doctor(root)?;
     Ok(format!("checked {}", root.display()))
 }
 
 fn run_list(root: &Path) -> Result<String, Error> {
-    Ok(monorelease::list(root)?)
+    Ok(mono::list(root)?)
 }
 
 fn run_plan(root: &Path, pipeline: Option<&str>, package: Option<&str>) -> Result<String, Error> {
-    Ok(monorelease::plan(root, pipeline, package, NO_TASK_FILTER)?)
+    Ok(mono::plan(root, pipeline, package, NO_TASK_FILTER)?)
 }
 
 fn run_graph(root: &Path, pipeline: Option<&str>, package: Option<&str>) -> Result<String, Error> {
-    Ok(monorelease::graph(root, pipeline, package, NO_TASK_FILTER)?)
+    Ok(mono::graph(root, pipeline, package, NO_TASK_FILTER)?)
 }
 
 fn run_cache(root: &Path, command: CacheCommands) -> Result<String, Error> {
     match command {
-        CacheCommands::Clean => Ok(monorelease::clean_cache(root)?),
+        CacheCommands::Clean => Ok(mono::clean_cache(root)?),
     }
 }
 
@@ -593,7 +593,7 @@ fn resolve_path(root: &Path, path: PathBuf) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use monorelease::{DoctorError, ListError, WorkspaceError};
+    use mono::{DoctorError, ListError, WorkspaceError};
 
     /// A writer that fails every write, standing in for a consumer that hung up
     /// (`BrokenPipe`) or a disk that is full (`StorageFull`).
@@ -653,7 +653,7 @@ mod tests {
         assert_eq!(emit_error(&mut sink, &error), EXIT_USAGE);
         assert_eq!(
             String::from_utf8(sink).unwrap(),
-            "monorelease: --jobs must be greater than zero\n"
+            "mono: --jobs must be greater than zero\n"
         );
     }
 
@@ -669,9 +669,7 @@ mod tests {
     fn requests_that_were_understood_fail_with_one() {
         for error in [
             Error::Init(InitError::StandaloneCommandRequired),
-            Error::Init(InitError::AlreadyInitialized(PathBuf::from(
-                "monorepo.toml",
-            ))),
+            Error::Init(InitError::AlreadyInitialized(PathBuf::from("mono.toml"))),
             Error::Doctor(DoctorError::Workspace(missing_root())),
             Error::Doctor(DoctorError::Workspace(missing_declared_directory())),
             Error::List(ListError::Workspace(WorkspaceError::UnknownPackage {
@@ -691,7 +689,7 @@ mod tests {
     fn environment_failures_exit_with_three() {
         for error in [
             Error::Init(InitError::WriteConfig {
-                path: PathBuf::from("monorepo.toml"),
+                path: PathBuf::from("mono.toml"),
                 source: io::Error::new(io::ErrorKind::PermissionDenied, "denied"),
             }),
             Error::Changelog(ChangelogError::Read {

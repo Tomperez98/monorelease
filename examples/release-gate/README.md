@@ -1,6 +1,6 @@
 # Release gate example
 
-This example demonstrates how a language-agnostic workspace task can coordinate a release without putting release knowledge into `monorelease` itself.
+This example demonstrates how a language-agnostic workspace task can coordinate a release without putting release knowledge into `mono` itself.
 
 Every command is an `echo`, so the example runs without Node, Rust, Docker, or any other toolchain.
 
@@ -30,15 +30,15 @@ cargo run -- run release --dir examples/release-gate --jobs 3
 ```text
 examples/release-gate/
 ├── automation/
-├── monorepo.toml
+├── mono.toml
 └── packages/
     ├── api/
-    │   └── monorepo.toml
+    │   └── mono.toml
     ├── docs/
-    │   ├── monorepo.toml
+    │   ├── mono.toml
     │   └── site/
     └── web/
-        └── monorepo.toml
+        └── mono.toml
 ```
 
 ## What this demonstrates
@@ -51,7 +51,7 @@ Each package owns its commands and its lifecycle:
 build -> test -> package
 ```
 
-The packages can use completely different languages or frameworks in a real repository. `monorelease` only sees executable argument arrays.
+The packages can use completely different languages or frameworks in a real repository. `mono` only sees executable argument arrays.
 
 ### Cross-package dependencies
 

@@ -1,4 +1,4 @@
-//! Core logic for `monorelease`.
+//! Core logic for `mono`.
 //!
 //! Each subcommand lives in its own module under [`commands`], owns its own
 //! error vocabulary, and is re-exported at the crate root. Everything here
@@ -42,7 +42,7 @@ pub use commands::release::{
     manifest as release_manifest, source as release_source, verify as release_verify,
 };
 pub use config::{
-    CONFIG_FILE_NAME, MonorepoConfig, PackageConfig, PipelineConfig, TaskConfig,
+    CONFIG_FILE_NAME, MonoConfig, PackageConfig, PipelineConfig, TaskConfig,
     WORKSPACE_PACKAGE_NAME, WorkspaceConfig, config_path, render_config,
 };
 pub use output::OutputMode;
@@ -55,7 +55,7 @@ pub use release::{
 pub use scheduler::SchedulerError;
 pub use workspace::{Package, PlannedTask, TaskNode, Workspace, WorkspaceError};
 
-/// Every expected failure a `monorelease` command can report.
+/// Every expected failure a `mono` command can report.
 ///
 /// The signature of a command documents its whole failure space; this union
 /// is what a caller has to handle, and nothing else.

@@ -59,7 +59,7 @@ struct CachedOutput {
 impl CacheStore {
     pub(crate) fn new(workspace_root: &Path) -> Self {
         Self {
-            root: workspace_root.join(".monorelease").join("cache"),
+            root: workspace_root.join(".mono").join("cache"),
         }
     }
 
@@ -69,7 +69,7 @@ impl CacheStore {
         plan: &[PlannedTask],
     ) -> Result<CacheSession, CacheError> {
         self.ensure_gitignore()?;
-        let workspace_manifest = read_file(&workspace_root.join("monorepo.toml"))?;
+        let workspace_manifest = read_file(&workspace_root.join("mono.toml"))?;
         let mut package_manifests = BTreeMap::new();
         for task in plan.iter().filter(|task| task.cache()) {
             if task.package_path() == workspace_root {
@@ -81,7 +81,7 @@ impl CacheStore {
             }
             package_manifests.insert(
                 package_path.clone(),
-                read_file(&package_path.join("monorepo.toml"))?,
+                read_file(&package_path.join("mono.toml"))?,
             );
         }
         Ok(CacheSession {
@@ -110,7 +110,7 @@ impl CacheStore {
         dependency_keys: &[String],
     ) -> Result<String, CacheError> {
         let mut hasher = Sha256::new();
-        hash_string(&mut hasher, "monorelease-cache");
+        hash_string(&mut hasher, "mono-cache");
         hash_string(&mut hasher, &CACHE_FORMAT_VERSION.to_string());
         hash_string(&mut hasher, task.package());
         hash_string(&mut hasher, task.task());
@@ -343,10 +343,7 @@ impl CacheStore {
     }
 
     fn ensure_gitignore(&self) -> Result<(), CacheError> {
-        let directory = self
-            .root
-            .parent()
-            .expect("cache root has a .monorelease parent");
+        let directory = self.root.parent().expect("cache root has a .mono parent");
         fs::create_dir_all(directory)
             .map_err(|source| CacheError::io(directory.to_path_buf(), source))?;
 
@@ -490,7 +487,7 @@ fn walk_matched(
             .expect("walked path must remain below its root");
         if relative
             .components()
-            .any(|component| matches!(component, std::path::Component::Normal(name) if name == ".git" || name == ".monorelease"))
+            .any(|component| matches!(component, std::path::Component::Normal(name) if name == ".git" || name == ".mono"))
         {
             continue;
         }
@@ -839,7 +836,7 @@ mod tests {
             .expect("key succeeds");
 
         assert_eq!(
-            fs::read_to_string(workspace.root.join(".monorelease/.gitignore"))
+            fs::read_to_string(workspace.root.join(".mono/.gitignore"))
                 .expect("gitignore is created"),
             "*\n!.gitignore\n"
         );

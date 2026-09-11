@@ -39,7 +39,7 @@ jobs:
       tag_object: ${{ steps.source-identity.outputs.tag_object }}
     env:
       # The release gates smoke-test this binary against the examples.
-      MONORELEASE_BIN: target/debug/monorelease
+      MONO_BIN: target/debug/mono
     steps:
       - name: Check out repository
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
@@ -97,7 +97,7 @@ jobs:
         shell: bash
         run: |
           tag_version="${RELEASE_TAG#v}"
-          package_version="$(cargo metadata --locked --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "monorelease") | .version')"
+          package_version="$(cargo metadata --locked --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "mono") | .version')"
           test "$tag_version" = "$package_version" || {
             echo "tag v$tag_version does not match Cargo.toml version $package_version" >&2
             exit 1
@@ -171,12 +171,12 @@ jobs:
         shell: bash
         run: |
           version="${RELEASE_TAG#v}"
-          binary="target/${{ matrix.target }}/release/monorelease"
+          binary="target/${{ matrix.target }}/release/mono"
           if [[ "${{ matrix.archive }}" == "zip" ]]; then binary="$binary.exe"; fi
           reported="$("$binary" --version)"
           echo "$reported"
-          test "$reported" = "monorelease $version" || {
-            echo "$binary reports '$reported', expected 'monorelease $version'" >&2
+          test "$reported" = "mono $version" || {
+            echo "$binary reports '$reported', expected 'mono $version'" >&2
             exit 1
           }
 
@@ -185,8 +185,8 @@ jobs:
         shell: bash
         run: |
           mkdir -p dist
-          tar -czf "dist/monorelease-${RELEASE_TAG}-${{ matrix.target }}.tar.gz" \
-            -C "target/${{ matrix.target }}/release" monorelease \
+          tar -czf "dist/mono-${RELEASE_TAG}-${{ matrix.target }}.tar.gz" \
+            -C "target/${{ matrix.target }}/release" mono \
             -C "$GITHUB_WORKSPACE" LICENSE README.md
 
       - name: Package Windows artifact
@@ -196,18 +196,18 @@ jobs:
           New-Item -ItemType Directory -Force dist | Out-Null
           $staging = "dist/staging"
           New-Item -ItemType Directory -Force $staging | Out-Null
-          Copy-Item "target/${{ matrix.target }}/release/monorelease.exe" "$staging/monorelease.exe"
+          Copy-Item "target/${{ matrix.target }}/release/mono.exe" "$staging/mono.exe"
           Copy-Item LICENSE "$staging/LICENSE"
           Copy-Item README.md "$staging/README.md"
           Compress-Archive `
             -Path "$staging/*" `
-            -DestinationPath "dist/monorelease-$env:RELEASE_TAG-${{ matrix.target }}.zip"
+            -DestinationPath "dist/mono-$env:RELEASE_TAG-${{ matrix.target }}.zip"
           Remove-Item -Recurse -Force $staging
 
       - name: Generate build provenance
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
-          subject-path: dist/monorelease-*
+          subject-path: dist/mono-*
 
       - name: Upload release artifact
         uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
@@ -255,7 +255,7 @@ jobs:
 
       - name: Generate checksums
         working-directory: dist
-        run: sha256sum monorelease-* > SHA256SUMS
+        run: sha256sum mono-* > SHA256SUMS
 
       - name: Verify release asset inventory
         working-directory: dist
@@ -270,10 +270,10 @@ jobs:
           cat > "$expected_file" <<EOF
           BUILD-METADATA.json
           SHA256SUMS
-          monorelease-${RELEASE_TAG}-x86_64-unknown-linux-gnu.tar.gz
-          monorelease-${RELEASE_TAG}-aarch64-apple-darwin.tar.gz
-          monorelease-${RELEASE_TAG}-x86_64-apple-darwin.tar.gz
-          monorelease-${RELEASE_TAG}-x86_64-pc-windows-msvc.zip
+          mono-${RELEASE_TAG}-x86_64-unknown-linux-gnu.tar.gz
+          mono-${RELEASE_TAG}-aarch64-apple-darwin.tar.gz
+          mono-${RELEASE_TAG}-x86_64-apple-darwin.tar.gz
+          mono-${RELEASE_TAG}-x86_64-pc-windows-msvc.zip
           EOF
 
           for path in ./*; do

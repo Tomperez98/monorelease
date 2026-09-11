@@ -15,7 +15,7 @@ impl TempDir {
     pub fn new() -> Self {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let unique = format!(
-            "monorelease-{}-{}-{}",
+            "mono-{}-{}-{}",
             std::process::id(),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)

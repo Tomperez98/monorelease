@@ -82,7 +82,7 @@ pub fn plan(
 /// Remove local cache entries while preserving the workspace and ignore file.
 pub fn clean_cache(path: &Path) -> Result<String, CiError> {
     let workspace = Workspace::load(path)?;
-    let cache_path = workspace.root.join(".monorelease").join("cache");
+    let cache_path = workspace.root.join(".mono").join("cache");
     match std::fs::remove_dir_all(&cache_path) {
         Ok(()) => Ok(format!("removed cache {}", cache_path.display())),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
