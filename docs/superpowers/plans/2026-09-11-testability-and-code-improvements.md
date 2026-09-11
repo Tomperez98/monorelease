@@ -901,7 +901,7 @@ fn write_bytes(writers: &mut Writers, bytes: &[u8], to_stderr: bool) -> io::Resu
 
 Delete `start_section` (it is a no-op), `present_summary` (`#[allow(dead_code)]`, duplicate of `present_run_finished`), and `write_status` (`#[allow(dead_code)]`, unreferenced). Delete the now-unused `#[cfg(test)] write_json_event` helper and the `json_lines` field and its initialization in `new`.
 
-`run_identity()` and `write_line_terminated`/`write_json_event_with_identity` stay as they are.
+`run_identity()` stays as it is. `write_line_terminated` and `write_json_event_with_identity` keep their bodies but **must take `&mut (impl Write + ?Sized)`** instead of `&mut impl Write`: the call sites now pass `&mut *writers.out`, which is `&mut (dyn Write + Send)`, and an unsized `&mut dyn Write` does not satisfy a `Sized` `impl Write` parameter (`E0277: the size for values of type dyn std::io::Write + Send cannot be known at compilation time`). This was verified with a minimal `rustc` reproduction during execution; the plan's original literal snippets did not compile.
 
 - [ ] **Step 4: Run the tests**
 
@@ -915,7 +915,24 @@ Expected: PASS, including `tests/cli.rs::json_output_contains_lifecycle_events` 
 - [ ] **Step 5: Confirm no process globals remain in the renderer**
 
 Run: `grep -n "io::stdout()\|io::stderr()" src/output.rs`
-Expected: exactly two hits, both inside `OutputSink::new`.
+Expected: exactly two hits, both inside `OutputSink::new`. rustfmt may place both on one line.
+
+**As-built notes (what execution actually required, beyond the snippets above):**
+
+1. **`?Sized` bound (required).** `write_line_terminated` and `write_json_event_with_identity` must be declared `&mut (impl Write + ?Sized)`. See the note at the end of Step 3.
+2. **`present_failure` collapses to a let-chain (required).** Removing the `start_section(node)?;` call leaves `else { if let Some(output) = error.output() { … } }`, which clippy rejects as `collapsible_if` under `-D warnings`. It must become:
+
+```rust
+        } else if self.mode != OutputMode::Live
+            && let Some(output) = error.output()
+        {
+            write_bytes(&mut writers, &output.stdout, false)?;
+            write_bytes(&mut writers, &output.stderr, true)?;
+        }
+```
+
+   `present_success` similarly becomes `} else if self.mode != OutputMode::Live || result.cached {`. Control flow is otherwise identical, because `start_section` was a no-op.
+3. **Accepted residual risk, deliberately not fixed.** `Writers.out` holds a `Box<io::Stdout>` rather than a `StdoutLock` held across one render, so the process stdout lock is now taken per write rather than per event. This is safe here because every task-output write goes through the sink's single `Mutex<Writers>`, and the only other writers — `main::emit_summary` and `main::emit_error` — run strictly after `execute_plan` returns. No interleaving is reachable without a second thread writing to process stdout mid-render, which the CLI never does. If a future caller renders to process stdout concurrently with a pipeline, this becomes a real bug and the fix is to hold the lock for the render's duration.
 
 - [ ] **Step 6: Commit**
 
