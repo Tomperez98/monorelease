@@ -2070,7 +2070,11 @@ In `src/main.rs`, replace the body of `exit_code` and add `project_exit_code`:
         Error::Release(ReleaseCommandError::Release(error)) => release_exit_code(error),
         Error::Doctor(DoctorError::Project(error)) => project_exit_code(error),
         Error::List(ListError::Project(error)) => project_exit_code(error),
-        Error::Doctor(_) | Error::List(_) => EXIT_FAILED,
+        // `DoctorError` has exactly one variant (`Project`), so an
+        // `Error::Doctor(_)` arm here is an UNREACHABLE PATTERN and fails
+        // `clippy -D warnings`. `ListError` has two variants, so `Error::List(_)`
+        // is still needed to cover `ListError::Json`.
+        Error::List(_) => EXIT_FAILED,
     }
 }
 
@@ -2107,6 +2111,22 @@ Expected: all PASS.
 
 Run: `cargo test --workspace --all-targets --all-features`
 Expected: PASS.
+
+**As-built notes.**
+
+1. **`Error::Doctor(_)` would be an unreachable pattern (required fix).** The `exit_code` match originally specified here ended with `Error::Doctor(_) | Error::List(_) => EXIT_FAILED`. `DoctorError` has exactly ONE variant (`Project`), so once `Error::Doctor(DoctorError::Project(error))` is matched, `Error::Doctor(_)` can never be reached. Rust's `unreachable_patterns` lint fires (verified with a standalone `rustc` repro), and `clippy -D warnings` turns that into a build failure. The arm is now `Error::List(_) => EXIT_FAILED` alone — `ListError` has two variants (`Project`, `Json`), so that arm is still reachable and still needed.
+2. **`project_exit_code` is deliberately exhaustive.** An implementation may be tempted to collapse it to `ProjectError::Io { .. } => EXIT_TOOL, _ => EXIT_FAILED`. That is behaviorally identical today, but the `_` arm would silently assign exit `1` to any future `ProjectError` variant — including one that is really an environment failure. That is the exact class of misclassification this task exists to remove, so the explicit 12-variant list is kept. Adding a variant must force a conscious decision.
+
+Verified end to end by running the built binary:
+
+```console
+$ mono --dir /definitely/not/here check ; echo $?
+mono: could not read /definitely/not/here: No such file or directory (os error 2)
+3                                    # was 1 before this task
+$ mono --dir "$proj_with_missing_cwd" check ; echo $?
+1                                    # unchanged
+# no manifest, malformed manifest, unknown task: all still 1
+```
 
 - [ ] **Step 6: Commit**
 
