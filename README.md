@@ -30,7 +30,7 @@ summary: 3 completed, 0 cached, 0 failed, 0 blocked across 3 package(s)
 cargo install --path .
 ```
 
-Building requires Rust 1.85+ (edition 2024). Prebuilt binaries for Linux x86_64, macOS arm64, macOS x86_64, and Windows x86_64 are attached to each [GitHub release](https://github.com/Tomperez98/monorelease/releases) together with a `SHA256SUMS` file:
+Building requires Rust 1.88+ (edition 2024). Prebuilt binaries for Linux x86_64, macOS arm64, macOS x86_64, and Windows x86_64 are attached to each [GitHub release](https://github.com/Tomperez98/monorelease/releases) together with a `SHA256SUMS` file:
 
 ```bash
 sha256sum -c SHA256SUMS
