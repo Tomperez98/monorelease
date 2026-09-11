@@ -28,7 +28,7 @@ gh attestation verify monorelease-<tag>-<target>.<archive> \\
   --repo Tomperez98/monorelease
 ```
 
-Install from source with `cargo install --path .` (Rust 1.85+, edition 2024).
+Install from source with `cargo install --path .` (Rust 1.88+, edition 2024).
 ";
 
 pub fn run(tag: &Tag, changelog_path: &Path, notes_path: &Path) -> Result<(), Error> {

@@ -259,8 +259,7 @@ impl Workspace {
                     return Err(WorkspaceError::InvalidManifest {
                         path: manifest_path,
                         message: format!(
-                            "package name '{}' is reserved for workspace tasks",
-                            WORKSPACE_PACKAGE_NAME
+                            "package name '{WORKSPACE_PACKAGE_NAME}' is reserved for workspace tasks"
                         ),
                     });
                 }
@@ -308,8 +307,7 @@ impl Workspace {
             return Err(WorkspaceError::InvalidManifest {
                 path: config_path(&root),
                 message: format!(
-                    "package name '{}' is reserved for workspace tasks",
-                    WORKSPACE_PACKAGE_NAME
+                    "package name '{WORKSPACE_PACKAGE_NAME}' is reserved for workspace tasks"
                 ),
             });
         }

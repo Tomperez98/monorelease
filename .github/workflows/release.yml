@@ -80,7 +80,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # pinned action
         with:
-          toolchain: 1.85.1
+          toolchain: 1.88.0
           components: rustfmt, clippy
 
       - name: Cache Cargo dependencies
@@ -154,7 +154,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # pinned action
         with:
-          toolchain: 1.85.1
+          toolchain: 1.88.0
           targets: ${{ matrix.target }}
 
       - name: Cache Cargo
