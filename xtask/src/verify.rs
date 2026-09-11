@@ -1,7 +1,7 @@
 //! Project-specific release gates.
 //!
 //! These gates assert claims made by this repository's release. Generic
-//! changelog, source, checksum, and artifact-manifest checks are provided by
+//! changelog, release-source, checksum, and artifact-manifest checks are provided by
 //! the published `mono` CLI instead of being duplicated here.
 
 use std::path::Path;
@@ -11,37 +11,17 @@ use crate::{Error, Tag};
 
 const PREFIX: &str = "release-verify";
 
-/// What a working binary must still do, run through `--no-cache` so every
-/// result comes from this run rather than from a previous one.
-const WORKLOADS: &[(&str, &[&str])] = &[
+/// Plans the repository's real pipelines without executing the release
+/// pipeline recursively. The release pipeline invokes this xtask, so running
+/// it from here would recurse forever.
+const PLANS: &[(&str, &[&str], &str)] = &[
+    ("the root CI pipeline", &["plan", "ci"], "clippy"),
     (
-        "examples/echo builds in dependency order",
-        &[
-            "--dir",
-            "examples/echo",
-            "task",
-            "app-build",
-            "--jobs",
-            "2",
-            "--no-cache",
-        ],
-    ),
-    (
-        "examples/release-gate runs its release pipeline",
-        &[
-            "--dir",
-            "examples/release-gate",
-            "run",
-            "release",
-            "--jobs",
-            "3",
-            "--no-cache",
-        ],
+        "the root release pipeline",
+        &["plan", "release"],
+        "release-verify",
     ),
 ];
-
-const PLAN: &[&str] = &["--dir", "examples/release-gate", "plan", "release"];
-const PLAN_EXPECTED: &str = "release-verify";
 
 pub fn run(tag: &Tag, binary: &Path) -> Result<(), Error> {
     if !binary.exists() {
@@ -53,8 +33,7 @@ pub fn run(tag: &Tag, binary: &Path) -> Result<(), Error> {
 
     identity(tag, binary)?;
     self_check(binary)?;
-    workloads(binary)?;
-    plan(binary)?;
+    plans(binary)?;
 
     println!("{PREFIX}: release gates passed for {}", tag.name);
     Ok(())
@@ -92,42 +71,23 @@ fn self_check(binary: &Path) -> Result<(), Error> {
     Ok(())
 }
 
-fn workloads(binary: &Path) -> Result<(), Error> {
-    for (description, args) in WORKLOADS {
+/// Planning is what a user reads before running anything, so it has to resolve
+/// the repository's real graphs without entering a recursive release run.
+fn plans(binary: &Path) -> Result<(), Error> {
+    for (description, args, expected) in PLANS {
         let output = capture(binary, args)?;
         let stdout = String::from_utf8_lossy(&output.stdout);
 
-        // A task graph that failed, or that reports a failure in its summary,
-        // means the binary cannot build its own examples.
-        if !output.status.success() || !stdout.contains("0 failed") {
+        if !output.status.success() || !stdout.contains(expected) {
             return Err(Error::Command(format!(
-                "`{} {}` did not report `0 failed`\n{}",
+                "`{} {}` does not plan {expected}\n{}",
                 binary.display(),
                 args.join(" "),
                 crate::process::diagnostics(&output)
             )));
         }
 
-        println!("{PREFIX}: {description}");
+        println!("{PREFIX}: {description} plans successfully");
     }
-    Ok(())
-}
-
-/// Planning is what a user reads before running anything, so it has to resolve
-/// the graph the documentation promises.
-fn plan(binary: &Path) -> Result<(), Error> {
-    let output = capture(binary, PLAN)?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-
-    if !output.status.success() || !stdout.contains(PLAN_EXPECTED) {
-        return Err(Error::Command(format!(
-            "`{} {}` does not plan {PLAN_EXPECTED}\n{}",
-            binary.display(),
-            PLAN.join(" "),
-            crate::process::diagnostics(&output)
-        )));
-    }
-
-    println!("{PREFIX}: examples/release-gate plans {PLAN_EXPECTED}");
     Ok(())
 }

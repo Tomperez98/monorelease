@@ -37,8 +37,15 @@ pub(crate) struct OutputSink {
     mode: OutputMode,
     writers: Mutex<Writers>,
     tui: Option<TuiController>,
+    tui_failures: Mutex<Vec<TuiFailure>>,
     run_id: u64,
     sequence: AtomicU64,
+}
+
+struct TuiFailure {
+    task: String,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
 }
 
 struct Writers {
@@ -86,6 +93,7 @@ impl OutputSink {
                 stream: StreamFormatter::default(),
             }),
             tui,
+            tui_failures: Mutex::new(Vec::new()),
             run_id: run_identity(),
             sequence: AtomicU64::new(0),
         }
@@ -204,7 +212,20 @@ impl OutputSink {
                     )?;
                 }
             }
-        } else if !matches!(self.mode, OutputMode::Stream | OutputMode::Tui)
+        } else if self.mode == OutputMode::Tui {
+            if let Some(output) = error.output()
+                && (!output.stdout.is_empty() || !output.stderr.is_empty())
+            {
+                self.tui_failures
+                    .lock()
+                    .expect("TUI failure lock is not poisoned")
+                    .push(TuiFailure {
+                        task: node.id().to_owned(),
+                        stdout: output.stdout.clone(),
+                        stderr: output.stderr.clone(),
+                    });
+            }
+        } else if self.mode != OutputMode::Stream
             && let Some(output) = error.output()
         {
             write_bytes(&mut writers, &output.stdout, false)?;
@@ -278,13 +299,39 @@ impl OutputSink {
                 ),
             )
         } else if self.mode == OutputMode::Tui {
-            self.tui
+            let result = self
+                .tui
                 .as_ref()
                 .expect("TUI output has a controller")
-                .finish()
+                .finish();
+            if result.is_ok() {
+                self.write_tui_failures(&mut writers)?;
+            }
+            result
         } else {
             Ok(())
         }
+    }
+
+    fn write_tui_failures(&self, writers: &mut Writers) -> io::Result<()> {
+        let failures = std::mem::take(
+            &mut *self
+                .tui_failures
+                .lock()
+                .expect("TUI failure lock is not poisoned"),
+        );
+        for failure in failures {
+            writeln!(&mut *writers.err, "\n{} captured output:", failure.task)?;
+            if !failure.stdout.is_empty() {
+                writeln!(&mut *writers.err, "stdout:")?;
+                write_bytes(writers, &failure.stdout, true)?;
+            }
+            if !failure.stderr.is_empty() {
+                writeln!(&mut *writers.err, "stderr:")?;
+                write_bytes(writers, &failure.stderr, true)?;
+            }
+        }
+        Ok(())
     }
 
     fn render_event(&self, writers: &mut Writers, event: &ExecutionEvent) -> io::Result<()> {
