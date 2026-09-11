@@ -329,6 +329,14 @@ pub fn today() -> String {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
+    date_from_unix_seconds(seconds)
+}
+
+/// The UTC date `seconds` after the Unix epoch, in `yyyy-mm-dd` form.
+///
+/// Pure: the wall clock is read once, in `today`, so the calendar conversion
+/// can be asserted without a clock.
+fn date_from_unix_seconds(seconds: u64) -> String {
     let (year, month, day) = civil_from_days((seconds / 86_400) as i64);
     format!("{year:04}-{month:02}-{day:02}")
 }
@@ -413,5 +421,24 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.contains("only one"));
+    }
+
+    #[test]
+    fn epoch_and_known_dates_convert_exactly() {
+        // 0, 86_400, 951_782_400 (2000-02-29), and 1_789_084_800 (2026-09-11)
+        // are checked against `date -u -r <seconds> +%Y-%m-%d`.
+        assert_eq!(date_from_unix_seconds(0), "1970-01-01");
+        assert_eq!(date_from_unix_seconds(86_400), "1970-01-02");
+        assert_eq!(date_from_unix_seconds(951_782_400), "2000-02-29");
+        assert_eq!(date_from_unix_seconds(1_789_084_800), "2026-09-11");
+    }
+
+    #[test]
+    fn leap_day_rules_are_gregorian() {
+        assert_eq!(date_from_unix_seconds(1_709_164_800), "2024-02-29");
+        // 1900 is not a leap year under the Gregorian rule; 2000 is. Verify the
+        // century rule through the pure days conversion.
+        assert_eq!(civil_from_days(-25_508), (1900, 3, 1));
+        assert_eq!(civil_from_days(11_016), (2000, 2, 29));
     }
 }

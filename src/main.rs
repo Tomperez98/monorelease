@@ -4,7 +4,7 @@
 //! [`mono`], and maps the single error vocabulary onto stdout, stderr,
 //! and an exit code — in exactly one place.
 //!
-//! Every argument is validated while parsing, so [`run`] only ever sees
+//! Every argument is validated while parsing, so [`dispatch`] only ever sees
 //! well-formed commands and its failure space is exactly the library's. The
 //! exit code this edge publishes is:
 //!
@@ -15,7 +15,9 @@
 //! | `2`  | the command line was wrong; emitted by `clap` while parsing  |
 //! | `3`  | `mono` or its environment failed                      |
 
-use std::io::{self, Write};
+#![allow(clippy::result_large_err)]
+
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -23,10 +25,10 @@ use clap::builder::NonEmptyStringValueParser;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use mono::{
     CacheMode, CancellationToken, ChangelogError, CiError, DEFAULT_CHANGELOG_PATH,
-    DEFAULT_RELEASE_DIRECTORY, DEFAULT_RELEASE_NOTES_PATH, Error, InitError, OutputMode,
-    PipelineExecution, ReleaseCommandError, ReleaseError, ReleaseIdentity, SchedulerError,
-    changelog_notes, changelog_scaffold, changelog_validate, release_manifest, release_source,
-    release_verify,
+    DEFAULT_RELEASE_DIRECTORY, DEFAULT_RELEASE_NOTES_PATH, DoctorError, Error, InitError,
+    ListError, OutputMode, PipelineExecution, ProjectError, ReleaseCommandError, ReleaseError,
+    ReleaseIdentity, SchedulerError, changelog_notes, changelog_scaffold, changelog_validate,
+    release_manifest, release_source, release_verify,
 };
 
 #[derive(Parser)]
@@ -41,31 +43,38 @@ struct Cli {
     #[arg(long = "dir", global = true, default_value = ".")]
     root: PathBuf,
     /// Output contract for command summaries and execution events.
-    #[arg(long, global = true, value_enum, default_value_t = OutputFormat::Terminal)]
+    #[arg(long, global = true, value_enum, default_value_t = OutputFormat::Text)]
     output: OutputFormat,
+    /// Human task presentation for run and task commands.
+    #[arg(long, global = true, value_enum, default_value_t = UiFormat::Auto)]
+    ui: UiFormat,
     #[command(subcommand)]
     command: Option<Commands>,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
 enum OutputFormat {
-    #[value(name = "terminal")]
-    Terminal,
+    #[value(name = "text")]
+    Text,
     #[value(name = "json")]
     Json,
-    #[value(name = "github-actions")]
-    GithubActions,
-    #[value(name = "live")]
-    Live,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum UiFormat {
+    #[value(name = "auto")]
+    Auto,
+    #[value(name = "tui")]
+    Tui,
+    #[value(name = "stream")]
+    Stream,
 }
 
 impl From<OutputFormat> for OutputMode {
     fn from(format: OutputFormat) -> Self {
         match format {
-            OutputFormat::Terminal => Self::Terminal,
+            OutputFormat::Text => Self::Terminal,
             OutputFormat::Json => Self::Json,
-            OutputFormat::GithubActions => Self::GithubActions,
-            OutputFormat::Live => Self::Live,
         }
     }
 }
@@ -333,6 +342,7 @@ fn main() -> ExitCode {
     let Cli {
         root,
         output,
+        ui,
         command,
     } = Cli::parse();
     let output = output.into();
@@ -346,7 +356,7 @@ fn main() -> ExitCode {
         return ExitCode::from(EXIT_TOOL);
     }
 
-    let code = match run(root, output, command, cancellation) {
+    let code = match dispatch(root, output, ui, command, cancellation) {
         Ok(summary) => emit_summary(&mut io::stdout().lock(), &summary),
         Err(error) if output == OutputMode::Json => {
             emit_error(&mut io::stdout().lock(), &error, output)
@@ -385,19 +395,14 @@ fn emit_summary(sink: &mut impl Write, summary: &str) -> u8 {
 /// A closed stderr must never mask the failure, so the write is best effort and
 /// the code comes from the error alone.
 fn emit_error(sink: &mut impl Write, error: &Error, output: OutputMode) -> u8 {
+    let code = exit_code(error);
     if output == OutputMode::Json {
-        let document = serde_json::json!({
-            "schema": mono::JSON_OUTPUT_SCHEMA,
-            "kind": "error",
-            "code": exit_code(error),
-            "message": error.to_string(),
-        });
-        let _ = serde_json::to_writer(&mut *sink, &document);
+        let _ = sink.write_all(error_document(error).as_bytes());
         let _ = sink.write_all(b"\n");
     } else {
         let _ = writeln!(sink, "mono: {error}");
     }
-    exit_code(error)
+    code
 }
 
 /// Map the single error vocabulary onto this CLI's exit code, once.
@@ -412,18 +417,43 @@ fn exit_code(error: &Error) -> u8 {
         Error::Ci(CiError::InvalidJobs) => EXIT_USAGE,
         Error::Ci(CiError::Scheduler(error)) => scheduler_exit_code(error),
         Error::Ci(CiError::Json { .. }) => EXIT_TOOL,
+        Error::Ci(CiError::Project(error))
+        | Error::Doctor(DoctorError::Project(error))
+        | Error::List(ListError::Project(error)) => project_exit_code(error),
         Error::Changelog(error) => changelog_exit_code(error),
         Error::Release(ReleaseCommandError::Release(error)) => release_exit_code(error),
-        // A project failure is a rejected request, not a failed tool.
-        //
-        // `ProjectError::Io` is overloaded: it covers failing to read a
-        // manifest *and* failing to resolve a directory the manifest declares,
-        // such as a task `cwd`. The second is exactly the defect `mono
-        // check` exists to report, so the variant cannot be split by exit code
-        // here. A genuine environment failure surfaces as a write error, which
-        // is classified in `init_exit_code`, `changelog_exit_code`, and
-        // `release_exit_code`.
-        Error::Doctor(_) | Error::List(_) | Error::Ci(CiError::Project(_)) => EXIT_FAILED,
+        // A serialization failure means mono could not produce the requested
+        // output, exactly like `CiError::Json`; both are tool failures.
+        Error::List(ListError::Json { .. }) => EXIT_TOOL,
+    }
+}
+
+/// Map a project error onto this CLI's exit code.
+///
+/// `ProjectError::Io` means the manifest could not be read — a tool or
+/// environment failure. Everything else is a rejected request the caller
+/// can fix.
+fn project_exit_code(error: &mono::ProjectError) -> u8 {
+    match error {
+        // A manifest that could not be read is a `mono` or environment failure.
+        ProjectError::Io { .. } => EXIT_TOOL,
+        // Every other variant is a manifest that WAS read and rejected, which the
+        // caller can fix. This list is exhaustive on purpose: a `_` arm would
+        // silently assign exit `1` to any future variant, including one that is
+        // really an environment failure. Adding a variant must force a decision
+        // about which bucket it belongs in.
+        ProjectError::Parse { .. }
+        | ProjectError::MissingRoot { .. }
+        | ProjectError::InvalidManifest { .. }
+        | ProjectError::InvalidProject { .. }
+        | ProjectError::UnknownPipeline { .. }
+        | ProjectError::InvalidTaskName { .. }
+        | ProjectError::InvalidTask { .. }
+        | ProjectError::MissingTask { .. }
+        | ProjectError::InvalidTaskReference { .. }
+        | ProjectError::TaskCycle { .. }
+        | ProjectError::UnsupportedSchema { .. }
+        | ProjectError::TaskDirectory { .. } => EXIT_FAILED,
     }
 }
 
@@ -494,14 +524,15 @@ const NO_TASK_FILTER: &[String] = &[];
 ///
 /// Each subcommand owns a small helper below, so this match reads as a dispatch
 /// table and each helper documents the failure space it can surface.
-fn run(
+fn dispatch(
     root: PathBuf,
     output: OutputMode,
+    ui: UiFormat,
     command: Option<Commands>,
     cancellation: CancellationToken,
 ) -> Result<String, Error> {
     match command {
-        None => run_default_pipeline(&root, output, cancellation),
+        None => run_default_pipeline(&root, output, ui, cancellation),
         Some(Commands::Init) => run_init(&root, output),
         Some(Commands::Run {
             pipeline,
@@ -513,10 +544,11 @@ fn run(
             &tasks,
             options,
             output,
+            ui,
             cancellation,
         ),
         Some(Commands::Task { tasks, options }) => {
-            execute_pipeline(&root, None, &tasks, options, output, cancellation)
+            execute_pipeline(&root, None, &tasks, options, output, ui, cancellation)
         }
         Some(Commands::Check) => run_check(&root, output),
         Some(Commands::List) => run_list(&root, output),
@@ -532,6 +564,7 @@ fn run(
 fn run_default_pipeline(
     root: &Path,
     output: OutputMode,
+    ui: UiFormat,
     cancellation: CancellationToken,
 ) -> Result<String, Error> {
     execute_pipeline(
@@ -540,6 +573,7 @@ fn run_default_pipeline(
         NO_TASK_FILTER,
         ExecutionOptions::default(),
         output,
+        ui,
         cancellation,
     )
 }
@@ -560,6 +594,7 @@ fn execute_pipeline(
     tasks: &[String],
     options: ExecutionOptions,
     output: OutputMode,
+    ui: UiFormat,
     cancellation: CancellationToken,
 ) -> Result<String, Error> {
     Ok(mono::run_pipeline_with_mode(
@@ -570,24 +605,35 @@ fn execute_pipeline(
         options.jobs,
         PipelineExecution {
             cache: cache_mode(options.no_cache, options.force),
-            output,
+            output: resolve_execution_output(output, ui),
             cancellation,
         },
     )?)
 }
 
+fn resolve_execution_output(output: OutputMode, ui: UiFormat) -> OutputMode {
+    if output == OutputMode::Json {
+        return OutputMode::Json;
+    }
+    match ui {
+        UiFormat::Stream => OutputMode::Stream,
+        UiFormat::Tui | UiFormat::Auto => {
+            if interactive_terminal() {
+                OutputMode::Tui
+            } else {
+                OutputMode::Stream
+            }
+        }
+    }
+}
+
+fn interactive_terminal() -> bool {
+    io::stdin().is_terminal() && io::stdout().is_terminal() && std::env::var_os("CI").is_none()
+}
+
 fn run_check(root: &Path, output: OutputMode) -> Result<String, Error> {
     let project = mono::Project::load(root).map_err(mono::DoctorError::from)?;
-    if output == OutputMode::Json {
-        Ok(format!(
-            "{{\"schema\":{},\"kind\":\"check\",\"status\":\"ok\",\"project\":{}}}",
-            mono::JSON_OUTPUT_SCHEMA,
-            serde_json::to_string(&project.root.display().to_string())
-                .expect("path is serializable")
-        ))
-    } else {
-        Ok(format!("checked {}", project.root.display()))
-    }
+    Ok(check_document(output, &project.root))
 }
 
 fn run_list(root: &Path, output: OutputMode) -> Result<String, Error> {
@@ -686,17 +732,70 @@ fn run_release(root: &Path, command: ReleaseCommands, output: OutputMode) -> Res
     Ok(success_document(output, kind, message))
 }
 
-fn success_document(output: OutputMode, kind: &str, message: String) -> String {
+/// The success document every non-execution command returns in JSON mode.
+#[derive(serde::Serialize)]
+struct SuccessDocument {
+    schema: u32,
+    kind: &'static str,
+    status: &'static str,
+    message: String,
+}
+
+/// The `check` document, which reports the resolved project root.
+#[derive(serde::Serialize)]
+struct CheckDocument {
+    schema: u32,
+    kind: &'static str,
+    status: &'static str,
+    project: String,
+}
+
+/// The failure document for JSON mode.
+#[derive(serde::Serialize)]
+struct ErrorDocument<'a> {
+    schema: u32,
+    kind: &'static str,
+    code: u8,
+    message: &'a str,
+}
+
+/// Serialize a document that contains only serializable fields.
+fn serialize(document: &impl serde::Serialize) -> String {
+    serde_json::to_string(document).expect("output documents contain only serializable fields")
+}
+
+fn error_document(error: &Error) -> String {
+    serialize(&ErrorDocument {
+        schema: mono::JSON_OUTPUT_SCHEMA,
+        kind: "error",
+        code: exit_code(error),
+        message: &error.to_string(),
+    })
+}
+
+fn success_document(output: OutputMode, kind: &'static str, message: String) -> String {
     if output == OutputMode::Json {
-        serde_json::json!({
-            "schema": mono::JSON_OUTPUT_SCHEMA,
-            "kind": kind,
-            "status": "ok",
-            "message": message,
+        serialize(&SuccessDocument {
+            schema: mono::JSON_OUTPUT_SCHEMA,
+            kind,
+            status: "ok",
+            message,
         })
-        .to_string()
     } else {
         message
+    }
+}
+
+fn check_document(output: OutputMode, root: &Path) -> String {
+    if output == OutputMode::Json {
+        serialize(&CheckDocument {
+            schema: mono::JSON_OUTPUT_SCHEMA,
+            kind: "check",
+            status: "ok",
+            project: root.display().to_string(),
+        })
+    } else {
+        format!("checked {}", root.display())
     }
 }
 
@@ -717,7 +816,7 @@ fn resolve_path(root: &Path, path: PathBuf) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mono::{DoctorError, ListError, ProjectError};
+    use mono::{CiError, DoctorError, ListError, ProjectError};
 
     /// A writer that fails every write, standing in for a consumer that hung up
     /// (`BrokenPipe`) or a disk that is full (`StorageFull`).
@@ -741,9 +840,18 @@ mod tests {
 
     fn missing_declared_directory() -> ProjectError {
         // A task `cwd` that the manifest declares but the worktree lacks.
-        ProjectError::Io {
+        ProjectError::TaskDirectory {
+            task: "build".to_owned(),
             path: PathBuf::from("packages/api/missing"),
             source: io::Error::new(io::ErrorKind::NotFound, "missing"),
+        }
+    }
+
+    fn unreadable_manifest() -> ProjectError {
+        // The manifest file could not be read — a tool/environment failure.
+        ProjectError::Io {
+            path: PathBuf::from("mono.toml"),
+            source: io::Error::new(io::ErrorKind::PermissionDenied, "access denied"),
         }
     }
 
@@ -830,6 +938,7 @@ mod tests {
                 path: PathBuf::from("mono.toml"),
                 source: io::Error::new(io::ErrorKind::PermissionDenied, "denied"),
             }),
+            Error::Doctor(DoctorError::Project(unreadable_manifest())),
             Error::Changelog(ChangelogError::Read {
                 path: PathBuf::from("CHANGELOG.md"),
                 source: io::Error::new(io::ErrorKind::NotFound, "missing"),
@@ -887,6 +996,87 @@ mod tests {
         assert_eq!(
             resolve_path(root, PathBuf::from("/tmp/notes.md")),
             PathBuf::from("/tmp/notes.md")
+        );
+    }
+
+    #[test]
+    fn success_documents_have_the_documented_shape() {
+        let document =
+            success_document(OutputMode::Json, "cache_clean", "removed cache".to_owned());
+        let value: serde_json::Value = serde_json::from_str(&document).expect("valid JSON");
+
+        assert_eq!(value["schema"], mono::JSON_OUTPUT_SCHEMA);
+        assert_eq!(value["kind"], "cache_clean");
+        assert_eq!(value["status"], "ok");
+        assert_eq!(value["message"], "removed cache");
+    }
+
+    #[test]
+    fn a_check_document_reports_the_project_root() {
+        let document = check_document(OutputMode::Json, Path::new("/workspace"));
+        let value: serde_json::Value = serde_json::from_str(&document).expect("valid JSON");
+
+        assert_eq!(value["schema"], mono::JSON_OUTPUT_SCHEMA);
+        assert_eq!(value["kind"], "check");
+        assert_eq!(value["status"], "ok");
+        assert_eq!(value["project"], "/workspace");
+    }
+
+    #[test]
+    fn error_document_is_json_ready_without_writing_to_a_stream() {
+        let error = Error::Ci(CiError::InvalidJobs);
+        let value: serde_json::Value =
+            serde_json::from_str(&error_document(&error)).expect("valid JSON");
+
+        assert_eq!(value["schema"], mono::JSON_OUTPUT_SCHEMA);
+        assert_eq!(value["kind"], "error");
+        assert_eq!(value["code"], EXIT_USAGE);
+        assert!(value["message"].as_str().unwrap().contains("--jobs"));
+    }
+
+    #[test]
+    fn error_documents_have_the_documented_shape_on_the_json_transport() {
+        let error = Error::Ci(CiError::InvalidJobs);
+        let mut sink = Vec::new();
+
+        emit_error(&mut sink, &error, OutputMode::Json);
+
+        let value: serde_json::Value = serde_json::from_slice(&sink).expect("valid JSON");
+        assert_eq!(value["schema"], mono::JSON_OUTPUT_SCHEMA);
+        assert_eq!(value["kind"], "error");
+        assert_eq!(value["code"], EXIT_USAGE);
+        assert!(value["message"].as_str().unwrap().contains("--jobs"));
+    }
+
+    #[test]
+    fn dispatch_rejects_invalid_jobs_before_loading_a_project() {
+        let error = dispatch(
+            PathBuf::from("does-not-exist"),
+            OutputMode::Terminal,
+            UiFormat::Stream,
+            Some(Commands::Run {
+                pipeline: None,
+                tasks: Vec::new(),
+                options: ExecutionOptions {
+                    jobs: 0,
+                    ..ExecutionOptions::default()
+                },
+            }),
+            CancellationToken::new(),
+        )
+        .expect_err("zero workers must fail");
+
+        assert!(matches!(error, Error::Ci(CiError::InvalidJobs)));
+    }
+
+    #[test]
+    fn a_list_serialization_failure_is_a_tool_failure_like_the_ci_one() {
+        let source = serde_json::from_str::<u32>("not json").expect_err("invalid JSON");
+
+        assert_eq!(
+            exit_code(&Error::List(ListError::Json { source })),
+            EXIT_TOOL,
+            "a failed serialization is a mono failure, not a rejected request"
         );
     }
 }

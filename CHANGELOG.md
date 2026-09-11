@@ -4,6 +4,12 @@ Notable changes per release, newest first.
 
 ## (unreleased)
 
+### Breaking Changes
+
+- Replace the flat `--output terminal|live|json|github-actions` interface with
+  `--output text|json` and `--ui auto|tui|stream`. Interactive runs now use a
+  task-oriented TUI automatically when attached to a terminal.
+
 ### Features
 
 - Use one root `mono.toml` task graph for every project shape.
@@ -12,6 +18,8 @@ Notable changes per release, newest first.
 - Add retry policies and pipeline finalizers for cleanup and diagnostics.
 - Add explicit release artifact inventory validation.
 - Add structured JSON execution events for machine-readable task orchestration.
+- Add task-prefixed stream output and an interactive per-task terminal UI for
+  concurrent pipeline execution.
 
 ### Fixes
 
@@ -19,6 +27,8 @@ Notable changes per release, newest first.
 
 ### Internals
 
+- Delegate cross-platform process-group and Job Object lifecycle management to
+  `process-wrap`, keeping platform-specific process code out of Mono.
 - Add platform-aware cache keys, output digests, and concurrent cache publication.
 - Validate process-tree behavior across the supported operating systems in CI.
 - Harden Git release-source validation and publish release metadata through temporary files with atomic replacement where supported.

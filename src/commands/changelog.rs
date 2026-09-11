@@ -3,9 +3,8 @@
 use std::error::Error as StdError;
 use std::fmt;
 use std::fs;
-use std::io::{self, Write};
+use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::changelog::{Changelog, Request, today};
 
@@ -23,12 +22,21 @@ pub fn validate(path: &Path) -> Result<String, ChangelogError> {
     ))
 }
 
+/// Scaffold an entry dated today.
 pub fn scaffold(path: &Path, version: &str) -> Result<String, ChangelogError> {
+    scaffold_on(path, version, &today())
+}
+
+/// Scaffold an entry with an explicit date.
+///
+/// The clock is a parameter rather than a call, so the rendered changelog is
+/// deterministic and a test can assert the date.
+pub fn scaffold_on(path: &Path, version: &str, date: &str) -> Result<String, ChangelogError> {
     let request = Request::parse(version).map_err(ChangelogError::Invalid)?;
     let text = read(path)?;
     let mut changelog = Changelog::parse(&text).map_err(|message| invalid(path, message))?;
     let action = changelog
-        .scaffold(request, &today(), &[])
+        .scaffold(request, date, &[])
         .map_err(|message| invalid(path, message))?;
     write(path, &changelog.render())?;
     Ok(format!(
@@ -87,61 +95,15 @@ fn read(path: &Path) -> Result<String, ChangelogError> {
 }
 
 fn write(path: &Path, contents: &str) -> Result<(), ChangelogError> {
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let temporary = path.with_file_name(format!(
-        ".{}.{}.{}.tmp",
-        path.file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("changelog"),
-        std::process::id(),
-        COUNTER.fetch_add(1, Ordering::Relaxed),
-    ));
-
-    let result = (|| {
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temporary)
-            .map_err(|source| ChangelogError::Write {
-                path: path.to_path_buf(),
-                source,
-            })?;
-        file.write_all(contents.as_bytes())
-            .and_then(|_| file.sync_all())
-            .map_err(|source| ChangelogError::Write {
-                path: path.to_path_buf(),
-                source,
-            })?;
-        drop(file);
-        replace_file(&temporary, path).map_err(|source| ChangelogError::Write {
-            path: path.to_path_buf(),
-            source,
-        })
-    })();
-
-    if result.is_err() {
-        let _ = fs::remove_file(&temporary);
-    }
-    result
-}
-
-fn replace_file(temporary: &Path, destination: &Path) -> io::Result<()> {
-    #[cfg(unix)]
-    {
-        fs::rename(temporary, destination)
-    }
-
-    #[cfg(not(unix))]
-    {
-        match fs::rename(temporary, destination) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                fs::remove_file(destination)?;
-                fs::rename(temporary, destination)
-            }
-            Err(error) => Err(error),
-        }
-    }
+    crate::atomic_file::write(
+        path,
+        contents.as_bytes(),
+        crate::atomic_file::WriteMode::Replace,
+    )
+    .map_err(|source| ChangelogError::Write {
+        path: path.to_path_buf(),
+        source,
+    })
 }
 
 #[derive(Debug)]
@@ -232,5 +194,56 @@ mod tests {
                 .filter_map(Result::ok)
                 .all(|entry| !entry.file_name().to_string_lossy().ends_with(".tmp"))
         );
+    }
+
+    #[test]
+    fn notes_rejects_an_empty_entry_without_writing_the_output_file() {
+        let temp = TempDir::new();
+        let changelog = temp.path().join(DEFAULT_PATH);
+        let notes_path = temp.path().join(DEFAULT_NOTES_PATH);
+        fs::write(&changelog, "# Changelog\n\n## (unreleased)\n").unwrap();
+
+        let error = notes(&changelog, "unreleased", &notes_path).expect_err("empty entry fails");
+
+        assert!(
+            error
+                .to_string()
+                .contains("entry `## (unreleased)` is empty")
+        );
+        assert!(!notes_path.exists());
+    }
+
+    #[test]
+    fn scaffold_on_writes_the_supplied_date() {
+        let temp = TempDir::new();
+        let path = temp.path().join(DEFAULT_PATH);
+        fs::write(&path, "# Changelog\n\n## 1.0.0\nReleased: 2026-01-01\n").unwrap();
+
+        // Deliberately not today's date. If this were the current date, the test
+        // could not tell `scaffold_on` using the parameter apart from
+        // `scaffold_on` ignoring it and calling `today()`, and would pass for
+        // the wrong reason until the clock moved on.
+        scaffold_on(&path, "1.1.0", "2001-02-03").expect("scaffold succeeds");
+
+        let rendered = fs::read_to_string(&path).unwrap();
+        assert!(rendered.contains("## 1.1.0\n"), "{rendered}");
+        assert!(rendered.contains("Released: 2001-02-03\n"), "{rendered}");
+        assert!(
+            !rendered.contains(&format!("Released: {}\n", today())),
+            "scaffold_on must not fall back to the wall clock: {rendered}"
+        );
+    }
+
+    #[test]
+    fn changelog_errors_expose_a_source_only_for_read_and_write() {
+        let read = ChangelogError::Read {
+            path: PathBuf::from("CHANGELOG.md"),
+            source: io::Error::new(io::ErrorKind::NotFound, "missing"),
+        };
+        let invalid = ChangelogError::Invalid("no entries".to_owned());
+
+        assert!(read.source().is_some(), "{read}");
+        assert!(invalid.source().is_none(), "{invalid}");
+        assert!(!invalid.to_string().is_empty());
     }
 }

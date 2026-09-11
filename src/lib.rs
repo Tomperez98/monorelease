@@ -6,6 +6,7 @@
 //! invariant; nothing knows about `clap`, stdout, or exit codes — that
 //! translation happens once, in `main.rs`.
 
+mod atomic_file;
 mod cache;
 mod changelog;
 mod commands;
@@ -21,8 +22,10 @@ mod project;
 mod release;
 mod runner;
 mod scheduler;
+mod stream_output;
 #[cfg(test)]
 mod testing;
+mod tui;
 
 use std::error::Error as StdError;
 use std::fmt;
@@ -34,7 +37,8 @@ pub use changelog::{
 pub use commands::changelog::{
     ChangelogError, DEFAULT_NOTES_PATH as DEFAULT_RELEASE_NOTES_PATH,
     DEFAULT_PATH as DEFAULT_CHANGELOG_PATH, notes as changelog_notes,
-    scaffold as changelog_scaffold, validate as changelog_validate,
+    scaffold as changelog_scaffold, scaffold_on as changelog_scaffold_on,
+    validate as changelog_validate,
 };
 pub use commands::ci::{
     CiError, PipelineExecution, clean_cache, graph, graph_with_output, plan, plan_with_output,
@@ -136,5 +140,62 @@ impl From<ChangelogError> for Error {
 impl From<ReleaseCommandError> for Error {
     fn from(error: ReleaseCommandError) -> Self {
         Self::Release(error)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io;
+
+    fn builders() -> [(Error, bool); 6] {
+        [
+            (
+                Error::Init(InitError::AlreadyInitialized(std::path::PathBuf::from(
+                    "mono.toml",
+                ))),
+                false,
+            ),
+            (
+                Error::Doctor(DoctorError::Project(ProjectError::MissingRoot {
+                    start: std::path::PathBuf::from("."),
+                })),
+                true,
+            ),
+            (Error::Ci(CiError::InvalidJobs), false),
+            (
+                Error::List(ListError::Project(ProjectError::MissingRoot {
+                    start: std::path::PathBuf::from("."),
+                })),
+                true,
+            ),
+            (
+                Error::Changelog(ChangelogError::Invalid("bad".to_owned())),
+                false,
+            ),
+            (
+                Error::Release(ReleaseCommandError::Release(ReleaseError::Write {
+                    path: std::path::PathBuf::from("out"),
+                    source: io::Error::new(io::ErrorKind::PermissionDenied, "denied"),
+                })),
+                true,
+            ),
+        ]
+    }
+
+    /// The union is the command failure space, so its `source` must forward to
+    /// the wrapped error rather than swallow it.
+    #[test]
+    fn the_error_union_forwards_display_and_source() {
+        for (error, has_source) in builders() {
+            let has_underlying_source = error.source().and_then(|e| e.source()).is_some();
+            assert_eq!(has_underlying_source, has_source, "{error}");
+            assert!(!error.to_string().is_empty(), "{error}");
+        }
+    }
+
+    #[test]
+    fn every_command_error_converts_into_the_union() {
+        let _: Error = InitError::AlreadyInitialized(std::path::PathBuf::from("mono.toml")).into();
     }
 }

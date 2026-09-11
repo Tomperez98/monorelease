@@ -4,18 +4,42 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error as StdError;
 use std::fmt;
 use std::fs;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::Serialize;
 
-use crate::config::{PipelineConfig, StdinMode, TaskConfig, config_path, validate_process_value};
+use crate::config::{PipelineConfig, StdinMode, TaskConfig, config_path};
 use crate::discovery::find_root;
+
+mod matrix;
+mod suggest;
+#[cfg(test)]
+mod tests;
+mod validate;
+
+use matrix::{
+    base_task_name, format_task_instance, interpolate_value, matrix_instances, task_dimensions,
+    validate_matrix_instance,
+};
+use suggest::closest_name;
+pub(crate) use validate::validate_schema;
+use validate::{validate_identifier, validate_task_config, validate_task_reference};
 
 /// A task identity in the single root graph.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub struct TaskNode {
     pub id: String,
+}
+
+impl TaskNode {
+    pub fn new(id: impl Into<String>) -> Self {
+        Self { id: id.into() }
+    }
+
+    pub fn id(&self) -> &str {
+        &self.id
+    }
 }
 
 /// One executable task in a deterministic task-DAG plan.
@@ -41,26 +65,12 @@ pub struct PlannedTask {
     depends_on: Vec<TaskNode>,
 }
 
-impl TaskNode {
-    pub fn new(id: impl Into<String>) -> Self {
-        Self { id: id.into() }
-    }
-
-    pub fn id(&self) -> &str {
-        &self.id
-    }
-}
-
 impl PlannedTask {
     pub fn node(&self) -> TaskNode {
         TaskNode::new(self.id.clone())
     }
 
     pub fn id(&self) -> &str {
-        &self.id
-    }
-
-    pub fn task(&self) -> &str {
         &self.id
     }
 
@@ -428,11 +438,13 @@ impl Project {
             })
         };
         let cwd = interpolate(task.cwd.as_deref().unwrap_or("."))?;
-        let cwd_path =
-            fs::canonicalize(self.root.join(&cwd)).map_err(|source| ProjectError::Io {
+        let cwd_path = fs::canonicalize(self.root.join(&cwd)).map_err(|source| {
+            ProjectError::TaskDirectory {
+                task: node.id.clone(),
                 path: self.root.join(&cwd),
                 source,
-            })?;
+            }
+        })?;
         if !cwd_path.starts_with(&self.root) || !cwd_path.is_dir() {
             return Err(ProjectError::InvalidTask {
                 task: node.id.clone(),
@@ -573,390 +585,6 @@ impl Project {
     }
 }
 
-pub(crate) fn validate_schema(path: &Path, schema: u32) -> Result<(), ProjectError> {
-    if schema != crate::config::SUPPORTED_SCHEMA {
-        return Err(ProjectError::UnsupportedSchema {
-            path: path.to_path_buf(),
-            found: schema,
-            supported: crate::config::SUPPORTED_SCHEMA,
-        });
-    }
-    Ok(())
-}
-
-fn validate_task_config(
-    manifest_path: &Path,
-    root: &Path,
-    task_name: &str,
-    task: &TaskConfig,
-) -> Result<(), ProjectError> {
-    validate_identifier(manifest_path, "task name", task_name)?;
-    if task_name.contains(['[', ']', '=', ',']) {
-        return Err(ProjectError::InvalidTaskName {
-            task: task_name.to_owned(),
-        });
-    }
-    if task.command.is_empty() || task.command[0].is_empty() {
-        return Err(ProjectError::InvalidTask {
-            task: task_name.to_owned(),
-            message: "command must contain an executable".to_owned(),
-        });
-    }
-    for (index, argument) in task.command.iter().enumerate() {
-        validate_process_value(argument, &format!("command argument {index}")).map_err(
-            |message| ProjectError::InvalidTask {
-                task: task_name.to_owned(),
-                message,
-            },
-        )?;
-    }
-    for (key, value) in &task.env {
-        validate_process_value(key, "environment key")
-            .and_then(|_| validate_process_value(value, "environment value"))
-            .map_err(|message| ProjectError::InvalidTask {
-                task: task_name.to_owned(),
-                message,
-            })?;
-    }
-    if task.cache
-        && (task.inputs.is_empty() || !task.inputs.iter().any(|pattern| !pattern.starts_with('!')))
-    {
-        return Err(ProjectError::InvalidTask {
-            task: task_name.to_owned(),
-            message: "cacheable tasks must declare at least one positive input pattern".to_owned(),
-        });
-    }
-    if task.cache && task.stdin == StdinMode::Inherit {
-        return Err(ProjectError::InvalidTask {
-            task: task_name.to_owned(),
-            message: "cacheable tasks cannot inherit standard input".to_owned(),
-        });
-    }
-    if !task.outputs.is_empty() && !task.outputs.iter().any(|pattern| !pattern.starts_with('!')) {
-        return Err(ProjectError::InvalidTask {
-            task: task_name.to_owned(),
-            message: "outputs must declare at least one positive pattern".to_owned(),
-        });
-    }
-    for pattern in task.inputs.iter().chain(&task.outputs) {
-        validate_cache_pattern(pattern).map_err(|message| ProjectError::InvalidTask {
-            task: task_name.to_owned(),
-            message,
-        })?;
-    }
-    for variable in &task.cache_env {
-        if variable.is_empty() || variable.contains('=') || variable.contains('\0') {
-            return Err(ProjectError::InvalidTask {
-                task: task_name.to_owned(),
-                message: "cache_env names must be non-empty and cannot contain '=' or NUL"
-                    .to_owned(),
-            });
-        }
-    }
-    if task.timeout_seconds == 0 {
-        return Err(ProjectError::InvalidTask {
-            task: task_name.to_owned(),
-            message: "timeout_seconds must be greater than zero".to_owned(),
-        });
-    }
-    if task.max_output_bytes == 0 || usize::try_from(task.max_output_bytes).is_err() {
-        return Err(ProjectError::InvalidTask {
-            task: task_name.to_owned(),
-            message: "max_output_bytes must be positive and fit in platform usize".to_owned(),
-        });
-    }
-    if task.retries > 0 && task.retry_backoff_seconds > 86_400 {
-        return Err(ProjectError::InvalidTask {
-            task: task_name.to_owned(),
-            message: "retry_backoff_seconds must not exceed 86400".to_owned(),
-        });
-    }
-    if let Some(group) = &task.resource_group
-        && (group.is_empty()
-            || group.contains(':')
-            || group.contains('\0')
-            || group.chars().any(char::is_control))
-    {
-        return Err(ProjectError::InvalidTask {
-            task: task_name.to_owned(),
-            message: "resource_group must be non-empty and cannot contain ':', NUL, or control characters".to_owned(),
-        });
-    }
-    if let Some(cwd) = &task.cwd {
-        if !valid_relative_path(cwd) {
-            return Err(ProjectError::InvalidTask {
-                task: task_name.to_owned(),
-                message: "cwd must be an existing relative directory without '..'".to_owned(),
-            });
-        }
-        if !cwd.contains("${") {
-            let cwd_path = root.join(cwd);
-            let canonical = fs::canonicalize(&cwd_path).map_err(|source| ProjectError::Io {
-                path: cwd_path.clone(),
-                source,
-            })?;
-            if !canonical.starts_with(root) || !canonical.is_dir() {
-                return Err(ProjectError::InvalidTask {
-                    task: task_name.to_owned(),
-                    message: "cwd must resolve to a directory inside the project root".to_owned(),
-                });
-            }
-        }
-    }
-    for (dimension, values) in &task.matrix {
-        validate_identifier(manifest_path, "matrix dimension", dimension)?;
-        if values.is_empty() {
-            return Err(ProjectError::InvalidTask {
-                task: task_name.to_owned(),
-                message: format!("matrix dimension '{dimension}' must have at least one value"),
-            });
-        }
-        let mut seen = BTreeSet::new();
-        for value in values {
-            validate_process_value(value, "matrix value")
-                .and_then(|_| {
-                    if value.contains(['[', ']', '=', ',']) {
-                        Err("matrix values cannot contain '[', ']', '=', or ','".to_owned())
-                    } else if value.chars().any(char::is_control) {
-                        Err("matrix values cannot contain control characters".to_owned())
-                    } else {
-                        Ok(())
-                    }
-                })
-                .map_err(|message| ProjectError::InvalidTask {
-                    task: task_name.to_owned(),
-                    message,
-                })?;
-            if !seen.insert(value) {
-                return Err(ProjectError::InvalidTask {
-                    task: task_name.to_owned(),
-                    message: format!(
-                        "matrix dimension '{dimension}' contains duplicate value '{value}'"
-                    ),
-                });
-            }
-        }
-    }
-    let matrix_size = task
-        .matrix
-        .values()
-        .try_fold(1usize, |size, values| size.checked_mul(values.len()))
-        .ok_or_else(|| ProjectError::InvalidTask {
-            task: task_name.to_owned(),
-            message: "matrix has too many instances".to_owned(),
-        })?;
-    if matrix_size > 1024 {
-        return Err(ProjectError::InvalidTask {
-            task: task_name.to_owned(),
-            message: "matrix cannot expand to more than 1024 instances".to_owned(),
-        });
-    }
-    Ok(())
-}
-
-fn validate_identifier(path: &Path, label: &str, value: &str) -> Result<(), ProjectError> {
-    if value.is_empty() || value.contains('\0') || value.chars().any(char::is_control) {
-        return Err(ProjectError::InvalidManifest {
-            path: path.to_path_buf(),
-            message: format!(
-                "{label} must be non-empty and cannot contain NUL or control characters"
-            ),
-        });
-    }
-    Ok(())
-}
-
-fn validate_task_reference(reference: &str) -> Result<(), String> {
-    if reference.is_empty() || reference.contains('\0') || reference.chars().any(char::is_control) {
-        Err(
-            "task reference must be non-empty and cannot contain NUL or control characters"
-                .to_owned(),
-        )
-    } else {
-        Ok(())
-    }
-}
-
-fn valid_relative_path(path: &str) -> bool {
-    let path = Path::new(path);
-    !path.as_os_str().is_empty()
-        && path
-            .components()
-            .all(|component| matches!(component, Component::Normal(_) | Component::CurDir))
-}
-
-fn validate_cache_pattern(pattern: &str) -> Result<(), String> {
-    let pattern = pattern.strip_prefix('!').unwrap_or(pattern);
-    if pattern.is_empty() || pattern.contains('\0') || Path::new(pattern).is_absolute() {
-        return Err("cache patterns must be non-empty and relative".to_owned());
-    }
-    if pattern
-        .split('/')
-        .any(|segment| segment.is_empty() || segment == "..")
-    {
-        return Err("cache patterns cannot contain empty or '..' path segments".to_owned());
-    }
-    Ok(())
-}
-
-fn base_task_name(task: &str) -> Result<&str, ()> {
-    match task.find('[') {
-        None => Ok(task),
-        Some(index) if task.ends_with(']') && index > 0 => Ok(&task[..index]),
-        Some(_) => Err(()),
-    }
-}
-
-fn task_dimensions(task: &str) -> Result<BTreeMap<String, String>, ()> {
-    let Some(index) = task.find('[') else {
-        return Ok(BTreeMap::new());
-    };
-    if !task.ends_with(']') {
-        return Err(());
-    }
-    let body = &task[index + 1..task.len() - 1];
-    if body.is_empty() {
-        return Err(());
-    }
-    let mut dimensions = BTreeMap::new();
-    for pair in body.split(',') {
-        let Some((key, value)) = pair.split_once('=') else {
-            return Err(());
-        };
-        if key.is_empty()
-            || value.is_empty()
-            || dimensions
-                .insert(key.to_owned(), value.to_owned())
-                .is_some()
-        {
-            return Err(());
-        }
-    }
-    Ok(dimensions)
-}
-
-fn validate_matrix_instance(
-    matrix: &BTreeMap<String, Vec<String>>,
-    dimensions: &BTreeMap<String, String>,
-) -> Result<(), String> {
-    if matrix.is_empty() {
-        return if dimensions.is_empty() {
-            Ok(())
-        } else {
-            Err("task is not matrix-parameterized".to_owned())
-        };
-    }
-    if matrix.len() != dimensions.len() {
-        return Err("matrix task references must specify every dimension".to_owned());
-    }
-    for (key, values) in matrix {
-        let Some(value) = dimensions.get(key) else {
-            return Err(format!(
-                "matrix task reference is missing dimension '{key}'"
-            ));
-        };
-        if !values.contains(value) {
-            return Err(format!("matrix dimension '{key}' has no value '{value}'"));
-        }
-    }
-    Ok(())
-}
-
-fn format_task_instance(base: &str, dimensions: &BTreeMap<String, String>) -> String {
-    if dimensions.is_empty() {
-        return base.to_owned();
-    }
-    let values = dimensions
-        .iter()
-        .map(|(key, value)| format!("{key}={value}"))
-        .collect::<Vec<_>>()
-        .join(",");
-    format!("{base}[{values}]")
-}
-
-fn matrix_instances(
-    matrix: &BTreeMap<String, Vec<String>>,
-    fixed: &BTreeMap<String, String>,
-) -> Result<Vec<BTreeMap<String, String>>, String> {
-    if matrix.is_empty() {
-        return Ok(vec![BTreeMap::new()]);
-    }
-    let mut instances = vec![BTreeMap::new()];
-    for (key, values) in matrix {
-        let selected = if let Some(value) = fixed.get(key) {
-            if !values.contains(value) {
-                return Err(format!("matrix dimension '{key}' has no value '{value}'"));
-            }
-            vec![value.clone()]
-        } else {
-            values.clone()
-        };
-        let mut next = Vec::new();
-        for instance in instances {
-            for value in &selected {
-                let mut expanded = instance.clone();
-                expanded.insert(key.clone(), value.clone());
-                next.push(expanded);
-            }
-        }
-        instances = next;
-    }
-    Ok(instances)
-}
-
-fn interpolate_value(value: &str, dimensions: &BTreeMap<String, String>) -> Result<String, String> {
-    let mut output = String::with_capacity(value.len());
-    let mut remaining = value;
-    while let Some(start) = remaining.find("${") {
-        output.push_str(&remaining[..start]);
-        let after = &remaining[start + 2..];
-        let Some(end) = after.find('}') else {
-            return Err(format!("unterminated matrix placeholder in `{value}`"));
-        };
-        let key = &after[..end];
-        let replacement = dimensions
-            .get(key)
-            .ok_or_else(|| format!("unknown matrix placeholder `${{{key}}}` in `{value}`"))?;
-        output.push_str(replacement);
-        remaining = &after[end + 1..];
-    }
-    output.push_str(remaining);
-    Ok(output)
-}
-
-fn closest_name<'a>(
-    name: &str,
-    candidates: impl IntoIterator<Item = &'a String>,
-) -> Option<String> {
-    let max_distance = if name.len() <= 4 { 1 } else { 2 };
-    candidates
-        .into_iter()
-        .filter(|candidate| candidate.as_str() != name)
-        .map(|candidate| (edit_distance(name, candidate), candidate))
-        .filter(|(distance, _)| *distance <= max_distance)
-        .min_by(|(left_distance, left), (right_distance, right)| {
-            left_distance
-                .cmp(right_distance)
-                .then_with(|| left.cmp(right))
-        })
-        .map(|(_, candidate)| candidate.clone())
-}
-
-fn edit_distance(left: &str, right: &str) -> usize {
-    let mut previous = (0..=right.len()).collect::<Vec<_>>();
-    for (left_index, left_byte) in left.bytes().enumerate() {
-        let mut current = vec![left_index + 1];
-        for (right_index, right_byte) in right.bytes().enumerate() {
-            let substitution = previous[right_index] + usize::from(left_byte != right_byte);
-            let insertion = current[right_index] + 1;
-            let deletion = previous[right_index + 1] + 1;
-            current.push(substitution.min(insertion).min(deletion));
-        }
-        previous = current;
-    }
-    previous[right.len()]
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum VisitState {
     Visiting,
@@ -966,6 +594,13 @@ enum VisitState {
 #[derive(Debug)]
 pub enum ProjectError {
     Io {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    /// A task `cwd` the manifest declares cannot be resolved — a request the
+    /// caller can fix, not an environment failure.
+    TaskDirectory {
+        task: String,
         path: PathBuf,
         source: std::io::Error,
     },
@@ -1016,6 +651,11 @@ impl fmt::Display for ProjectError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Io { path, source } => write!(f, "could not read {}: {source}", path.display()),
+            Self::TaskDirectory { task, path, source } => write!(
+                f,
+                "task '{task}': could not resolve cwd {}: {source}",
+                path.display()
+            ),
             Self::Parse { path, source } => {
                 write!(f, "could not parse {}: {source}", path.display())
             }
@@ -1073,6 +713,7 @@ impl StdError for ProjectError {
         match self {
             Self::Io { source, .. } => Some(source),
             Self::Parse { source, .. } => Some(source),
+            Self::TaskDirectory { source, .. } => Some(source),
             _ => None,
         }
     }

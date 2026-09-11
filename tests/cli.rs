@@ -1,37 +1,14 @@
 //! End-to-end checks of the CLI transport contract.
 
 use std::fs;
-use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::path::Path;
+#[cfg(unix)]
+use std::process::Command;
+use std::process::Output;
 
-struct TempDir(PathBuf);
+mod support;
 
-impl TempDir {
-    fn new(name: &str) -> Self {
-        let path = std::env::temp_dir().join(format!("mono-cli-{}-{name}", std::process::id()));
-        let _ = fs::remove_dir_all(&path);
-        fs::create_dir_all(&path).expect("create temp dir");
-        Self(path)
-    }
-
-    fn path(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
-
-fn mono(args: &[&str], cwd: &Path) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_mono"))
-        .args(args)
-        .current_dir(cwd)
-        .output()
-        .expect("run mono")
-}
+use support::{TempDir, mono};
 
 fn stdout(output: &Output) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
@@ -297,21 +274,24 @@ fn json_success_documents_cover_non_execution_commands() {
 
 #[cfg(unix)]
 #[test]
-fn github_actions_output_disables_command_processing_for_task_output() {
-    let temp = TempDir::new("github-output");
+fn stream_output_prefixes_task_bytes_and_reports_summary() {
+    let temp = TempDir::new("stream-output");
     write_project(
         temp.path(),
-        "[pipelines.ci]\ntasks = [\"build\"]\n\n[tasks.build]\ncommand = [\"sh\", \"-c\", \"printf '::error:: injected'\"]\n",
+        "[pipelines.ci]\ntasks = [\"build\"]\n\n[tasks.build]\ncommand = [\"sh\", \"-c\", \"printf 'output'\"]\n",
     );
-    let output = mono(
-        &["--output", "github-actions", "run", "--no-cache"],
-        temp.path(),
-    );
+    let output = mono(&["--ui", "stream", "run", "--no-cache"], temp.path());
     assert!(output.status.success(), "{}", stderr(&output));
-    let text = stdout(&output);
-    assert!(text.contains("::stop-commands::"), "{text}");
-    assert!(text.contains("::mono_output_"), "{text}");
-    assert!(text.contains("::error:: injected"), "{text}");
+    assert!(
+        stdout(&output).contains("[build] output"),
+        "{}",
+        stdout(&output)
+    );
+    assert!(
+        stderr(&output).contains("└─ build: completed"),
+        "{}",
+        stderr(&output)
+    );
 }
 
 #[cfg(unix)]
@@ -322,9 +302,13 @@ fn live_output_streams_task_bytes_and_reports_summary() {
         temp.path(),
         "[pipelines.ci]\ntasks = [\"build\"]\n\n[tasks.build]\ncommand = [\"sh\", \"-c\", \"printf one; sleep 0.02; printf two\"]\n",
     );
-    let output = mono(&["--output", "live", "run", "--no-cache"], temp.path());
+    let output = mono(&["--ui", "stream", "run", "--no-cache"], temp.path());
     assert!(output.status.success(), "{}", stderr(&output));
-    assert!(stdout(&output).contains("onetwo"), "{}", stdout(&output));
+    assert!(
+        stdout(&output).contains("[build] onetwo"),
+        "{}",
+        stdout(&output)
+    );
     assert!(
         stdout(&output).contains("1 completed"),
         "{}",
@@ -347,4 +331,82 @@ fn json_errors_are_documents_on_stdout() {
     assert_eq!(document["kind"], "error");
     assert_eq!(document["code"], 1);
     assert!(document["message"].as_str().unwrap().contains("missing"));
+}
+
+/// A refactor once made `scheduler::classify` stop treating a cancelled task as
+/// the reported error, so an interrupted run fell through to `Ok(summary)` and
+/// exited `0`. Nothing failed, because no test covered the Ctrl-C path. This
+/// pins it. The exit code is asserted as "not success" rather than `Some(1)` so
+/// the test still means something if the signal lands before the handler is
+/// installed and the process dies by signal (`code() == None`).
+#[cfg(unix)]
+#[test]
+fn an_interrupted_run_does_not_report_success() {
+    let temp = TempDir::new("cancel");
+    write_project(
+        temp.path(),
+        "[pipelines.ci]\ntasks = [\"slow\"]\n\n[tasks.slow]\ncommand = [\"sleep\", \"30\"]\n",
+    );
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_mono"))
+        .args(["ci", "--no-cache"])
+        .current_dir(temp.path())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn mono");
+
+    // Long enough for the Ctrl-C handler to be installed and the task to start.
+    std::thread::sleep(std::time::Duration::from_millis(2000));
+    let signaled = Command::new("kill")
+        .args(["-INT", &child.id().to_string()])
+        .status()
+        .expect("send SIGINT");
+    assert!(signaled.success(), "could not signal mono");
+
+    let status = child.wait().expect("wait for mono");
+
+    assert_ne!(
+        status.code(),
+        Some(0),
+        "an interrupted run reported success; a cancelled task must still be the \
+         reported error in scheduler::classify"
+    );
+}
+
+/// `std::env::vars()` panics when any ambient variable is not valid Unicode. The
+/// cache session gathers the environment once, so calling `vars()` there aborts
+/// the whole run because of an unrelated variable — `vars_os` plus a lossy
+/// conversion does not. The variable is set on the child process rather than
+/// with `set_var`, which is `unsafe` in Rust 2024 and racy under parallel tests.
+#[cfg(unix)]
+#[test]
+fn a_non_unicode_environment_variable_does_not_abort_a_cached_run() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    let temp = TempDir::new("non-unicode-env");
+    write_project(
+        temp.path(),
+        "[pipelines.ci]\ntasks = [\"build\"]\n\n[tasks.build]\ncommand = [\"sh\", \"-c\", \"cat seed > artifact\"]\ncache = true\ninputs = [\"seed\"]\noutputs = [\"artifact\"]\ncache_env = [\"*\"]\n",
+    );
+    fs::write(temp.path().join("seed"), "hello").unwrap();
+
+    // Deliberately no `--no-cache`: the cache session only prepares when the
+    // cache is enabled, and preparing is where the environment is gathered.
+    let output = Command::new(env!("CARGO_BIN_EXE_mono"))
+        .args(["ci"])
+        .current_dir(temp.path())
+        .env(
+            "MONO_TEST_NON_UNICODE",
+            OsString::from_vec(vec![0xff, 0xfe]),
+        )
+        .output()
+        .expect("run mono");
+
+    assert!(
+        output.status.success(),
+        "a non-UTF-8 environment variable aborted the run: {}",
+        stderr(&output)
+    );
 }

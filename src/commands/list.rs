@@ -129,3 +129,47 @@ impl From<ProjectError> for ListError {
         Self::Project(error)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::config_path;
+    use crate::testing::TempDir;
+    use std::fs;
+
+    fn write_manifest(temp: &TempDir) {
+        fs::write(
+            config_path(temp.path()),
+            "[project]\nname = \"fixture\"\n\n[pipelines.ci]\ntasks = [\"build\"]\nfinally = [\"cleanup\"]\n\n[tasks.build]\ncommand = [\"echo\", \"build\"]\n\n[tasks.cleanup]\ncommand = [\"echo\", \"cleanup\"]\nstdin = \"inherit\"\n",
+        )
+        .expect("write project manifest");
+    }
+
+    #[test]
+    fn terminal_list_contains_pipeline_finalizer_and_task_command() {
+        let temp = TempDir::new();
+        write_manifest(&temp);
+
+        let output = list_with_output(temp.path(), OutputMode::Terminal).expect("list succeeds");
+
+        assert!(output.contains("ci: build"));
+        assert!(output.contains("finally: cleanup"));
+        assert!(output.contains("build: echo build"));
+        assert!(output.contains("cleanup: echo cleanup"));
+    }
+
+    #[test]
+    fn json_list_contains_pipeline_task_and_stdin_contracts() {
+        let temp = TempDir::new();
+        write_manifest(&temp);
+
+        let output = list_with_output(temp.path(), OutputMode::Json).expect("JSON list succeeds");
+        let value: serde_json::Value = serde_json::from_str(&output).expect("valid JSON");
+
+        assert_eq!(value["schema"], crate::events::EXECUTION_EVENT_SCHEMA);
+        assert_eq!(value["kind"], "list");
+        assert_eq!(value["default_pipeline"], "ci");
+        assert_eq!(value["pipelines"][0]["finally"][0], "cleanup");
+        assert_eq!(value["tasks"][1]["stdin"], "inherit");
+    }
+}
