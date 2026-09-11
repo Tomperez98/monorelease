@@ -385,19 +385,22 @@ fn emit_summary(sink: &mut impl Write, summary: &str) -> u8 {
 /// A closed stderr must never mask the failure, so the write is best effort and
 /// the code comes from the error alone.
 fn emit_error(sink: &mut impl Write, error: &Error, output: OutputMode) -> u8 {
+    let code = exit_code(error);
     if output == OutputMode::Json {
-        let document = serde_json::json!({
-            "schema": mono::JSON_OUTPUT_SCHEMA,
-            "kind": "error",
-            "code": exit_code(error),
-            "message": error.to_string(),
-        });
-        let _ = serde_json::to_writer(&mut *sink, &document);
+        let _ = sink.write_all(
+            serialize(&ErrorDocument {
+                schema: mono::JSON_OUTPUT_SCHEMA,
+                kind: "error",
+                code,
+                message: &error.to_string(),
+            })
+            .as_bytes(),
+        );
         let _ = sink.write_all(b"\n");
     } else {
         let _ = writeln!(sink, "mono: {error}");
     }
-    exit_code(error)
+    code
 }
 
 /// Map the single error vocabulary onto this CLI's exit code, once.
@@ -578,16 +581,7 @@ fn execute_pipeline(
 
 fn run_check(root: &Path, output: OutputMode) -> Result<String, Error> {
     let project = mono::Project::load(root).map_err(mono::DoctorError::from)?;
-    if output == OutputMode::Json {
-        Ok(format!(
-            "{{\"schema\":{},\"kind\":\"check\",\"status\":\"ok\",\"project\":{}}}",
-            mono::JSON_OUTPUT_SCHEMA,
-            serde_json::to_string(&project.root.display().to_string())
-                .expect("path is serializable")
-        ))
-    } else {
-        Ok(format!("checked {}", project.root.display()))
-    }
+    Ok(check_document(output, &project.root))
 }
 
 fn run_list(root: &Path, output: OutputMode) -> Result<String, Error> {
@@ -686,17 +680,61 @@ fn run_release(root: &Path, command: ReleaseCommands, output: OutputMode) -> Res
     Ok(success_document(output, kind, message))
 }
 
-fn success_document(output: OutputMode, kind: &str, message: String) -> String {
+/// The success document every non-execution command returns in JSON mode.
+#[derive(serde::Serialize)]
+struct SuccessDocument {
+    schema: u32,
+    kind: &'static str,
+    status: &'static str,
+    message: String,
+}
+
+/// The `check` document, which reports the resolved project root.
+#[derive(serde::Serialize)]
+struct CheckDocument {
+    schema: u32,
+    kind: &'static str,
+    status: &'static str,
+    project: String,
+}
+
+/// The failure document for JSON mode.
+#[derive(serde::Serialize)]
+struct ErrorDocument<'a> {
+    schema: u32,
+    kind: &'static str,
+    code: u8,
+    message: &'a str,
+}
+
+/// Serialize a document that contains only serializable fields.
+fn serialize(document: &impl serde::Serialize) -> String {
+    serde_json::to_string(document).expect("output documents contain only serializable fields")
+}
+
+fn success_document(output: OutputMode, kind: &'static str, message: String) -> String {
     if output == OutputMode::Json {
-        serde_json::json!({
-            "schema": mono::JSON_OUTPUT_SCHEMA,
-            "kind": kind,
-            "status": "ok",
-            "message": message,
+        serialize(&SuccessDocument {
+            schema: mono::JSON_OUTPUT_SCHEMA,
+            kind,
+            status: "ok",
+            message,
         })
-        .to_string()
     } else {
         message
+    }
+}
+
+fn check_document(output: OutputMode, root: &Path) -> String {
+    if output == OutputMode::Json {
+        serialize(&CheckDocument {
+            schema: mono::JSON_OUTPUT_SCHEMA,
+            kind: "check",
+            status: "ok",
+            project: root.display().to_string(),
+        })
+    } else {
+        format!("checked {}", root.display())
     }
 }
 
@@ -717,7 +755,7 @@ fn resolve_path(root: &Path, path: PathBuf) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mono::{DoctorError, ListError, ProjectError};
+    use mono::{CiError, DoctorError, ListError, ProjectError};
 
     /// A writer that fails every write, standing in for a consumer that hung up
     /// (`BrokenPipe`) or a disk that is full (`StorageFull`).
@@ -888,5 +926,42 @@ mod tests {
             resolve_path(root, PathBuf::from("/tmp/notes.md")),
             PathBuf::from("/tmp/notes.md")
         );
+    }
+
+    #[test]
+    fn success_documents_have_the_documented_shape() {
+        let document =
+            success_document(OutputMode::Json, "cache_clean", "removed cache".to_owned());
+        let value: serde_json::Value = serde_json::from_str(&document).expect("valid JSON");
+
+        assert_eq!(value["schema"], mono::JSON_OUTPUT_SCHEMA);
+        assert_eq!(value["kind"], "cache_clean");
+        assert_eq!(value["status"], "ok");
+        assert_eq!(value["message"], "removed cache");
+    }
+
+    #[test]
+    fn a_check_document_reports_the_project_root() {
+        let document = check_document(OutputMode::Json, Path::new("/workspace"));
+        let value: serde_json::Value = serde_json::from_str(&document).expect("valid JSON");
+
+        assert_eq!(value["schema"], mono::JSON_OUTPUT_SCHEMA);
+        assert_eq!(value["kind"], "check");
+        assert_eq!(value["status"], "ok");
+        assert_eq!(value["project"], "/workspace");
+    }
+
+    #[test]
+    fn error_documents_have_the_documented_shape() {
+        let error = Error::Ci(CiError::InvalidJobs);
+        let mut sink = Vec::new();
+
+        emit_error(&mut sink, &error, OutputMode::Json);
+
+        let value: serde_json::Value = serde_json::from_slice(&sink).expect("valid JSON");
+        assert_eq!(value["schema"], mono::JSON_OUTPUT_SCHEMA);
+        assert_eq!(value["kind"], "error");
+        assert_eq!(value["code"], EXIT_USAGE);
+        assert!(value["message"].as_str().unwrap().contains("--jobs"));
     }
 }
