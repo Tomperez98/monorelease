@@ -1,7 +1,7 @@
 # Standalone demo
 
-This is a single-project `monorelease` configuration. It has one root
-`monorepo.toml`, one package, and no `apps/`, `packages/`, or child manifests.
+This is a single-project `mono` configuration. It has one root
+`mono.toml`, one package, and no `apps/`, `packages/`, or child manifests.
 The tasks use `src/` as their working directory to demonstrate that commands
 can be invoked from a nested project directory.
 

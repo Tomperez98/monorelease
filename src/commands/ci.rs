@@ -12,102 +12,6 @@ use crate::runner::format_command;
 use crate::scheduler::{ExecutionSummary, SchedulerError, execute_plan};
 use crate::workspace::{PlannedTask, TaskNode, Workspace, WorkspaceError};
 
-/// Run the workspace's default pipeline with one worker.
-pub fn ci(
-    path: &Path,
-    selected_package: Option<&str>,
-    requested_tasks: &[String],
-    dry_run: bool,
-) -> Result<String, CiError> {
-    run_pipeline_with_options(
-        path,
-        None,
-        selected_package,
-        requested_tasks,
-        dry_run,
-        1,
-        CacheMode::ReadWrite,
-    )
-}
-
-/// Run the workspace's default pipeline with a bounded worker count.
-pub fn ci_with_jobs(
-    path: &Path,
-    selected_package: Option<&str>,
-    requested_tasks: &[String],
-    dry_run: bool,
-    jobs: usize,
-) -> Result<String, CiError> {
-    run_pipeline_with_options(
-        path,
-        None,
-        selected_package,
-        requested_tasks,
-        dry_run,
-        jobs,
-        CacheMode::ReadWrite,
-    )
-}
-
-/// Run a named pipeline with one worker.
-pub fn run_pipeline(
-    path: &Path,
-    pipeline: Option<&str>,
-    selected_package: Option<&str>,
-    requested_tasks: &[String],
-    dry_run: bool,
-) -> Result<String, CiError> {
-    run_pipeline_with_options(
-        path,
-        pipeline,
-        selected_package,
-        requested_tasks,
-        dry_run,
-        1,
-        CacheMode::ReadWrite,
-    )
-}
-
-/// Run a named pipeline with a bounded worker count.
-pub fn run_pipeline_with_jobs(
-    path: &Path,
-    pipeline: Option<&str>,
-    selected_package: Option<&str>,
-    requested_tasks: &[String],
-    dry_run: bool,
-    jobs: usize,
-) -> Result<String, CiError> {
-    run_pipeline_with_options(
-        path,
-        pipeline,
-        selected_package,
-        requested_tasks,
-        dry_run,
-        jobs,
-        CacheMode::ReadWrite,
-    )
-}
-
-pub fn run_pipeline_with_cache(
-    path: &Path,
-    pipeline: Option<&str>,
-    selected_package: Option<&str>,
-    requested_tasks: &[String],
-    dry_run: bool,
-    jobs: usize,
-    cache_mode: CacheMode,
-) -> Result<String, CiError> {
-    run_pipeline_with_options(
-        path,
-        pipeline,
-        selected_package,
-        requested_tasks,
-        dry_run,
-        jobs,
-        cache_mode,
-    )
-}
-
 /// Selects the cache and output contracts for a pipeline run.
 #[derive(Debug, Clone, Copy)]
 pub struct PipelineExecution {
@@ -115,51 +19,23 @@ pub struct PipelineExecution {
     pub output: OutputMode,
 }
 
-/// Run a pipeline with an explicit execution contract.
-pub fn run_pipeline_with_mode(
-    path: &Path,
-    pipeline: Option<&str>,
-    selected_package: Option<&str>,
-    requested_tasks: &[String],
-    dry_run: bool,
-    jobs: usize,
-    execution: PipelineExecution,
-) -> Result<String, CiError> {
-    run_pipeline_with_options_and_mode(
-        path,
-        pipeline,
-        selected_package,
-        requested_tasks,
-        dry_run,
-        jobs,
-        execution,
-    )
-}
-
-pub(crate) fn run_pipeline_with_options(
-    path: &Path,
-    pipeline: Option<&str>,
-    selected_package: Option<&str>,
-    requested_tasks: &[String],
-    dry_run: bool,
-    jobs: usize,
-    cache_mode: CacheMode,
-) -> Result<String, CiError> {
-    run_pipeline_with_mode(
-        path,
-        pipeline,
-        selected_package,
-        requested_tasks,
-        dry_run,
-        jobs,
-        PipelineExecution {
-            cache: cache_mode,
+impl Default for PipelineExecution {
+    /// The contract used when no flag selects one: terminal output with the
+    /// normal read/write cache.
+    fn default() -> Self {
+        Self {
+            cache: CacheMode::ReadWrite,
             output: OutputMode::Terminal,
-        },
-    )
+        }
+    }
 }
 
-fn run_pipeline_with_options_and_mode(
+/// Run a pipeline with an explicit execution contract.
+///
+/// This is the single entry point for workspace orchestration: every cache and
+/// output choice travels in `execution`, and `jobs == 0` is rejected here so no
+/// caller can reach the scheduler with an invalid worker count.
+pub fn run_pipeline_with_mode(
     path: &Path,
     pipeline: Option<&str>,
     selected_package: Option<&str>,
@@ -206,7 +82,7 @@ pub fn plan(
 /// Remove local cache entries while preserving the workspace and ignore file.
 pub fn clean_cache(path: &Path) -> Result<String, CiError> {
     let workspace = Workspace::load(path)?;
-    let cache_path = workspace.root.join(".monorelease").join("cache");
+    let cache_path = workspace.root.join(".mono").join("cache");
     match std::fs::remove_dir_all(&cache_path) {
         Ok(()) => Ok(format!("removed cache {}", cache_path.display())),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -363,7 +239,16 @@ mod tests {
             .expect("write package manifest");
         }
 
-        let output = ci(temp.path(), None, &[], true).expect("dry run succeeds");
+        let output = run_pipeline_with_mode(
+            temp.path(),
+            None,
+            None,
+            &[],
+            true,
+            1,
+            PipelineExecution::default(),
+        )
+        .expect("dry run succeeds");
 
         assert!(output.find("base:build").unwrap() < output.find("app:build").unwrap());
         assert!(output.contains("would run app:build"));
@@ -395,13 +280,30 @@ mod tests {
             .expect("write package manifest");
         }
 
-        ci_with_jobs(temp.path(), None, &[], false, 2).expect("resource group serializes tasks");
+        run_pipeline_with_mode(
+            temp.path(),
+            None,
+            None,
+            &[],
+            false,
+            2,
+            PipelineExecution::default(),
+        )
+        .expect("resource group serializes tasks");
     }
 
     #[test]
     fn rejects_zero_workers_before_loading_the_workspace() {
-        let error = ci_with_jobs(Path::new("."), None, &[], false, 0)
-            .expect_err("zero workers are invalid");
+        let error = run_pipeline_with_mode(
+            Path::new("."),
+            None,
+            None,
+            &[],
+            false,
+            0,
+            PipelineExecution::default(),
+        )
+        .expect_err("zero workers are invalid");
 
         assert!(matches!(error, CiError::InvalidJobs));
     }

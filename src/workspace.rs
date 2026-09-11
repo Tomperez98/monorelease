@@ -1,4 +1,4 @@
-//! Manifest validation and task-graph planning for a manifest-driven monorepo.
+//! Manifest validation and task-graph planning for a manifest-driven workspace.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error as StdError;
@@ -8,7 +8,7 @@ use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 use crate::config::{
-    MonorepoConfig, PackageConfig, PipelineConfig, TaskConfig, WORKSPACE_PACKAGE_NAME, config_path,
+    MonoConfig, PackageConfig, PipelineConfig, TaskConfig, WORKSPACE_PACKAGE_NAME, config_path,
     validate_process_value,
 };
 use crate::discovery::{RootKind, expand_member_pattern, find_root, read_manifest};
@@ -293,7 +293,7 @@ impl Workspace {
         Ok(workspace)
     }
 
-    fn load_standalone(root: PathBuf, root_config: MonorepoConfig) -> Result<Self, WorkspaceError> {
+    fn load_standalone(root: PathBuf, root_config: MonoConfig) -> Result<Self, WorkspaceError> {
         let package_config =
             root_config
                 .package
@@ -418,7 +418,7 @@ impl Workspace {
     pub fn scope_label(&self) -> &'static str {
         match self.kind {
             ScopeKind::Standalone => "project",
-            ScopeKind::Workspace => "monorepo",
+            ScopeKind::Workspace => "workspace",
         }
     }
 
@@ -1114,7 +1114,7 @@ impl fmt::Display for WorkspaceError {
             }
             Self::MissingRoot { start } => write!(
                 f,
-                "could not find a root monorepo.toml from {}",
+                "could not find a root mono.toml from {}",
                 start.display()
             ),
             Self::MissingPackageManifest { path } => {

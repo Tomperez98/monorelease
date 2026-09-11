@@ -1,15 +1,15 @@
-# monorelease
+# mono (release)
 
-Run every package's tasks in dependency order, from one `monorepo.toml` — in any language.
+Run every package's tasks in dependency order, from one `mono.toml` — in any language.
 
-[![CI](https://github.com/Tomperez98/monorelease/actions/workflows/ci.yml/badge.svg)](https://github.com/Tomperez98/monorelease/actions/workflows/ci.yml)
-[![Release](https://github.com/Tomperez98/monorelease/actions/workflows/release.yml/badge.svg)](https://github.com/Tomperez98/monorelease/actions/workflows/release.yml)
+[![CI](https://github.com/Tomperez98/mono/actions/workflows/ci.yml/badge.svg)](https://github.com/Tomperez98/mono/actions/workflows/ci.yml)
+[![Release](https://github.com/Tomperez98/mono/actions/workflows/release.yml/badge.svg)](https://github.com/Tomperez98/mono/actions/workflows/release.yml)
 ![License](https://img.shields.io/badge/license-Apache--2.0-blue)
 
-`monorelease` reads your manifests, builds one task graph across every package, and runs the commands. It does not know whether a package is Rust, Node, Go, Make, Docker, or a shell script: a task is an argv array, executed directly with no shell in between.
+`mono` reads your manifests, builds one task graph across every package, and runs the commands. It does not know whether a package is Rust, Node, Go, Make, Docker, or a shell script: a task is an argv array, executed directly with no shell in between.
 
 ```console
-$ monorelease --dir examples/echo task build --jobs 2
+$ mono --dir examples/echo task build --jobs 2
 ▶ docs:build
 ▶ shared:build
 ▶ app:build
@@ -30,7 +30,7 @@ summary: 3 completed, 0 cached, 0 failed, 0 blocked across 3 package(s)
 cargo install --path .
 ```
 
-Building requires Rust 1.88+ (edition 2024). Prebuilt binaries for Linux x86_64, macOS arm64, macOS x86_64, and Windows x86_64 are attached to each [GitHub release](https://github.com/Tomperez98/monorelease/releases) together with a `SHA256SUMS` file:
+Building requires Rust 1.88+ (edition 2024). Prebuilt binaries for Linux x86_64, macOS arm64, macOS x86_64, and Windows x86_64 are attached to each [GitHub release](https://github.com/Tomperez98/mono/releases) together with a `SHA256SUMS` file:
 
 ```bash
 sha256sum -c SHA256SUMS
@@ -38,10 +38,10 @@ sha256sum -c SHA256SUMS
 
 ## Quick start
 
-A project does not need to be a monorepo. One root manifest is enough:
+A project does not need to be a workspace. One root manifest is enough:
 
 ```toml
-# monorepo.toml
+# mono.toml
 [package]
 name = "my-project"
 
@@ -57,26 +57,26 @@ depends_on = ["build"]
 ```
 
 ```bash
-monorelease check    # validate manifests and the task graph
-monorelease          # run the default pipeline (ci)
-monorelease plan     # print the resolved order without running anything
+mono check    # validate manifests and the task graph
+mono          # run the default pipeline (ci)
+mono plan     # print the resolved order without running anything
 ```
 
 Scaffold that file instead of writing it by hand. The generated package is named `project`; rename it in the manifest afterward:
 
 ```bash
-monorelease init --standalone --command cargo --command build
+mono init --standalone --command cargo --command build
 ```
 
-For a monorepo, `monorelease init` writes a root workspace with member patterns instead:
+For a workspace, `mono init` writes a root manifest with member patterns instead:
 
 ```bash
-monorelease init
+mono init
 ```
 
 ```toml
 [workspace]
-name = "monorepo"
+name = "mono"
 members = ["apps/*", "packages/*"]
 default_pipeline = "ci"
 
@@ -87,7 +87,7 @@ tasks = ["build", "test"]
 Then add one manifest per package. `apps/web` can depend on `packages/shared` without either package knowing about the other:
 
 ```toml
-# apps/web/monorepo.toml
+# apps/web/mono.toml
 [package]
 name = "web"
 
@@ -102,32 +102,43 @@ depends_on = ["shared:build"]
 
 | Command | What it does |
 | --- | --- |
-| `monorelease` | Run the default pipeline. |
-| `monorelease run [PIPELINE]` | Run the default or a named pipeline (alias: `ci`). |
-| `monorelease task TASK...` | Run one or more tasks and their transitive dependencies. |
-| `monorelease check` | Validate manifests, references, and working directories (alias: `doctor`). |
-| `monorelease plan [PIPELINE]` | Print the dependency-first execution plan. |
-| `monorelease graph [PIPELINE]` | Print the dependency edges. |
-| `monorelease list` | List pipelines, tasks, and common commands. |
-| `monorelease init [--standalone] [--command CMD]` | Write a fresh manifest; refuses to overwrite an existing one. |
-| `monorelease cache clean` | Delete all local cache entries. |
+| `mono` | Run the default pipeline. |
+| `mono run [PIPELINE]` | Run the default or a named pipeline (alias: `ci`). |
+| `mono task TASK...` | Run one or more tasks and their transitive dependencies. |
+| `mono check` | Validate manifests, references, and working directories (alias: `doctor`). |
+| `mono plan [PIPELINE]` | Print the dependency-first execution plan. |
+| `mono graph [PIPELINE]` | Print the dependency edges. |
+| `mono list` | List pipelines, tasks, and common commands. |
+| `mono init [--standalone] [--command CMD]` | Write a fresh manifest; refuses to overwrite an existing one. |
+| `mono cache clean` | Delete all local cache entries. |
 
 `run` and `task` accept:
 
 | Flag | Default | Effect |
 | --- | --- | --- |
 | `--package NAME` | all packages | Restrict the run to one package, keeping its transitive dependencies. |
-| `--jobs N` | machine CPUs | Maximum independent tasks to execute concurrently. Defaults to this machine's available parallelism. |
+| `--jobs N` | machine CPUs | Maximum independent tasks to execute concurrently. Must be at least `1`. Defaults to this machine's available parallelism. |
 | `--dry-run` | off | Resolve and print the plan; run nothing and touch no cache. |
 | `--no-cache` | off | Skip reading and writing the cache for this run. |
 | `--force` | off | Ignore cache hits and refresh successful entries. |
 | `--output terminal\|github-actions` | `terminal` | Select the output contract. |
 
 ```bash
-monorelease task test --package web --jobs 4
-monorelease run release --dry-run
-monorelease --dir examples/echo task build --jobs 2
+mono task test --package web --jobs 4
+mono run release --dry-run
+mono --dir examples/echo task build --jobs 2
 ```
+
+## Exit codes
+
+| Code | Meaning |
+| --- | --- |
+| `0` | The command succeeded. |
+| `1` | The command was understood and failed: an invalid or unreadable manifest, an absent `--dir`, an unknown task or package, a task that exited non-zero, or a changelog or release check that did not pass. |
+| `2` | The command line was wrong. `clap` rejects it while parsing, so a bad value never reaches the pipeline — `--jobs 0` and empty values such as `--package ""` fail here. |
+| `3` | `mono` could not carry the command out: `init` could not write the manifest, `changelog` or `release` could not read or write its files, `git` could not be run, the cache could not be updated, or task output could not be written. |
+
+`1` and `3` are the useful pair in CI: `1` means the pipeline is red, `3` means the tool never got far enough to tell you.
 
 ## Manifest model
 
@@ -198,8 +209,8 @@ The schema is fixed: there is no `version` header, and unknown fields are reject
 - Nothing is implicit: no shell, no hidden environment merging, no working-directory mutation.
 
 ```console
-$ monorelease --dir examples/release-gate plan release
-monorepo release-gate (/path/to/examples/release-gate)
+$ mono --dir examples/release-gate plan release
+workspace release-gate (/path/to/examples/release-gate)
 would run api:build in .../packages/api: echo '[api] build' [timeout=30s] [max_output_bytes=16777216]
 would run api:test in .../packages/api: echo '[api] test' [timeout=30s] [max_output_bytes=16777216] [resource_group=checks]
 would run api:package in .../packages/api: echo '[api] package' [timeout=30s] [max_output_bytes=16777216]
@@ -224,7 +235,7 @@ cache_env = ["RUSTFLAGS"]
 A cache hit replays the captured stdout/stderr and restores the declared outputs, so downstream tasks see the same artifacts as a real run:
 
 ```console
-$ monorelease --dir examples/cache run
+$ mono --dir examples/cache run
 ▶ app:build
 [build] generated artifact from input: hello from the cache example
 app:build: cache hit in 0ms
@@ -236,7 +247,7 @@ summary: 1 completed, 1 cached, 0 failed, 0 blocked across 1 package(s)
 
 The key covers the task's package, name, cwd, command, timeout, output limit, resource group, input/output patterns, declared environment values, dependency keys, and the workspace and package manifest contents. Changing a declared input changes the key.
 
-Patterns select files with `*` (within a path segment), `**` (across segments), and a leading `!` to exclude; the last matching pattern wins. `.git` and `.monorelease` are never walked. A positive pattern that matches no files is an error, and symlink matches are rejected because content addressing cannot represent them. `.monorelease/.gitignore` keeps the store out of Git.
+Patterns select files with `*` (within a path segment), `**` (across segments), and a leading `!` to exclude; the last matching pattern wins. `.git` and `.mono` are never walked. A positive pattern that matches no files is an error, and symlink matches are rejected because content addressing cannot represent them. `.mono/.gitignore` keeps the store out of Git.
 
 Failed and timed-out tasks are never cached. `--force` re-runs cacheable tasks and refreshes their entries, `--no-cache` bypasses the cache for a run, and `--dry-run` never reads or writes it. `cache_env = ["*"]` hashes the complete inherited environment: more correct for environment-sensitive tasks, fewer hits.
 
@@ -248,7 +259,7 @@ Do not cache publishing, deployment, migration, time-dependent, network-dependen
 
 Root discovery walks up from `--dir` until it finds a manifest: the nearest `[workspace]` wins, otherwise the nearest `[package]`. A manifest containing both sections is rejected. A package manifest may contain only `[package]` and `[tasks]`; pipelines live in the root.
 
-`monorelease` plans and schedules work. It does not fetch dependencies, bump versions, or publish artifacts — a task does that by running the command your package already uses.
+`mono` plans and schedules work. It does not fetch dependencies, bump versions, or publish artifacts — a task does that by running the command your package already uses.
 
 ## Examples
 
@@ -268,7 +279,7 @@ cargo run -- run --dir examples/echo --jobs 2
 
 ## CI and releases
 
-The project dogfoods itself: `.github/workflows/ci.yml` runs the pipeline defined in its own root `monorepo.toml`, so local and hosted checks use the same task graph.
+The project dogfoods itself: `.github/workflows/ci.yml` runs the pipeline defined in its own root `mono.toml`, so local and hosted checks use the same task graph.
 
 ```bash
 cargo run --locked -- ci --no-cache --output github-actions
@@ -280,14 +291,31 @@ Releasing is a pipeline too, and it is the only place release knowledge lives:
 RELEASE_TAG=v0.1.2 cargo run --locked -- run release
 ```
 
-The tasks call [`xtask/`](xtask), a Rust helper that is deliberately *not* part of the published binary: `monorelease` stays generic and knows nothing about changelogs, release notes, or where a release is published — the same separation [`examples/release-gate`](examples/release-gate/README.md) describes. Run it directly with `cargo run -p xtask -- --help`.
+The tasks call [`xtask/`](xtask), a Rust helper that is deliberately *not* part of the published binary. It contains this repository's project-specific release gates: binary behavior, examples, and release-plan assertions. `mono` now provides the provider-neutral changelog and artifact operations that can be reused by any language or package manager.
 
-`release-notes` turns `CHANGELOG.md` into `RELEASE_NOTES.md`, and `release-verify` asserts that the binary reports the version it claims, that this repository's own manifests still validate, that the published `SHA256SUMS` still match when they are available, and that the examples still run. The version of a release is the newest `## ` entry of [`CHANGELOG.md`](CHANGELOG.md), so the notes a reviewer approves are the notes users read. Name that entry `## (unreleased)` to fold a skipped release into the next one.
+### Generic changelog and release commands
 
-To cut a release, scaffold the newest changelog entry from the pull requests merged since the last tag, set the same version in `Cargo.toml`, merge, then push the tag:
+These commands require no additional `mono.toml` sections:
 
 ```bash
-VERSION=0.1.2 cargo run --locked -- task changelog   # edit the result
+mono changelog validate
+mono changelog scaffold --version 0.1.2
+RELEASE_TAG=v0.1.2 mono changelog notes --output RELEASE_NOTES.md
+
+mono release source --tag v0.1.2 --commit "$GITHUB_SHA"
+mono release manifest --directory dist
+mono release verify --directory dist --tag v0.1.2
+```
+
+Changelog commands validate and render the repository's structured `CHANGELOG.md`; they do not assume GitHub, pull requests, or a programming language. Release commands operate on files, checksums, and explicit source identity. They do not publish, inspect registries, execute binaries, or assume a package format.
+
+The project's `release-notes` task turns `CHANGELOG.md` into `RELEASE_NOTES.md`, while `release-verify` asserts this repository's project-specific claims: that its binary reports the version it claims, that its own manifests validate, that examples run, and that the documented release plan resolves. The generic `mono release verify` command validates published metadata and artifacts separately. The version of a release is the newest `## ` entry of [`CHANGELOG.md`](CHANGELOG.md), so the notes a reviewer approves are the notes users read. Name that entry `## (unreleased)` to fold a skipped release into the next one.
+
+To cut a release, scaffold the newest changelog entry, fill in the user-facing notes, set the same version in `Cargo.toml`, merge, then push the tag:
+
+```bash
+cargo run --locked -- changelog scaffold --version 0.1.2
+# edit CHANGELOG.md
 # CHANGELOG.md: ## 0.1.2  |  Cargo.toml: version = "0.1.2"
 git tag v0.1.2
 git push origin v0.1.2

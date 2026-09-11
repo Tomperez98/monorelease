@@ -1,6 +1,6 @@
 # Echo demo
 
-This is a runnable `monorelease` workspace that uses only `echo` commands. It demonstrates package discovery, local and cross-package dependencies, pipelines, package selection, task working directories, child environments, timeouts, resource groups, dry runs, and parallel scheduling.
+This is a runnable `mono` workspace that uses only `echo` commands. It demonstrates package discovery, local and cross-package dependencies, pipelines, package selection, task working directories, child environments, timeouts, resource groups, dry runs, and parallel scheduling.
 
 Run these commands from the repository root:
 
@@ -28,15 +28,15 @@ cargo run -- task build --dir examples/echo --package app --jobs 2
 
 ```text
 examples/echo/
-├── monorepo.toml
+├── mono.toml
 └── packages/
     ├── app/
-    │   └── monorepo.toml
+    │   └── mono.toml
     ├── docs/
-    │   ├── monorepo.toml
+    │   ├── mono.toml
     │   └── site/
     └── shared/
-        └── monorepo.toml
+        └── mono.toml
 ```
 
 ## What to look for

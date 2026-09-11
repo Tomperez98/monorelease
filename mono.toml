@@ -1,5 +1,5 @@
 [package]
-name = "monorelease"
+name = "mono"
 
 [pipelines.ci]
 tasks = ["fmt", "check", "test", "clippy"]
@@ -32,13 +32,13 @@ timeout_seconds = 120
 # Turn CHANGELOG.md into RELEASE_NOTES.md for the tag in RELEASE_TAG. The
 # workflow uploads the file and publishes it with `gh release create`.
 [tasks.release-notes]
-command = ["cargo", "run", "--locked", "--quiet", "-p", "xtask", "--", "notes"]
+command = ["cargo", "run", "--locked", "--quiet", "--", "changelog", "notes"]
 timeout_seconds = 60
 
 # Preparation, run by hand before a release:
-#   VERSION=0.1.2 monorelease task changelog
+#   mono changelog scaffold --version 0.1.2
 [tasks.changelog]
-command = ["cargo", "run", "--locked", "--quiet", "-p", "xtask", "--", "changelog", "scaffold"]
+command = ["cargo", "run", "--locked", "--quiet", "--", "changelog", "scaffold"]
 timeout_seconds = 60
 
 # The release gate: the binary must report the version it claims, accept this

@@ -58,7 +58,7 @@ jobs:
           gh release download "${{ steps.release.outputs.tag }}" \
             --repo "$GITHUB_REPOSITORY" \
             --pattern 'SHA256SUMS' \
-            --pattern 'monorelease-*' \
+            --pattern 'mono-*' \
             --dir dist \
             --clobber
           if gh release view "${{ steps.release.outputs.tag }}" \
@@ -118,6 +118,17 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
+      - name: Verify published artifact manifest
+        if: ${{ steps.release.outputs.exists == 'true' && hashFiles('dist/BUILD-METADATA.json') != '' }}
+        env:
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          cargo run --locked --quiet -- release verify \
+            --directory dist \
+            --tag "$RELEASE_TAG" \
+            --commit "$(git rev-parse HEAD)" \
+            --repository "$GITHUB_REPOSITORY"
+
       - name: Rebuild released Linux binary
         if: ${{ steps.release.outputs.exists == 'true' && hashFiles('xtask/Cargo.toml') != '' }}
         run: cargo build --locked --release --target x86_64-unknown-linux-gnu
@@ -126,9 +137,9 @@ jobs:
         if: ${{ steps.release.outputs.exists == 'true' && hashFiles('xtask/Cargo.toml') != '' }}
         shell: bash
         run: |
-          cmp target/x86_64-unknown-linux-gnu/release/monorelease dist/extracted/monorelease || {
+          cmp target/x86_64-unknown-linux-gnu/release/mono dist/extracted/mono || {
             echo 'the released Linux binary differs from a rebuild of its tagged source' >&2
-            sha256sum target/x86_64-unknown-linux-gnu/release/monorelease dist/extracted/monorelease
+            sha256sum target/x86_64-unknown-linux-gnu/release/mono dist/extracted/mono
             exit 1
           }
 
@@ -146,13 +157,12 @@ jobs:
         if: ${{ steps.release.outputs.exists == 'true' && hashFiles('xtask/Cargo.toml') != '' }}
         env:
           RELEASE_TAG: ${{ steps.release.outputs.tag }}
-          MONORELEASE_BIN: dist/extracted/monorelease
-          RELEASE_ASSETS: dist
-        run: '"$MONORELEASE_BIN" run release --output github-actions'
+          MONO_BIN: dist/extracted/mono
+        run: '"$MONO_BIN" run release --output github-actions'
 
       # Releases cut before the pipeline existed: not much to check, but check it.
       - name: Verify checksums and version
         if: ${{ steps.release.outputs.exists == 'true' && hashFiles('xtask/Cargo.toml') == '' }}
         run: |
           ( cd dist && sha256sum -c SHA256SUMS )
-          ./dist/extracted/monorelease --version
+          ./dist/extracted/mono --version

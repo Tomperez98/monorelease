@@ -3,7 +3,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::config::{MonorepoConfig, config_path};
+use crate::config::{MonoConfig, config_path};
 use crate::workspace::WorkspaceError;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -15,7 +15,7 @@ pub(crate) enum RootKind {
 #[derive(Debug)]
 pub(crate) struct DiscoveredRoot {
     pub(crate) root: PathBuf,
-    pub(crate) config: MonorepoConfig,
+    pub(crate) config: MonoConfig,
     pub(crate) kind: RootKind,
 }
 
@@ -72,12 +72,12 @@ pub(crate) fn find_root(start: &Path) -> Result<DiscoveredRoot, WorkspaceError> 
     })
 }
 
-pub(crate) fn read_manifest(path: &Path) -> Result<MonorepoConfig, WorkspaceError> {
+pub(crate) fn read_manifest(path: &Path) -> Result<MonoConfig, WorkspaceError> {
     let contents = fs::read_to_string(path).map_err(|source| WorkspaceError::Io {
         path: path.to_path_buf(),
         source,
     })?;
-    MonorepoConfig::parse(&contents).map_err(|source| WorkspaceError::Parse {
+    MonoConfig::parse(&contents).map_err(|source| WorkspaceError::Parse {
         path: path.to_path_buf(),
         source,
     })

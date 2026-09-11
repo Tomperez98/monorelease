@@ -3,8 +3,8 @@ name = "xtask"
 version = "0.0.0"
 edition = "2024"
 publish = false
-description = "Repository automation for monorelease releases"
+description = "Repository automation for mono releases"
 
 [dependencies]
 clap = { version = "4.6.6", features = ["derive"] }
-sha2 = "0.10.9"
+mono = { path = ".." }

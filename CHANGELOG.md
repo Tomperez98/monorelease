@@ -15,6 +15,14 @@ next version on the following release. Versions are monotonic but may skip
 numbers: shipping nothing is cheaper than shipping something broken. `Released:`
 is the date the entry was drafted; correct it if the release slips.
 
+## 0.1.3
+Released: 2026-09-11
+
+### Features
+
+- Rename project to `mono`
+- Add changelog and notes commands
+
 ## 0.1.2
 Released: 2026-09-11
 
@@ -27,16 +35,16 @@ Released: 2026-09-11
 
 ### Fixes
 
-- `--version`, `--help`, and error prefixes report the program as `monorelease`.
+- `--version`, `--help`, and error prefixes report the program as `mono`.
   They previously said `monore`.
 - The documented Rust minimum is now 1.88, matching the language features used
   by the workspace.
-- Release validation selects the root `monorelease` package instead of the
+- Release validation selects the root `mono` package instead of the
   repository-only `xtask` member when checking the tag version.
 
 ### Internals
 
-- Releasing moved into this repository's own `monorepo.toml` as a `release`
+- Releasing moved into this repository's own `mono.toml` as a `release`
   pipeline: notes are generated from this file, and the binary is run against
   `examples/` before a release is published and again after. The release tasks
   are Rust programs in `xtask/`, which is not part of the published crate.

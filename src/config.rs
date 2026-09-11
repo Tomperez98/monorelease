@@ -1,4 +1,4 @@
-//! The fixed, language-agnostic `monorepo.toml` schema.
+//! The fixed, language-agnostic `mono.toml` schema.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -6,14 +6,14 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 /// Name of the configuration file, relative to a repository or package root.
-pub const CONFIG_FILE_NAME: &str = "monorepo.toml";
+pub const CONFIG_FILE_NAME: &str = "mono.toml";
 /// Namespace used by task references for tasks declared in the root manifest.
 pub const WORKSPACE_PACKAGE_NAME: &str = "workspace";
 
-/// The fixed on-disk `monorepo.toml` schema.
+/// The fixed on-disk `mono.toml` schema.
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct MonorepoConfig {
+pub struct MonoConfig {
     #[serde(default)]
     pub workspace: Option<WorkspaceConfig>,
     #[serde(default)]
@@ -25,7 +25,7 @@ pub struct MonorepoConfig {
     pub pipelines: BTreeMap<String, PipelineConfig>,
 }
 
-impl MonorepoConfig {
+impl MonoConfig {
     /// The root config [`crate::init`] writes into a fresh repository.
     pub fn template() -> Self {
         let mut pipelines = BTreeMap::new();
@@ -111,7 +111,7 @@ pub struct WorkspaceConfig {
 impl WorkspaceConfig {
     pub fn template() -> Self {
         Self {
-            name: "monorepo".to_owned(),
+            name: "mono".to_owned(),
             members: vec!["apps/*".to_owned(), "packages/*".to_owned()],
             default_pipeline: default_pipeline(),
         }
@@ -192,8 +192,8 @@ pub fn config_path(dir: &Path) -> PathBuf {
 }
 
 /// Render a config as TOML.
-pub fn render_config(config: &MonorepoConfig) -> String {
-    toml::to_string_pretty(config).expect("MonorepoConfig must serialize to TOML")
+pub fn render_config(config: &MonoConfig) -> String {
+    toml::to_string_pretty(config).expect("MonoConfig must serialize to TOML")
 }
 
 /// Return a manifest validation message when a value cannot be passed to a
@@ -211,20 +211,20 @@ mod tests {
 
     #[test]
     fn template_round_trips_through_toml() {
-        let rendered = render_config(&MonorepoConfig::template());
-        let parsed = MonorepoConfig::parse(&rendered).expect("rendered config parses");
+        let rendered = render_config(&MonoConfig::template());
+        let parsed = MonoConfig::parse(&rendered).expect("rendered config parses");
 
-        assert_eq!(parsed, MonorepoConfig::template());
+        assert_eq!(parsed, MonoConfig::template());
     }
 
     #[test]
     fn standalone_template_round_trips_through_toml() {
-        let config = MonorepoConfig::standalone_template(
+        let config = MonoConfig::standalone_template(
             "app".to_owned(),
             vec!["cargo".to_owned(), "build".to_owned()],
         );
         let rendered = render_config(&config);
-        let parsed = MonorepoConfig::parse(&rendered).expect("standalone config parses");
+        let parsed = MonoConfig::parse(&rendered).expect("standalone config parses");
 
         assert_eq!(parsed, config);
     }
@@ -239,7 +239,7 @@ mod tests {
 
     #[test]
     fn task_defaults_to_no_dependencies_or_environment() {
-        let parsed = MonorepoConfig::parse(
+        let parsed = MonoConfig::parse(
             "[package]\nname = \"worker\"\n\n[tasks.build]\ncommand = [\"make\", \"build\"]\n",
         )
         .expect("package parses");
@@ -264,7 +264,7 @@ mod tests {
 
     #[test]
     fn rejects_schema_version_headers() {
-        let error = MonorepoConfig::parse("version = 1\n\n[workspace]\nname = \"repo\"\n")
+        let error = MonoConfig::parse("version = 1\n\n[workspace]\nname = \"repo\"\n")
             .expect_err("version headers are not part of the fixed schema");
 
         assert!(error.to_string().contains("unknown field"));

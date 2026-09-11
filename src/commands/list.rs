@@ -1,4 +1,4 @@
-//! `monorelease list` — describe the available execution targets.
+//! `mono list` — describe the available execution targets.
 
 use std::error::Error as StdError;
 use std::fmt;
@@ -7,7 +7,7 @@ use std::path::Path;
 use crate::runner::format_command;
 use crate::workspace::{Workspace, WorkspaceError};
 
-/// Describe the loaded project or monorepo without executing tasks.
+/// Describe the loaded project or workspace without executing tasks.
 pub fn list(path: &Path) -> Result<String, ListError> {
     let workspace = Workspace::load(path)?;
     let mut output = format!(
@@ -40,18 +40,12 @@ pub fn list(path: &Path) -> Result<String, ListError> {
     output.push_str(&format_rows(&task_rows));
 
     let example_rows = vec![
+        ("mono".to_owned(), "Run the default pipeline".to_owned()),
         (
-            "monorelease".to_owned(),
-            "Run the default pipeline".to_owned(),
-        ),
-        (
-            "monorelease task <task>".to_owned(),
+            "mono task <task>".to_owned(),
             "Run one or more tasks".to_owned(),
         ),
-        (
-            "monorelease plan".to_owned(),
-            "Print the resolved plan".to_owned(),
-        ),
+        ("mono plan".to_owned(), "Print the resolved plan".to_owned()),
     ];
     output.push_str("\n\nExamples:");
     output.push_str(&format_rows(&example_rows));
