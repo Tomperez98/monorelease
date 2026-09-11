@@ -97,7 +97,7 @@ jobs:
         shell: bash
         run: |
           tag_version="${RELEASE_TAG#v}"
-          package_version="$(cargo metadata --locked --no-deps --format-version 1 | jq -r '.packages[0].version')"
+          package_version="$(cargo metadata --locked --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "monorelease") | .version')"
           test "$tag_version" = "$package_version" || {
             echo "tag v$tag_version does not match Cargo.toml version $package_version" >&2
             exit 1
