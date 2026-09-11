@@ -23,10 +23,10 @@ use clap::builder::NonEmptyStringValueParser;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use mono::{
     CacheMode, CancellationToken, ChangelogError, CiError, DEFAULT_CHANGELOG_PATH,
-    DEFAULT_RELEASE_DIRECTORY, DEFAULT_RELEASE_NOTES_PATH, Error, InitError, OutputMode,
-    PipelineExecution, ReleaseCommandError, ReleaseError, ReleaseIdentity, SchedulerError,
-    changelog_notes, changelog_scaffold, changelog_validate, release_manifest, release_source,
-    release_verify,
+    DEFAULT_RELEASE_DIRECTORY, DEFAULT_RELEASE_NOTES_PATH, DoctorError, Error, InitError,
+    ListError, OutputMode, PipelineExecution, ProjectError, ReleaseCommandError, ReleaseError,
+    ReleaseIdentity, SchedulerError, changelog_notes, changelog_scaffold, changelog_validate,
+    release_manifest, release_source, release_verify,
 };
 
 #[derive(Parser)]
@@ -415,18 +415,41 @@ fn exit_code(error: &Error) -> u8 {
         Error::Ci(CiError::InvalidJobs) => EXIT_USAGE,
         Error::Ci(CiError::Scheduler(error)) => scheduler_exit_code(error),
         Error::Ci(CiError::Json { .. }) => EXIT_TOOL,
+        Error::Ci(CiError::Project(error))
+        | Error::Doctor(DoctorError::Project(error))
+        | Error::List(ListError::Project(error)) => project_exit_code(error),
         Error::Changelog(error) => changelog_exit_code(error),
         Error::Release(ReleaseCommandError::Release(error)) => release_exit_code(error),
-        // A project failure is a rejected request, not a failed tool.
-        //
-        // `ProjectError::Io` is overloaded: it covers failing to read a
-        // manifest *and* failing to resolve a directory the manifest declares,
-        // such as a task `cwd`. The second is exactly the defect `mono
-        // check` exists to report, so the variant cannot be split by exit code
-        // here. A genuine environment failure surfaces as a write error, which
-        // is classified in `init_exit_code`, `changelog_exit_code`, and
-        // `release_exit_code`.
-        Error::Doctor(_) | Error::List(_) | Error::Ci(CiError::Project(_)) => EXIT_FAILED,
+        Error::List(_) => EXIT_FAILED,
+    }
+}
+
+/// Map a project error onto this CLI's exit code.
+///
+/// `ProjectError::Io` means the manifest could not be read — a tool or
+/// environment failure. Everything else is a rejected request the caller
+/// can fix.
+fn project_exit_code(error: &mono::ProjectError) -> u8 {
+    match error {
+        // A manifest that could not be read is a `mono` or environment failure.
+        ProjectError::Io { .. } => EXIT_TOOL,
+        // Every other variant is a manifest that WAS read and rejected, which the
+        // caller can fix. This list is exhaustive on purpose: a `_` arm would
+        // silently assign exit `1` to any future variant, including one that is
+        // really an environment failure. Adding a variant must force a decision
+        // about which bucket it belongs in.
+        ProjectError::Parse { .. }
+        | ProjectError::MissingRoot { .. }
+        | ProjectError::InvalidManifest { .. }
+        | ProjectError::InvalidProject { .. }
+        | ProjectError::UnknownPipeline { .. }
+        | ProjectError::InvalidTaskName { .. }
+        | ProjectError::InvalidTask { .. }
+        | ProjectError::MissingTask { .. }
+        | ProjectError::InvalidTaskReference { .. }
+        | ProjectError::TaskCycle { .. }
+        | ProjectError::UnsupportedSchema { .. }
+        | ProjectError::TaskDirectory { .. } => EXIT_FAILED,
     }
 }
 
@@ -779,9 +802,18 @@ mod tests {
 
     fn missing_declared_directory() -> ProjectError {
         // A task `cwd` that the manifest declares but the worktree lacks.
-        ProjectError::Io {
+        ProjectError::TaskDirectory {
+            task: "build".to_owned(),
             path: PathBuf::from("packages/api/missing"),
             source: io::Error::new(io::ErrorKind::NotFound, "missing"),
+        }
+    }
+
+    fn unreadable_manifest() -> ProjectError {
+        // The manifest file could not be read — a tool/environment failure.
+        ProjectError::Io {
+            path: PathBuf::from("mono.toml"),
+            source: io::Error::new(io::ErrorKind::PermissionDenied, "access denied"),
         }
     }
 
@@ -868,6 +900,7 @@ mod tests {
                 path: PathBuf::from("mono.toml"),
                 source: io::Error::new(io::ErrorKind::PermissionDenied, "denied"),
             }),
+            Error::Doctor(DoctorError::Project(unreadable_manifest())),
             Error::Changelog(ChangelogError::Read {
                 path: PathBuf::from("CHANGELOG.md"),
                 source: io::Error::new(io::ErrorKind::NotFound, "missing"),

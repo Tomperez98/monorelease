@@ -428,11 +428,13 @@ impl Project {
             })
         };
         let cwd = interpolate(task.cwd.as_deref().unwrap_or("."))?;
-        let cwd_path =
-            fs::canonicalize(self.root.join(&cwd)).map_err(|source| ProjectError::Io {
+        let cwd_path = fs::canonicalize(self.root.join(&cwd)).map_err(|source| {
+            ProjectError::TaskDirectory {
+                task: node.id.clone(),
                 path: self.root.join(&cwd),
                 source,
-            })?;
+            }
+        })?;
         if !cwd_path.starts_with(&self.root) || !cwd_path.is_dir() {
             return Err(ProjectError::InvalidTask {
                 task: node.id.clone(),
@@ -691,10 +693,12 @@ fn validate_task_config(
         }
         if !cwd.contains("${") {
             let cwd_path = root.join(cwd);
-            let canonical = fs::canonicalize(&cwd_path).map_err(|source| ProjectError::Io {
-                path: cwd_path.clone(),
-                source,
-            })?;
+            let canonical =
+                fs::canonicalize(&cwd_path).map_err(|source| ProjectError::TaskDirectory {
+                    task: task_name.to_owned(),
+                    path: cwd_path.clone(),
+                    source,
+                })?;
             if !canonical.starts_with(root) || !canonical.is_dir() {
                 return Err(ProjectError::InvalidTask {
                     task: task_name.to_owned(),
@@ -969,6 +973,13 @@ pub enum ProjectError {
         path: PathBuf,
         source: std::io::Error,
     },
+    /// A task `cwd` the manifest declares cannot be resolved — a request the
+    /// caller can fix, not an environment failure.
+    TaskDirectory {
+        task: String,
+        path: PathBuf,
+        source: std::io::Error,
+    },
     Parse {
         path: PathBuf,
         source: toml::de::Error,
@@ -1016,6 +1027,11 @@ impl fmt::Display for ProjectError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Io { path, source } => write!(f, "could not read {}: {source}", path.display()),
+            Self::TaskDirectory { task, path, source } => write!(
+                f,
+                "task '{task}': could not resolve cwd {}: {source}",
+                path.display()
+            ),
             Self::Parse { path, source } => {
                 write!(f, "could not parse {}: {source}", path.display())
             }
@@ -1073,6 +1089,7 @@ impl StdError for ProjectError {
         match self {
             Self::Io { source, .. } => Some(source),
             Self::Parse { source, .. } => Some(source),
+            Self::TaskDirectory { source, .. } => Some(source),
             _ => None,
         }
     }
@@ -1445,14 +1462,15 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_cwd_directory_cannot_be_resolved() {
+    fn a_missing_cwd_directory_is_a_task_directory_failure() {
         let error = reject(
             "[project]\nname = \"fixture\"\n\n[pipelines.ci]\ntasks = [\"build\"]\n\n[tasks.build]\ncommand = [\"echo\", \"build\"]\ncwd = \"missing\"\n",
         );
 
-        // Task 7 replaces this variant with `TaskDirectory`; this test is the
-        // one that changes there.
-        assert!(matches!(error, ProjectError::Io { .. }), "{error}");
+        assert!(
+            matches!(error, ProjectError::TaskDirectory { ref task, .. } if task == "build"),
+            "{error}"
+        );
     }
 
     #[test]
