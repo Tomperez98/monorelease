@@ -2391,13 +2391,32 @@ Add to `mod tests` in `src/commands/changelog.rs`:
         let path = temp.path().join(DEFAULT_PATH);
         fs::write(&path, "# Changelog\n\n## 1.0.0\nReleased: 2026-01-01\n").unwrap();
 
-        scaffold_on(&path, "1.1.0", "2026-09-11").expect("scaffold succeeds");
+        scaffold_on(&path, "1.1.0", "2001-02-03").expect("scaffold succeeds");
 
         let rendered = fs::read_to_string(&path).unwrap();
         assert!(rendered.contains("## 1.1.0\n"), "{rendered}");
-        assert!(rendered.contains("Released: 2026-09-11\n"), "{rendered}");
+        assert!(rendered.contains("Released: 2001-02-03\n"), "{rendered}");
+        assert!(
+            !rendered.contains(&format!("Released: {}\n", today())),
+            "scaffold_on must not fall back to the wall clock: {rendered}"
+        );
     }
 ```
+
+**As-built note — this test was written blind and had to be fixed (required).**
+
+The version originally specified here scaffolded with `"2026-09-11"`, which was the date the plan was authored — so the assertion `rendered.contains("Released: 2026-09-11")` could not distinguish `scaffold_on` *using* its parameter from `scaffold_on` *ignoring* it and calling `today()`. On any run whose UTC date matched the literal, the test passed either way.
+
+Proven, not assumed. With `scaffold_on` mutated to `.scaffold(request, &today(), &[])` and the original test restored verbatim:
+
+```console
+$ cargo test --lib commands::changelog::tests::scaffold_on_writes
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 120 filtered out
+```
+
+So the test asserted nothing about the parameter. Its meaning depended on the wall clock: it would fail on every day except the one hardcoded. The fix uses `"2001-02-03"` (a date that can never be today) and adds an explicit negative assertion that the rendered output does **not** contain today's date. Re-running the same mutation against the fixed test fails as it should.
+
+The generalizable rule: **a test that hardcodes "today" cannot detect a fallback to the clock.** Any test whose expected value is derived from the current date must pick a constant that the clock cannot produce.
 
 - [ ] **Step 2: Run the test to verify it fails**
 
