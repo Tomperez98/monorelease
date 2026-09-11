@@ -2801,6 +2801,31 @@ Expected: clean.
 Run: `cargo fmt --check`
 Expected: clean. Run `cargo fmt` first if the moves reflow lines.
 
+**As-built note — how "pure move" was actually proven.**
+
+The validation above only says "same test count", which is too weak: a split can pass every test while silently dropping or renaming an item. Two stronger checks were used instead:
+
+1. **Test-name set, byte-identical.** Capture before editing, diff after:
+
+```console
+$ cargo test --lib -- --list 2>/dev/null | grep ': test$' | sed 's/: test$//' | sort > /tmp/tests_before.txt
+$ wc -l /tmp/tests_before.txt
+121
+# ...make the split...
+$ cargo test --lib -- --list 2>/dev/null | grep ': test$' | sed 's/: test$//' | sort > /tmp/tests_after.txt
+$ diff /tmp/tests_before.txt /tmp/tests_after.txt && echo IDENTICAL
+IDENTICAL
+```
+
+   This works because `#[cfg(test)] mod tests;` in `project/mod.rs` keeps the module path `project::tests`, so all 51 `project::*`/`cache::*` test names survive unchanged. Any rename or loss shows up as a diff line.
+2. **Symbol set.** Every original top-level symbol must still be present (`comm -23 before after` must be empty). The count *grows* after the split — moving the test module into its own file exposes the test function names, which were previously indented inside a `mod tests { }` block — so compare for *missing* entries, not for equality of counts.
+
+**Visibility notes.**
+
+- Only widen to the minimum the compiler requires. An implementation widened `edit_distance`, `valid_relative_path`, and `validate_cache_pattern` to `pub(crate)` because the test module imports them by full path. `pub(super)` compiles for all three (`cargo build` proves it), because a `pub(super)` item in a submodule is visible in `project` *and its descendants*, and `project::tests` is a descendant. Keep them `pub(super)`; unnecessary `pub(crate)` widens the crate-internal surface for no reason.
+- `validate_schema` must stay reachable as `crate::project::validate_schema`: declare it `pub(crate)` in `validate.rs` and re-export it with `pub(crate) use validate::validate_schema;` from `mod.rs`. `src/discovery.rs` imports it by that path. Re-exporting a `pub(super)` item as `pub(crate)` is rejected by the compiler — this is the one place the visibility cannot be tightened.
+- The parenthetical in Step 1 about rewriting `use super::*;` to `use crate::project::*;` was unnecessary. Both forms compile (verified with a standalone `rustc` repro), because `tests` is a direct child of `project`, so `super` and `crate::project` denote the same module. The landed version keeps `use super::*;` and adds explicit imports only for the three items `mod.rs` does not re-export — which is clearer anyway.
+
 - [ ] **Step 5: Commit**
 
 ```bash
