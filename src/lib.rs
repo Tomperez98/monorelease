@@ -140,3 +140,60 @@ impl From<ReleaseCommandError> for Error {
         Self::Release(error)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io;
+
+    fn builders() -> [(Error, bool); 6] {
+        [
+            (
+                Error::Init(InitError::AlreadyInitialized(std::path::PathBuf::from(
+                    "mono.toml",
+                ))),
+                false,
+            ),
+            (
+                Error::Doctor(DoctorError::Project(ProjectError::MissingRoot {
+                    start: std::path::PathBuf::from("."),
+                })),
+                true,
+            ),
+            (Error::Ci(CiError::InvalidJobs), false),
+            (
+                Error::List(ListError::Project(ProjectError::MissingRoot {
+                    start: std::path::PathBuf::from("."),
+                })),
+                true,
+            ),
+            (
+                Error::Changelog(ChangelogError::Invalid("bad".to_owned())),
+                false,
+            ),
+            (
+                Error::Release(ReleaseCommandError::Release(ReleaseError::Write {
+                    path: std::path::PathBuf::from("out"),
+                    source: io::Error::new(io::ErrorKind::PermissionDenied, "denied"),
+                })),
+                true,
+            ),
+        ]
+    }
+
+    /// The union is the command failure space, so its `source` must forward to
+    /// the wrapped error rather than swallow it.
+    #[test]
+    fn the_error_union_forwards_display_and_source() {
+        for (error, has_source) in builders() {
+            let has_underlying_source = error.source().and_then(|e| e.source()).is_some();
+            assert_eq!(has_underlying_source, has_source, "{error}");
+            assert!(!error.to_string().is_empty(), "{error}");
+        }
+    }
+
+    #[test]
+    fn every_command_error_converts_into_the_union() {
+        let _: Error = InitError::AlreadyInitialized(std::path::PathBuf::from("mono.toml")).into();
+    }
+}

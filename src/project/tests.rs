@@ -417,3 +417,74 @@ fn a_matrix_larger_than_the_bound_is_rejected() {
         "{error}"
     );
 }
+
+// --- Fault model: which failures wrap a cause ---
+
+#[test]
+fn project_errors_expose_a_source_exactly_when_they_wrap_one() {
+    let io = || std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
+
+    let with_source = [
+        ProjectError::Io {
+            path: PathBuf::from("mono.toml"),
+            source: io(),
+        },
+        ProjectError::TaskDirectory {
+            task: "build".to_owned(),
+            path: PathBuf::from("missing"),
+            source: io(),
+        },
+    ];
+    for error in &with_source {
+        assert!(error.source().is_some(), "{error}");
+        assert!(!error.to_string().is_empty(), "{error}");
+    }
+
+    let bare = [
+        ProjectError::InvalidProject {
+            message: "no pipelines".to_owned(),
+        },
+        ProjectError::UnknownPipeline {
+            name: "missing".to_owned(),
+            suggestion: Some("ci".to_owned()),
+        },
+        ProjectError::InvalidTaskName {
+            task: "bad[".to_owned(),
+        },
+        ProjectError::InvalidTask {
+            task: "build".to_owned(),
+            message: "empty command".to_owned(),
+        },
+        ProjectError::MissingTask {
+            task: "missing".to_owned(),
+            suggestion: None,
+        },
+        ProjectError::InvalidTaskReference {
+            reference: "bad[".to_owned(),
+            from: TaskNode::new("build"),
+        },
+        ProjectError::TaskCycle {
+            path: vec![TaskNode::new("a"), TaskNode::new("b"), TaskNode::new("a")],
+        },
+        ProjectError::MissingRoot {
+            start: PathBuf::from("."),
+        },
+    ];
+    for error in &bare {
+        assert!(error.source().is_none(), "{error}");
+        assert!(!error.to_string().is_empty(), "{error}");
+    }
+
+    let parse_error = ProjectError::Parse {
+        path: PathBuf::from("mono.toml"),
+        source: toml::from_str::<crate::config::MonoConfig>("= =").unwrap_err(),
+    };
+    assert!(parse_error.source().is_some(), "{parse_error}");
+
+    let schema_error = ProjectError::UnsupportedSchema {
+        path: PathBuf::from("mono.toml"),
+        found: 2,
+        supported: 1,
+    };
+    assert!(schema_error.source().is_none(), "{schema_error}");
+}

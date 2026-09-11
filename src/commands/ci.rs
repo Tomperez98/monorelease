@@ -8,7 +8,7 @@ use std::sync::Arc;
 use crate::cache::CacheMode;
 use crate::output::{OutputMode, OutputSink};
 use crate::project::{PlannedTask, Project, ProjectError, TaskNode};
-use crate::runner::{CancellationToken, Runner, format_command};
+use crate::runner::{CancellationToken, Runner, TaskExecutor, format_command};
 use crate::scheduler::{ExecutionSummary, SchedulerError, execute_plan};
 
 #[derive(Debug, Clone)]
@@ -49,13 +49,13 @@ pub fn run_pipeline_with_mode(
         };
     }
 
-    let runner = Runner::new();
+    let runner: Arc<dyn TaskExecutor> = Arc::new(Runner::new());
     let output = Arc::new(OutputSink::new(execution.output));
     let summary = execute_plan(
         &project,
         &plan,
         jobs,
-        &runner,
+        runner,
         &output,
         execution.cache,
         &execution.cancellation,

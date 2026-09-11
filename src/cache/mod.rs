@@ -924,4 +924,24 @@ mod tests {
             "must remain unchanged"
         );
     }
+
+    #[test]
+    fn cache_errors_expose_a_source_exactly_when_they_wrap_one() {
+        let io_error = CacheError::io(
+            PathBuf::from("entry"),
+            std::io::Error::new(std::io::ErrorKind::NotFound, "missing"),
+        );
+        let json_error = CacheError::Json {
+            path: PathBuf::from("metadata.json"),
+            source: serde_json::from_str::<serde_json::Value>("{").unwrap_err(),
+        };
+        let invalid = CacheError::Invalid {
+            message: "unsafe path".to_owned(),
+        };
+
+        assert!(io_error.source().is_some());
+        assert!(json_error.source().is_some());
+        assert!(invalid.source().is_none());
+        assert!(!invalid.to_string().is_empty());
+    }
 }

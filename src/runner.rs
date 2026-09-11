@@ -21,6 +21,67 @@ const POLL_INTERVAL_START: Duration = Duration::from_millis(1);
 /// hundreds of times per second.
 const POLL_INTERVAL_MAX: Duration = Duration::from_millis(50);
 
+/// The observable result of one non-blocking child wait.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WaitOutcome {
+    Exited,
+    Running,
+    Failed,
+}
+
+/// What the poll loop must do next, given the state it can observe.
+///
+/// Extracted from the loop so the precedence between cancellation, an exceeded
+/// output limit, child exit, and timeout is a table a test can assert instead
+/// of five interleaved branches over a live child.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PollDecision {
+    /// Terminate the tree and report cancellation.
+    Cancel,
+    /// Terminate the tree and report that `stream` exceeded its limit.
+    OutputLimit(&'static str),
+    /// The direct child exited; descendants may still hold the pipes open.
+    Exited { descendants_may_hold_pipes: bool },
+    /// Terminate the tree and report the timeout.
+    Timeout,
+    /// `try_wait` failed; report a wait error.
+    WaitFailed,
+    /// Still running; sleep before polling again.
+    Sleep(Duration),
+}
+
+fn poll_decision(
+    cancelled: bool,
+    exceeded_stream: Option<&'static str>,
+    wait: WaitOutcome,
+    readers_done: u8,
+    elapsed: Duration,
+    timeout: Duration,
+    poll_interval: Duration,
+) -> PollDecision {
+    if cancelled {
+        return PollDecision::Cancel;
+    }
+    if let Some(stream) = exceeded_stream {
+        return PollDecision::OutputLimit(stream);
+    }
+    match wait {
+        WaitOutcome::Exited => PollDecision::Exited {
+            descendants_may_hold_pipes: readers_done < 2,
+        },
+        WaitOutcome::Running if elapsed >= timeout => PollDecision::Timeout,
+        WaitOutcome::Running => {
+            let remaining = timeout.saturating_sub(elapsed);
+            PollDecision::Sleep(poll_interval.min(remaining))
+        }
+        WaitOutcome::Failed => PollDecision::WaitFailed,
+    }
+}
+
+fn next_poll_interval(current: Duration) -> Duration {
+    (current * 2).min(POLL_INTERVAL_MAX)
+}
+
 /// Captured process output, presented by the scheduler after a task completes.
 #[derive(Debug, Clone, Default)]
 pub struct CapturedOutput {
@@ -55,6 +116,20 @@ impl CancellationToken {
 }
 
 pub(crate) type OutputCallback = Arc<dyn Fn(&'static str, &[u8]) -> io::Result<()> + Send + Sync>;
+
+/// The seam the scheduler executes tasks through.
+///
+/// [`Runner`] is the production implementation; a test supplies a scripted one
+/// to drive the scheduling loop without spawning processes.
+pub(crate) trait TaskExecutor: Send + Sync {
+    fn execute(
+        &self,
+        project_root: &Path,
+        planned: &PlannedTask,
+        cancellation: Option<&CancellationToken>,
+        output_callback: Option<OutputCallback>,
+    ) -> Result<TaskResult, RunnerError>;
+}
 
 /// Executes root-project tasks without changing the process-global working directory.
 #[derive(Debug, Clone, Default)]
@@ -161,83 +236,90 @@ impl Runner {
             })
         };
 
-        // Poll with exponential backoff capped at the remaining timeout: a
-        // short task is noticed within a millisecond, and a long task costs a
-        // handful of wakeups per second instead of a hundred.
         let mut poll_interval = POLL_INTERVAL_START;
         let mut exceeded_stream: Option<&'static str> = None;
+        // `None` means the run is already cancelled, so no wait is attempted:
+        // cancellation is decided before the child is touched, exactly as
+        // before this refactor.
         let status = loop {
-            // Check stream-limit notification before checking child status
-            // so overflow is detected even when the notification arrives
-            // between polls.
-            if cancellation.is_some_and(CancellationToken::is_cancelled) {
-                terminate_tree(
-                    &mut managed,
-                    planned.project(),
-                    planned.task(),
-                    "cancellation",
-                )?;
-                managed.wait().map_err(|source| RunnerError::Wait {
-                    project: planned.project().to_owned(),
-                    task: planned.task().to_owned(),
-                    source,
-                })?;
-                let output = join_output(
-                    planned.project(),
-                    planned.task(),
-                    stdout_reader,
-                    stderr_reader,
-                )?
-                .output;
-                return Err(RunnerError::Cancelled(Box::new(CancelledTask {
-                    project: planned.project().to_owned(),
-                    task: planned.task().to_owned(),
-                    output,
-                    elapsed: started.elapsed(),
-                })));
-            }
             if exceeded_stream.is_none()
                 && let Ok(stream) = limit_receiver.try_recv()
             {
                 exceeded_stream = Some(stream);
             }
-            if let Some(stream_name) = exceeded_stream {
-                // Terminate the tree so pipe-holding descendants release
-                // the readers, then join them and report the overflow.
-                terminate_tree(
-                    &mut managed,
-                    planned.project(),
-                    planned.task(),
-                    "output limit",
-                )?;
-                managed.wait().map_err(|source| RunnerError::Wait {
-                    project: planned.project().to_owned(),
-                    task: planned.task().to_owned(),
-                    source,
-                })?;
-                let joined = join_output(
-                    planned.project(),
-                    planned.task(),
-                    stdout_reader,
-                    stderr_reader,
-                )?;
-                return Err(RunnerError::OutputLimit(Box::new(OutputLimitTask {
-                    project: planned.project().to_owned(),
-                    task: planned.task().to_owned(),
-                    stream: stream_name,
-                    limit: output_limit,
-                    output: joined.output,
-                    elapsed: started.elapsed(),
-                })));
-            }
-            match managed.try_wait() {
-                Ok(WaitResult::Exited(status)) => {
-                    // The child has exited. If both output readers have
-                    // already finished (no descendant inherited the pipe),
-                    // skip terminate_tree entirely.  Otherwise a descendant
-                    // still holds a pipe open and we must terminate the tree
-                    // to unblock the readers.
-                    if reader_done.load(Ordering::Acquire) < 2 {
+            let cancelled = cancellation.is_some_and(CancellationToken::is_cancelled);
+            let wait = (!cancelled).then(|| managed.try_wait());
+            let outcome = match &wait {
+                Some(Ok(WaitResult::Exited(_))) => WaitOutcome::Exited,
+                Some(Err(_)) => WaitOutcome::Failed,
+                _ => WaitOutcome::Running,
+            };
+            match poll_decision(
+                cancelled,
+                exceeded_stream,
+                outcome,
+                reader_done.load(Ordering::Acquire),
+                started.elapsed(),
+                planned.timeout(),
+                poll_interval,
+            ) {
+                PollDecision::Cancel => {
+                    terminate_tree(
+                        &mut managed,
+                        planned.project(),
+                        planned.task(),
+                        "cancellation",
+                    )?;
+                    managed.wait().map_err(|source| RunnerError::Wait {
+                        project: planned.project().to_owned(),
+                        task: planned.task().to_owned(),
+                        source,
+                    })?;
+                    let output = join_output(
+                        planned.project(),
+                        planned.task(),
+                        stdout_reader,
+                        stderr_reader,
+                    )?
+                    .output;
+                    return Err(RunnerError::Cancelled(Box::new(CancelledTask {
+                        project: planned.project().to_owned(),
+                        task: planned.task().to_owned(),
+                        output,
+                        elapsed: started.elapsed(),
+                    })));
+                }
+                PollDecision::OutputLimit(stream_name) => {
+                    terminate_tree(
+                        &mut managed,
+                        planned.project(),
+                        planned.task(),
+                        "output limit",
+                    )?;
+                    managed.wait().map_err(|source| RunnerError::Wait {
+                        project: planned.project().to_owned(),
+                        task: planned.task().to_owned(),
+                        source,
+                    })?;
+                    let joined = join_output(
+                        planned.project(),
+                        planned.task(),
+                        stdout_reader,
+                        stderr_reader,
+                    )?;
+                    return Err(RunnerError::OutputLimit(Box::new(OutputLimitTask {
+                        project: planned.project().to_owned(),
+                        task: planned.task().to_owned(),
+                        stream: stream_name,
+                        limit: output_limit,
+                        output: joined.output,
+                        elapsed: started.elapsed(),
+                    })));
+                }
+                PollDecision::Exited {
+                    descendants_may_hold_pipes,
+                } => {
+                    if descendants_may_hold_pipes {
                         terminate_tree(
                             &mut managed,
                             planned.project(),
@@ -245,9 +327,12 @@ impl Runner {
                             "descendant cleanup",
                         )?;
                     }
-                    break status;
+                    match wait {
+                        Some(Ok(WaitResult::Exited(status))) => break status,
+                        _ => unreachable!("PollDecision::Exited implies an exited child"),
+                    }
                 }
-                Ok(WaitResult::Running) if started.elapsed() >= planned.timeout() => {
+                PollDecision::Timeout => {
                     terminate_tree(&mut managed, planned.project(), planned.task(), "timeout")?;
                     managed.wait().map_err(|source| RunnerError::Wait {
                         project: planned.project().to_owned(),
@@ -271,12 +356,7 @@ impl Runner {
                         elapsed: started.elapsed(),
                     })));
                 }
-                Ok(WaitResult::Running) => {
-                    let remaining = planned.timeout().saturating_sub(started.elapsed());
-                    thread::sleep(poll_interval.min(remaining));
-                    poll_interval = (poll_interval * 2).min(POLL_INTERVAL_MAX);
-                }
-                Err(source) => {
+                PollDecision::WaitFailed => {
                     if let Err(error) = terminate_tree(
                         &mut managed,
                         planned.project(),
@@ -289,11 +369,19 @@ impl Runner {
                     }
                     let _ = stdout_reader.join();
                     let _ = stderr_reader.join();
+                    let source = match wait {
+                        Some(Err(source)) => source,
+                        _ => unreachable!("PollDecision::WaitFailed implies a failed wait"),
+                    };
                     return Err(RunnerError::Wait {
                         project: planned.project().to_owned(),
                         task: planned.task().to_owned(),
                         source,
                     });
+                }
+                PollDecision::Sleep(duration) => {
+                    thread::sleep(duration);
+                    poll_interval = next_poll_interval(poll_interval);
                 }
             }
         };
@@ -333,6 +421,18 @@ impl Runner {
             elapsed,
             cached: false,
         })
+    }
+}
+
+impl TaskExecutor for Runner {
+    fn execute(
+        &self,
+        project_root: &Path,
+        planned: &PlannedTask,
+        cancellation: Option<&CancellationToken>,
+        output_callback: Option<OutputCallback>,
+    ) -> Result<TaskResult, RunnerError> {
+        self.run_with_options(project_root, planned, cancellation, output_callback)
     }
 }
 
@@ -927,5 +1027,210 @@ mod tests {
             format_command(&["echo".to_owned(), "hello world".to_owned()]),
             "echo 'hello world'"
         );
+    }
+
+    // `PollDecision`, `WaitOutcome`, `poll_decision`, `next_poll_interval`, and
+    // the `POLL_INTERVAL_*` constants are reachable through the existing
+    // `use super::*;` at the top of this module.
+    const TIMEOUT: Duration = Duration::from_secs(10);
+
+    #[test]
+    fn cancellation_outranks_every_other_condition() {
+        assert_eq!(
+            poll_decision(
+                true,
+                Some("stdout"),
+                WaitOutcome::Exited,
+                2,
+                Duration::ZERO,
+                TIMEOUT,
+                POLL_INTERVAL_START,
+            ),
+            PollDecision::Cancel
+        );
+    }
+
+    #[test]
+    fn an_exceeded_stream_stops_the_task_before_the_exit_is_considered() {
+        assert_eq!(
+            poll_decision(
+                false,
+                Some("stderr"),
+                WaitOutcome::Exited,
+                2,
+                Duration::ZERO,
+                TIMEOUT,
+                POLL_INTERVAL_START,
+            ),
+            PollDecision::OutputLimit("stderr")
+        );
+    }
+
+    #[test]
+    fn an_exit_wants_descendant_cleanup_until_both_readers_finish() {
+        for (readers_done, descendants_may_hold_pipes) in [(0, true), (1, true), (2, false)] {
+            assert_eq!(
+                poll_decision(
+                    false,
+                    None,
+                    WaitOutcome::Exited,
+                    readers_done,
+                    Duration::ZERO,
+                    TIMEOUT,
+                    POLL_INTERVAL_START,
+                ),
+                PollDecision::Exited {
+                    descendants_may_hold_pipes
+                },
+                "readers_done={readers_done}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_running_child_past_its_timeout_times_out() {
+        assert_eq!(
+            poll_decision(
+                false,
+                None,
+                WaitOutcome::Running,
+                2,
+                TIMEOUT,
+                TIMEOUT,
+                POLL_INTERVAL_START,
+            ),
+            PollDecision::Timeout
+        );
+    }
+
+    #[test]
+    fn a_running_child_sleeps_for_the_shorter_of_the_interval_and_the_remaining_time() {
+        assert_eq!(
+            poll_decision(
+                false,
+                None,
+                WaitOutcome::Running,
+                2,
+                Duration::from_secs(9),
+                TIMEOUT,
+                Duration::from_millis(5),
+            ),
+            PollDecision::Sleep(Duration::from_millis(5))
+        );
+        assert_eq!(
+            poll_decision(
+                false,
+                None,
+                WaitOutcome::Running,
+                2,
+                Duration::from_millis(9_999),
+                TIMEOUT,
+                Duration::from_millis(5),
+            ),
+            PollDecision::Sleep(Duration::from_millis(1))
+        );
+    }
+
+    #[test]
+    fn a_failed_wait_is_reported() {
+        assert_eq!(
+            poll_decision(
+                false,
+                None,
+                WaitOutcome::Failed,
+                2,
+                Duration::ZERO,
+                TIMEOUT,
+                POLL_INTERVAL_START,
+            ),
+            PollDecision::WaitFailed
+        );
+    }
+
+    #[test]
+    fn the_poll_interval_doubles_up_to_the_cap() {
+        assert_eq!(
+            next_poll_interval(POLL_INTERVAL_START),
+            (POLL_INTERVAL_START * 2).min(POLL_INTERVAL_MAX)
+        );
+        assert_eq!(next_poll_interval(POLL_INTERVAL_MAX), POLL_INTERVAL_MAX);
+    }
+
+    #[test]
+    fn runner_errors_expose_a_source_exactly_when_they_wrap_one() {
+        let io = || io::Error::new(io::ErrorKind::NotFound, "missing");
+
+        let with_source = [
+            RunnerError::Spawn {
+                project: "fixture".to_owned(),
+                task: "build".to_owned(),
+                command: vec!["tool".to_owned()],
+                cwd: PathBuf::from("/tmp"),
+                source: io(),
+            },
+            RunnerError::Wait {
+                project: "fixture".to_owned(),
+                task: "build".to_owned(),
+                source: io(),
+            },
+            RunnerError::OutputRead {
+                project: "fixture".to_owned(),
+                task: "build".to_owned(),
+                stream: "stdout",
+                source: io(),
+            },
+            RunnerError::Terminate {
+                project: "fixture".to_owned(),
+                task: "build".to_owned(),
+                operation: "timeout",
+                source: io(),
+            },
+        ];
+        for error in &with_source {
+            assert!(error.source().is_some(), "{error}");
+        }
+
+        let bare = [
+            RunnerError::EmptyCommand {
+                project: "fixture".to_owned(),
+                task: "build".to_owned(),
+            },
+            RunnerError::Failed(Box::new(FailedTask {
+                project: "fixture".to_owned(),
+                task: "build".to_owned(),
+                command: vec!["tool".to_owned()],
+                cwd: PathBuf::from("/tmp"),
+                code: Some(1),
+                output: CapturedOutput::default(),
+                elapsed: Duration::ZERO,
+            })),
+            RunnerError::TimedOut(Box::new(TimedOutTask {
+                project: "fixture".to_owned(),
+                task: "build".to_owned(),
+                command: vec!["tool".to_owned()],
+                cwd: PathBuf::from("/tmp"),
+                timeout: Duration::from_secs(1),
+                output: CapturedOutput::default(),
+                elapsed: Duration::ZERO,
+            })),
+            RunnerError::OutputLimit(Box::new(OutputLimitTask {
+                project: "fixture".to_owned(),
+                task: "build".to_owned(),
+                stream: "stdout",
+                limit: 8,
+                output: CapturedOutput::default(),
+                elapsed: Duration::ZERO,
+            })),
+            RunnerError::Cancelled(Box::new(CancelledTask {
+                project: "fixture".to_owned(),
+                task: "build".to_owned(),
+                output: CapturedOutput::default(),
+                elapsed: Duration::ZERO,
+            })),
+        ];
+        for error in &bare {
+            assert!(error.source().is_none(), "{error}");
+            assert!(!error.to_string().is_empty(), "{error}");
+        }
     }
 }

@@ -67,3 +67,66 @@ impl StdError for InitError {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testing::TempDir;
+
+    #[test]
+    fn init_writes_a_manifest_that_parses_back() {
+        let temp = TempDir::new();
+
+        let written = init(temp.path()).expect("init succeeds");
+
+        assert_eq!(written, config_path(temp.path()));
+        let contents = fs::read_to_string(&written).expect("manifest is written");
+        let config = MonoConfig::parse(&contents).expect("written manifest parses");
+        assert_eq!(config, MonoConfig::template());
+    }
+
+    #[test]
+    fn init_creates_a_missing_directory() {
+        let temp = TempDir::new();
+        let nested = temp.path().join("a/b/c");
+
+        let written = init(&nested).expect("init creates the directory");
+
+        assert!(written.is_file(), "{}", written.display());
+    }
+
+    #[test]
+    fn a_second_init_refuses_to_overwrite() {
+        let temp = TempDir::new();
+        init(temp.path()).expect("first init succeeds");
+
+        let error = init(temp.path()).expect_err("second init refuses");
+
+        assert!(
+            matches!(error, InitError::AlreadyInitialized(ref path) if path == &config_path(temp.path())),
+            "{error}"
+        );
+        assert!(
+            error.to_string().contains("refusing to overwrite"),
+            "{error}"
+        );
+        assert!(
+            error.source().is_none(),
+            "a refusal has no underlying cause"
+        );
+    }
+
+    #[test]
+    fn a_directory_that_cannot_be_created_is_a_tool_failure() {
+        let temp = TempDir::new();
+        // A file where the directory should be makes `create_dir_all` fail.
+        let blocked = temp.path().join("blocked");
+        fs::write(&blocked, "not a directory").expect("write blocker file");
+
+        let error = init(&blocked.join("nested")).expect_err("init fails");
+
+        assert!(matches!(error, InitError::CreateDir { .. }), "{error}");
+        assert!(error.source().is_some(), "a filesystem cause is exposed");
+        assert!(error.to_string().contains("could not create directory"));
+    }
+}

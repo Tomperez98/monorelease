@@ -216,4 +216,17 @@ mod tests {
             "scaffold_on must not fall back to the wall clock: {rendered}"
         );
     }
+
+    #[test]
+    fn changelog_errors_expose_a_source_only_for_read_and_write() {
+        let read = ChangelogError::Read {
+            path: PathBuf::from("CHANGELOG.md"),
+            source: io::Error::new(io::ErrorKind::NotFound, "missing"),
+        };
+        let invalid = ChangelogError::Invalid("no entries".to_owned());
+
+        assert!(read.source().is_some(), "{read}");
+        assert!(invalid.source().is_none(), "{invalid}");
+        assert!(!invalid.to_string().is_empty());
+    }
 }

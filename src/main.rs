@@ -420,7 +420,9 @@ fn exit_code(error: &Error) -> u8 {
         | Error::List(ListError::Project(error)) => project_exit_code(error),
         Error::Changelog(error) => changelog_exit_code(error),
         Error::Release(ReleaseCommandError::Release(error)) => release_exit_code(error),
-        Error::List(_) => EXIT_FAILED,
+        // A serialization failure means mono could not produce the requested
+        // output, exactly like `CiError::Json`; both are tool failures.
+        Error::List(ListError::Json { .. }) => EXIT_TOOL,
     }
 }
 
@@ -996,5 +998,16 @@ mod tests {
         assert_eq!(value["kind"], "error");
         assert_eq!(value["code"], EXIT_USAGE);
         assert!(value["message"].as_str().unwrap().contains("--jobs"));
+    }
+
+    #[test]
+    fn a_list_serialization_failure_is_a_tool_failure_like_the_ci_one() {
+        let source = serde_json::from_str::<u32>("not json").expect_err("invalid JSON");
+
+        assert_eq!(
+            exit_code(&Error::List(ListError::Json { source })),
+            EXIT_TOOL,
+            "a failed serialization is a mono failure, not a rejected request"
+        );
     }
 }

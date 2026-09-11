@@ -299,17 +299,11 @@ impl OutputSink {
                     status.label()
                 )
             }
-            ExecutionEvent::RunFinished {
-                completed,
-                cached,
-                failed,
-                cancelled,
-                blocked,
-                ..
-            } => writeln!(
-                &mut *writers.err,
-                "summary: {completed} completed, {cached} cached, {failed} failed, {cancelled} cancelled, {blocked} blocked"
-            ),
+            // `present_run_finished` emits this event only for JSON. The CLI
+            // transport prints the summary for every other mode, so rendering
+            // it here would either duplicate the line or drift from
+            // `commands::ci::format_summary`.
+            ExecutionEvent::RunFinished { .. } => Ok(()),
             ExecutionEvent::RunStarted { .. } => Ok(()),
         }
     }
@@ -392,20 +386,11 @@ impl OutputSink {
                 writeln!(&mut *writers.out, "::endgroup::")?;
                 writers.out.flush()
             }
-            ExecutionEvent::RunFinished {
-                completed,
-                cached,
-                failed,
-                cancelled,
-                blocked,
-                ..
-            } => {
-                writeln!(
-                    &mut *writers.out,
-                    "summary: {completed} completed, {cached} cached, {failed} failed, {cancelled} cancelled, {blocked} blocked"
-                )?;
-                writers.out.flush()
-            }
+            // `present_run_finished` emits this event only for JSON. The CLI
+            // transport prints the summary for every other mode, so rendering
+            // it here would either duplicate the line or drift from
+            // `commands::ci::format_summary`.
+            ExecutionEvent::RunFinished { .. } => Ok(()),
             ExecutionEvent::RunStarted { .. } => Ok(()),
         }
     }
@@ -681,5 +666,41 @@ mod tests {
             let rendered = format!("{}{}", text(&out), text(&err));
             assert!(rendered.contains("blocked"), "{mode:?}: {rendered}");
         }
+    }
+
+    #[test]
+    fn run_finished_renders_only_in_json_mode() {
+        let summary = ExecutionSummary {
+            completed: 1,
+            cached: 0,
+            failed: 0,
+            cancelled: 0,
+            blocked: 0,
+        };
+
+        for mode in [
+            OutputMode::Terminal,
+            OutputMode::GithubActions,
+            OutputMode::Live,
+        ] {
+            let (sink, out, err) = captured(mode, 1);
+            sink.present_run_finished(&summary)
+                .expect("summary renders");
+            assert!(
+                text(&out).is_empty() && text(&err).is_empty(),
+                "{mode:?} must leave the summary to the CLI transport, not render it: {}{}",
+                text(&out),
+                text(&err)
+            );
+        }
+
+        let (sink, out, _err) = captured(OutputMode::Json, 1);
+        sink.present_run_finished(&summary)
+            .expect("summary renders");
+        let rendered = text(&out);
+        assert!(
+            rendered.contains("\"event\":\"run_finished\""),
+            "{rendered}"
+        );
     }
 }

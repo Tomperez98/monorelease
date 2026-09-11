@@ -11,14 +11,14 @@ use std::thread;
 use crate::cache::{CacheError, CacheMode, CacheSession, CacheStore};
 use crate::output::OutputSink;
 use crate::project::{PlannedTask, Project, TaskNode};
-use crate::runner::{CancellationToken, Runner, RunnerError, TaskResult};
+use crate::runner::{CancellationToken, RunnerError, TaskExecutor, TaskResult};
 
 /// Execute a validated plan while starting newly-ready tasks immediately.
 pub(crate) fn execute_plan(
     project: &Project,
     plan: &[PlannedTask],
     jobs: usize,
-    runner: &Runner,
+    runner: Arc<dyn TaskExecutor>,
     output: &Arc<OutputSink>,
     cache_mode: CacheMode,
     cancellation: &CancellationToken,
@@ -173,7 +173,7 @@ pub(crate) fn execute_plan(
                     can_cache,
                     force,
                     dependency_keys,
-                    runner: runner.clone(),
+                    runner: Arc::clone(&runner),
                     cancellation: cancellation.clone(),
                     output: Arc::clone(output),
                 })
@@ -446,7 +446,7 @@ struct WorkerJob {
     can_cache: bool,
     force: bool,
     dependency_keys: Vec<String>,
-    runner: Runner,
+    runner: Arc<dyn TaskExecutor>,
     cancellation: CancellationToken,
     output: Arc<OutputSink>,
 }
@@ -536,7 +536,7 @@ fn execute_task(job: WorkerJob) -> WorkerReport {
             return WorkerReport::OutputFailed(error);
         }
         let task_cancellation = (!task.is_finalizer()).then_some(&cancellation);
-        match runner.run_with_options(&root, &task, task_cancellation, output_callback.clone()) {
+        match runner.execute(&root, &task, task_cancellation, output_callback.clone()) {
             Ok(result) => break Ok(result),
             Err(_error) if attempt < task.retries() => {
                 attempt += 1;
@@ -838,5 +838,265 @@ mod tests {
         let mut done = BTreeMap::new();
         done.insert(TaskNode::new("build"), succeeded());
         assert!(finalizers_allowed(&tasks, &done, &HashSet::new(), false));
+    }
+
+    #[test]
+    fn scheduler_errors_expose_a_source_exactly_when_they_wrap_one() {
+        let with_source = [
+            SchedulerError::Task(Box::new(RunnerError::EmptyCommand {
+                project: "fixture".to_owned(),
+                task: "build".to_owned(),
+            })),
+            SchedulerError::Cache(CacheError::Invalid {
+                message: "bad entry".to_owned(),
+            }),
+            SchedulerError::Output(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "closed",
+            )),
+        ];
+        for error in &with_source {
+            assert!(error.source().is_some(), "{error}");
+        }
+
+        let bare = [
+            SchedulerError::UnresolvedDependency {
+                task: TaskNode::new("app"),
+                dependency: TaskNode::new("base"),
+            },
+            SchedulerError::NoReadyWork,
+            SchedulerError::Cancelled,
+        ];
+        for error in &bare {
+            assert!(error.source().is_none(), "{error}");
+            assert!(!error.to_string().is_empty(), "{error}");
+        }
+    }
+
+    /// A task executor that records every call and fails a scripted set of
+    /// tasks, so the scheduling loop can be driven deterministically.
+    #[derive(Default)]
+    struct ScriptedExecutor {
+        calls: Mutex<Vec<String>>,
+        failures: Mutex<BTreeSet<String>>,
+    }
+
+    impl ScriptedExecutor {
+        fn failing(ids: &[&str]) -> Self {
+            Self {
+                calls: Mutex::new(Vec::new()),
+                failures: Mutex::new(ids.iter().map(|id| (*id).to_owned()).collect()),
+            }
+        }
+
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().expect("call log is not poisoned").clone()
+        }
+    }
+
+    impl TaskExecutor for ScriptedExecutor {
+        fn execute(
+            &self,
+            _project_root: &std::path::Path,
+            task: &PlannedTask,
+            _cancellation: Option<&CancellationToken>,
+            _output: Option<crate::runner::OutputCallback>,
+        ) -> Result<TaskResult, RunnerError> {
+            self.calls
+                .lock()
+                .expect("call log is not poisoned")
+                .push(task.task().to_owned());
+            if self
+                .failures
+                .lock()
+                .expect("failure set is not poisoned")
+                .contains(task.task())
+            {
+                return Err(RunnerError::EmptyCommand {
+                    project: task.project().to_owned(),
+                    task: task.task().to_owned(),
+                });
+            }
+            succeeded()
+        }
+    }
+
+    /// A sink whose `Write` always fails, standing in for a hung-up pipe.
+    struct FailingWriter;
+
+    impl std::io::Write for FailingWriter {
+        fn write(&mut self, _buffer: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "consumer hung up",
+            ))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn terminal_sink() -> Arc<OutputSink> {
+        Arc::new(OutputSink::test_sink(
+            crate::output::OutputMode::Terminal,
+            1,
+            Box::new(Vec::new()),
+            Box::new(Vec::new()),
+        ))
+    }
+
+    fn project_and_plan(manifest: &str) -> (TempDir, Project, Vec<PlannedTask>) {
+        let temp = TempDir::new();
+        fs::write(config_path(temp.path()), manifest).expect("write manifest");
+        let project = Project::load(temp.path()).expect("project loads");
+        let plan = project.plan(None, &[]).expect("plan succeeds");
+        (temp, project, plan)
+    }
+
+    fn run_with_script(
+        manifest: &str,
+        jobs: usize,
+        executor: &Arc<ScriptedExecutor>,
+        output: &Arc<OutputSink>,
+        cache_mode: CacheMode,
+        cancellation: &CancellationToken,
+    ) -> Result<ExecutionSummary, SchedulerError> {
+        let (_temp, project, plan) = project_and_plan(manifest);
+        // The temp project must outlive the call, so keep `_temp` in scope.
+        execute_plan(
+            &project,
+            &plan,
+            jobs,
+            Arc::clone(executor) as Arc<dyn TaskExecutor>,
+            output,
+            cache_mode,
+            cancellation,
+        )
+    }
+
+    #[test]
+    fn a_chain_runs_in_dependency_order_and_accounts_for_every_task() {
+        let executor = Arc::new(ScriptedExecutor::default());
+        let summary = run_with_script(
+            "[project]\nname = \"fixture\"\n\n[pipelines.ci]\ntasks = [\"app\"]\n\n[tasks.base]\ncommand = [\"echo\", \"base\"]\n\n[tasks.app]\ncommand = [\"echo\", \"app\"]\ndepends_on = [\"base\"]\n",
+            1,
+            &executor,
+            &terminal_sink(),
+            CacheMode::NoCache,
+            &CancellationToken::new(),
+        )
+        .expect("the chain succeeds");
+
+        assert_eq!(executor.calls(), vec!["base".to_owned(), "app".to_owned()]);
+        assert_eq!(summary.completed, 2);
+        assert_eq!(summary.failed + summary.cancelled + summary.blocked, 0);
+    }
+
+    #[test]
+    fn a_failed_task_stops_normal_work_but_still_runs_finalizers() {
+        let executor = Arc::new(ScriptedExecutor::failing(&["build"]));
+        let error = run_with_script(
+            "[project]\nname = \"fixture\"\n\n[pipelines.ci]\ntasks = [\"build\"]\nfinally = [\"cleanup\"]\n\n[tasks.build]\ncommand = [\"echo\", \"build\"]\n\n[tasks.cleanup]\ncommand = [\"echo\", \"cleanup\"]\n",
+            1,
+            &executor,
+            &terminal_sink(),
+            CacheMode::NoCache,
+            &CancellationToken::new(),
+        )
+        .expect_err("a failed task is the reported error");
+
+        assert!(matches!(error, SchedulerError::Task(_)), "{error}");
+        assert_eq!(
+            executor.calls(),
+            vec!["build".to_owned(), "cleanup".to_owned()],
+            "the finalizer must run after a normal failure"
+        );
+    }
+
+    #[test]
+    fn a_cancelled_run_blocks_normal_work_and_reports_cancelled() {
+        let executor = Arc::new(ScriptedExecutor::default());
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+
+        let error = run_with_script(
+            "[project]\nname = \"fixture\"\n\n[pipelines.ci]\ntasks = [\"build\"]\n\n[tasks.build]\ncommand = [\"echo\", \"build\"]\n",
+            1,
+            &executor,
+            &terminal_sink(),
+            CacheMode::NoCache,
+            &cancellation,
+        )
+        .expect_err("a cancelled run is an error");
+
+        assert!(matches!(error, SchedulerError::Cancelled), "{error}");
+        assert!(
+            executor.calls().is_empty(),
+            "a cancelled task must never reach the executor"
+        );
+    }
+
+    #[test]
+    fn an_output_failure_is_reported_before_any_task_runs() {
+        let executor = Arc::new(ScriptedExecutor::default());
+        let output: Arc<OutputSink> = Arc::new(OutputSink::test_sink(
+            crate::output::OutputMode::Terminal,
+            1,
+            Box::new(FailingWriter),
+            Box::new(FailingWriter),
+        ));
+
+        let error = run_with_script(
+            "[project]\nname = \"fixture\"\n\n[pipelines.ci]\ntasks = [\"build\"]\n\n[tasks.build]\ncommand = [\"echo\", \"build\"]\n",
+            1,
+            &executor,
+            &output,
+            CacheMode::NoCache,
+            &CancellationToken::new(),
+        )
+        .expect_err("a renderer failure stops the run");
+
+        assert!(matches!(error, SchedulerError::Output(_)), "{error}");
+        assert!(executor.calls().is_empty());
+    }
+
+    #[test]
+    fn a_cache_failure_is_reported_before_the_task_runs() {
+        let executor = Arc::new(ScriptedExecutor::default());
+        let error = run_with_script(
+            "[project]\nname = \"fixture\"\n\n[pipelines.ci]\ntasks = [\"build\"]\n\n[tasks.build]\ncommand = [\"echo\", \"build\"]\ncache = true\ninputs = [\"missing/**\"]\noutputs = [\"out/**\"]\n",
+            1,
+            &executor,
+            &terminal_sink(),
+            CacheMode::ReadWrite,
+            &CancellationToken::new(),
+        )
+        .expect_err("an unmatched input pattern is a cache failure");
+
+        assert!(matches!(error, SchedulerError::Cache(_)), "{error}");
+        assert!(
+            executor.calls().is_empty(),
+            "the task must not run when its key cannot be computed"
+        );
+    }
+
+    #[test]
+    fn independent_tasks_run_once_each_at_one_worker() {
+        let executor = Arc::new(ScriptedExecutor::default());
+        let summary = run_with_script(
+            "[project]\nname = \"fixture\"\n\n[pipelines.ci]\ntasks = [\"a\", \"b\", \"c\"]\n\n[tasks.a]\ncommand = [\"echo\", \"a\"]\n\n[tasks.b]\ncommand = [\"echo\", \"b\"]\n\n[tasks.c]\ncommand = [\"echo\", \"c\"]\n",
+            1,
+            &executor,
+            &terminal_sink(),
+            CacheMode::NoCache,
+            &CancellationToken::new(),
+        )
+        .expect("independent tasks succeed");
+
+        let mut calls = executor.calls();
+        calls.sort();
+        assert_eq!(calls, vec!["a".to_owned(), "b".to_owned(), "c".to_owned()]);
+        assert_eq!(summary.completed, 3);
     }
 }

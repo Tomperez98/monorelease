@@ -142,3 +142,93 @@ impl TaskStatus {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// These strings are the machine contract a CI consumer reads. Renaming a
+    /// variant must break this test, not silently change the JSON stream.
+    #[test]
+    fn task_status_serializes_to_its_documented_token() {
+        for (status, token) in [
+            (TaskStatus::Completed, "completed"),
+            (TaskStatus::Cached, "cached"),
+            (TaskStatus::Failed, "failed"),
+            (TaskStatus::TimedOut, "timed_out"),
+            (TaskStatus::OutputLimit, "output_limit"),
+            (TaskStatus::Cancelled, "cancelled"),
+            (TaskStatus::Blocked, "blocked"),
+        ] {
+            assert_eq!(
+                serde_json::to_value(status).expect("status serializes"),
+                serde_json::json!(token)
+            );
+        }
+    }
+
+    #[test]
+    fn task_stream_serializes_to_its_documented_token() {
+        assert_eq!(
+            serde_json::to_value(TaskStream::Stdout).unwrap(),
+            serde_json::json!("stdout")
+        );
+        assert_eq!(
+            serde_json::to_value(TaskStream::Stderr).unwrap(),
+            serde_json::json!("stderr")
+        );
+    }
+
+    #[test]
+    fn every_event_carries_its_name_tag_and_schema() {
+        let node = TaskNode::new("build");
+        let events = [
+            (
+                ExecutionEvent::run_started(PathBuf::from("/workspace"), 2),
+                "run_started",
+            ),
+            (ExecutionEvent::task_started(&node), "task_started"),
+            (
+                ExecutionEvent::task_output(&node, TaskStream::Stdout, b"hi".to_vec()),
+                "task_output",
+            ),
+            (
+                ExecutionEvent::task_attempt_started(&node, 2, 3),
+                "task_attempt_started",
+            ),
+            (
+                ExecutionEvent::task_finished(&node, TaskStatus::Completed, Duration::ZERO),
+                "task_finished",
+            ),
+            (ExecutionEvent::run_finished(1, 0, 0, 0, 0), "run_finished"),
+        ];
+
+        for (event, name) in events {
+            let value = serde_json::to_value(&event).expect("event serializes");
+            assert_eq!(value["event"], name, "{value}");
+            assert_eq!(value["schema"], EXECUTION_EVENT_SCHEMA, "{value}");
+        }
+    }
+
+    #[test]
+    fn status_labels_are_distinct_and_non_empty() {
+        let labels = [
+            TaskStatus::Completed,
+            TaskStatus::Cached,
+            TaskStatus::Failed,
+            TaskStatus::TimedOut,
+            TaskStatus::OutputLimit,
+            TaskStatus::Cancelled,
+            TaskStatus::Blocked,
+        ]
+        .map(TaskStatus::label);
+
+        for label in labels {
+            assert!(!label.is_empty());
+        }
+        let mut sorted = labels.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), labels.len(), "two statuses share a label");
+    }
+}

@@ -185,6 +185,7 @@ fn verify_source_with(
 }
 
 /// Verify a legacy `SHA256SUMS` file without requiring release metadata.
+/// Public for compatibility; no in-tree caller.
 pub fn verify_checksums(directory: &Path) -> Result<usize, ReleaseError> {
     let checksums_path = directory.join(CHECKSUMS_FILE_NAME);
     let entries = read_checksums(&checksums_path)?;
@@ -879,6 +880,86 @@ mod tests {
             assert!(
                 matches!(error, ReleaseError::Invalid(_)),
                 "{tag}/{commit}: {error}"
+            );
+        }
+    }
+
+    fn sha256_of(contents: &[u8]) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(contents);
+        format!("{:x}", hasher.finalize())
+    }
+
+    #[test]
+    fn verify_checksums_accepts_a_matching_sums_file() {
+        let temp = TempDir::new();
+        fs::write(temp.path().join("app.tar.gz"), b"app").unwrap();
+        fs::write(
+            temp.path().join(CHECKSUMS_FILE_NAME),
+            format!("{}  app.tar.gz\n", sha256_of(b"app")),
+        )
+        .unwrap();
+
+        let count = verify_checksums(temp.path()).expect("checksums verify");
+
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn verify_checksums_reports_a_mismatch() {
+        let temp = TempDir::new();
+        fs::write(temp.path().join("app.tar.gz"), b"after").unwrap();
+        fs::write(
+            temp.path().join(CHECKSUMS_FILE_NAME),
+            format!("{}  app.tar.gz\n", sha256_of(b"before")),
+        )
+        .unwrap();
+
+        let error = verify_checksums(temp.path()).expect_err("a mismatch fails");
+
+        assert!(error.to_string().contains("checksum mismatch"), "{error}");
+    }
+
+    #[test]
+    fn verify_checksums_rejects_a_non_regular_entry() {
+        let temp = TempDir::new();
+        fs::create_dir(temp.path().join("directory")).unwrap();
+        fs::write(
+            temp.path().join(CHECKSUMS_FILE_NAME),
+            format!("{}  directory\n", sha256_of(b"")),
+        )
+        .unwrap();
+
+        let error = verify_checksums(temp.path()).expect_err("a directory is not an artifact");
+
+        assert!(error.to_string().contains("not a regular file"), "{error}");
+    }
+
+    #[test]
+    fn malformed_sums_files_are_rejected_with_their_line_number() {
+        let temp = TempDir::new();
+        fs::write(temp.path().join("artifact"), b"data").unwrap();
+
+        let cases = [
+            ("no separator\n", "expected `<sha256>  <file>`"),
+            ("abc  artifact\n", "invalid SHA-256 digest"),
+            ("   \n", "lists no artifacts"),
+            (
+                "0000000000000000000000000000000000000000000000000000000000000000  ../escape\n",
+                "invalid artifact name",
+            ),
+            (
+                "0000000000000000000000000000000000000000000000000000000000000000  artifact\n0000000000000000000000000000000000000000000000000000000000000000  artifact\n",
+                "duplicate artifact name",
+            ),
+        ];
+
+        for (contents, expected_message) in cases {
+            fs::write(temp.path().join(CHECKSUMS_FILE_NAME), contents).unwrap();
+            let error = verify_checksums(temp.path()).expect_err(contents);
+            assert!(
+                error.to_string().contains(expected_message),
+                "{contents:?}: {error}"
             );
         }
     }
