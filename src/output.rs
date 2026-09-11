@@ -28,100 +28,154 @@ pub enum OutputMode {
 
 /// Owns task presentation so worker threads never write directly to the
 /// process-global stdout or stderr handles.
-#[derive(Debug)]
+///
+/// The two write handles are fields rather than process globals so every
+/// output mode is renderable into a captured buffer.
 pub(crate) struct OutputSink {
     mode: OutputMode,
-    lock: Mutex<()>,
+    writers: Mutex<Writers>,
     run_id: u64,
     sequence: AtomicU64,
-    #[cfg(test)]
-    json_lines: Option<std::sync::Arc<std::sync::Mutex<Vec<String>>>>,
+}
+
+struct Writers {
+    out: Box<dyn Write + Send>,
+    err: Box<dyn Write + Send>,
+}
+
+impl std::fmt::Debug for OutputSink {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("OutputSink")
+            .field("mode", &self.mode)
+            .field("run_id", &self.run_id)
+            .finish_non_exhaustive()
+    }
 }
 
 impl OutputSink {
+    /// Render to the real process handles.
     pub(crate) fn new(mode: OutputMode) -> Self {
+        Self::with_writers(mode, Box::new(io::stdout()), Box::new(io::stderr()))
+    }
+
+    /// Render to caller-owned handles. A test passes buffers; the CLI passes
+    /// the process stdio.
+    pub(crate) fn with_writers(
+        mode: OutputMode,
+        out: Box<dyn Write + Send>,
+        err: Box<dyn Write + Send>,
+    ) -> Self {
+        Self::with_identity(mode, run_identity(), out, err)
+    }
+
+    fn with_identity(
+        mode: OutputMode,
+        run_id: u64,
+        out: Box<dyn Write + Send>,
+        err: Box<dyn Write + Send>,
+    ) -> Self {
         Self {
             mode,
-            lock: Mutex::new(()),
-            run_id: run_identity(),
+            writers: Mutex::new(Writers { out, err }),
+            run_id,
             sequence: AtomicU64::new(0),
-            #[cfg(test)]
-            json_lines: None,
         }
     }
 
+    /// A sink with a pinned run identity, so CI output is deterministic.
+    #[cfg(test)]
+    pub(crate) fn test_sink(
+        mode: OutputMode,
+        run_id: u64,
+        out: Box<dyn Write + Send>,
+        err: Box<dyn Write + Send>,
+    ) -> Self {
+        Self::with_identity(mode, run_id, out, err)
+    }
+
     pub(crate) fn present_start(&self, node: &TaskNode) -> io::Result<()> {
-        let _guard = self.lock.lock().expect("output lock is not poisoned");
-        self.render_event(&ExecutionEvent::task_started(node))
+        let mut writers = self.writers.lock().expect("output lock is not poisoned");
+        self.render_event(&mut writers, &ExecutionEvent::task_started(node))
     }
 
     pub(crate) fn present_success(&self, node: &TaskNode, result: &TaskResult) -> io::Result<()> {
-        let _guard = self.lock.lock().expect("output lock is not poisoned");
+        let mut writers = self.writers.lock().expect("output lock is not poisoned");
         if matches!(self.mode, OutputMode::Json | OutputMode::GithubActions) {
             // Emit separate TaskOutput events so the JSON stream and CI log are lossless.
             if !result.output.stdout.is_empty() {
-                self.render_event(&ExecutionEvent::task_output(
-                    node,
-                    TaskStream::Stdout,
-                    result.output.stdout.clone(),
-                ))?;
+                self.render_event(
+                    &mut writers,
+                    &ExecutionEvent::task_output(
+                        node,
+                        TaskStream::Stdout,
+                        result.output.stdout.clone(),
+                    ),
+                )?;
             }
             if !result.output.stderr.is_empty() {
-                self.render_event(&ExecutionEvent::task_output(
-                    node,
-                    TaskStream::Stderr,
-                    result.output.stderr.clone(),
-                ))?;
+                self.render_event(
+                    &mut writers,
+                    &ExecutionEvent::task_output(
+                        node,
+                        TaskStream::Stderr,
+                        result.output.stderr.clone(),
+                    ),
+                )?;
             }
-        } else {
-            self.start_section(node)?;
-            if self.mode != OutputMode::Live || result.cached {
-                write_bytes(&result.output.stdout, false)?;
-                write_bytes(&result.output.stderr, true)?;
-            }
+        } else if self.mode != OutputMode::Live || result.cached {
+            write_bytes(&mut writers, &result.output.stdout, false)?;
+            write_bytes(&mut writers, &result.output.stderr, true)?;
         }
         let status = if result.cached {
             TaskStatus::Cached
         } else {
             TaskStatus::Completed
         };
-        self.render_event(&ExecutionEvent::task_finished(node, status, result.elapsed))
+        self.render_event(
+            &mut writers,
+            &ExecutionEvent::task_finished(node, status, result.elapsed),
+        )
     }
 
     pub(crate) fn present_blocked(&self, node: &TaskNode) -> io::Result<()> {
-        let _guard = self.lock.lock().expect("output lock is not poisoned");
-        self.render_event(&ExecutionEvent::task_finished(
-            node,
-            TaskStatus::Blocked,
-            std::time::Duration::ZERO,
-        ))
+        let mut writers = self.writers.lock().expect("output lock is not poisoned");
+        self.render_event(
+            &mut writers,
+            &ExecutionEvent::task_finished(node, TaskStatus::Blocked, std::time::Duration::ZERO),
+        )
     }
 
     pub(crate) fn present_failure(&self, node: &TaskNode, error: &RunnerError) -> io::Result<()> {
-        let _guard = self.lock.lock().expect("output lock is not poisoned");
+        let mut writers = self.writers.lock().expect("output lock is not poisoned");
         if matches!(self.mode, OutputMode::Json | OutputMode::GithubActions) {
             if let Some(output) = error.output() {
                 if !output.stdout.is_empty() {
-                    self.render_event(&ExecutionEvent::task_output(
-                        node,
-                        TaskStream::Stdout,
-                        output.stdout.clone(),
-                    ))?;
+                    self.render_event(
+                        &mut writers,
+                        &ExecutionEvent::task_output(
+                            node,
+                            TaskStream::Stdout,
+                            output.stdout.clone(),
+                        ),
+                    )?;
                 }
                 if !output.stderr.is_empty() {
-                    self.render_event(&ExecutionEvent::task_output(
-                        node,
-                        TaskStream::Stderr,
-                        output.stderr.clone(),
-                    ))?;
+                    self.render_event(
+                        &mut writers,
+                        &ExecutionEvent::task_output(
+                            node,
+                            TaskStream::Stderr,
+                            output.stderr.clone(),
+                        ),
+                    )?;
                 }
             }
-        } else if self.mode != OutputMode::Live {
-            self.start_section(node)?;
-            if let Some(output) = error.output() {
-                write_bytes(&output.stdout, false)?;
-                write_bytes(&output.stderr, true)?;
-            }
+        } else if self.mode != OutputMode::Live
+            && let Some(output) = error.output()
+        {
+            write_bytes(&mut writers, &output.stdout, false)?;
+            write_bytes(&mut writers, &output.stderr, true)?;
         }
         let status = match error {
             RunnerError::TimedOut(_) => TaskStatus::TimedOut,
@@ -129,11 +183,10 @@ impl OutputSink {
             RunnerError::Cancelled(_) => TaskStatus::Cancelled,
             _ => TaskStatus::Failed,
         };
-        self.render_event(&ExecutionEvent::task_finished(
-            node,
-            status,
-            error.elapsed().unwrap_or_default(),
-        ))
+        self.render_event(
+            &mut writers,
+            &ExecutionEvent::task_finished(node, status, error.elapsed().unwrap_or_default()),
+        )
     }
 
     pub(crate) fn is_live(&self) -> bool {
@@ -146,12 +199,11 @@ impl OutputSink {
         attempt: u32,
         max_attempts: u32,
     ) -> io::Result<()> {
-        let _guard = self.lock.lock().expect("output lock is not poisoned");
-        self.render_event(&ExecutionEvent::task_attempt_started(
-            node,
-            attempt,
-            max_attempts,
-        ))
+        let mut writers = self.writers.lock().expect("output lock is not poisoned");
+        self.render_event(
+            &mut writers,
+            &ExecutionEvent::task_attempt_started(node, attempt, max_attempts),
+        )
     }
 
     pub(crate) fn present_live_output(
@@ -160,23 +212,26 @@ impl OutputSink {
         stream: TaskStream,
         bytes: Vec<u8>,
     ) -> io::Result<()> {
-        let _guard = self.lock.lock().expect("output lock is not poisoned");
-        self.render_event(&ExecutionEvent::task_output(node, stream, bytes))
+        let mut writers = self.writers.lock().expect("output lock is not poisoned");
+        self.render_event(
+            &mut writers,
+            &ExecutionEvent::task_output(node, stream, bytes),
+        )
     }
 
     pub(crate) fn present_run_start(&self, project: &Path, task_count: usize) -> io::Result<()> {
-        let _guard = self.lock.lock().expect("output lock is not poisoned");
-        self.render_event(&ExecutionEvent::run_started(
-            project.to_path_buf(),
-            task_count,
-        ))
+        let mut writers = self.writers.lock().expect("output lock is not poisoned");
+        self.render_event(
+            &mut writers,
+            &ExecutionEvent::run_started(project.to_path_buf(), task_count),
+        )
     }
 
     pub(crate) fn present_run_finished(
         &self,
         summary: &crate::scheduler::ExecutionSummary,
     ) -> io::Result<()> {
-        let _guard = self.lock.lock().expect("output lock is not poisoned");
+        let mut writers = self.writers.lock().expect("output lock is not poisoned");
 
         // `run_pipeline_with_mode` returns the human-readable summary to the
         // CLI transport, which writes it once to stdout. JSON must receive the
@@ -184,55 +239,39 @@ impl OutputSink {
         // second summary line in that mode. Avoid sending a second terminal or
         // GitHub Actions summary to stderr/stdout from the scheduler.
         if self.mode == OutputMode::Json {
-            self.render_event(&ExecutionEvent::run_finished(
-                summary.completed,
-                summary.cached,
-                summary.failed,
-                summary.cancelled,
-                summary.blocked,
-            ))
+            self.render_event(
+                &mut writers,
+                &ExecutionEvent::run_finished(
+                    summary.completed,
+                    summary.cached,
+                    summary.failed,
+                    summary.cancelled,
+                    summary.blocked,
+                ),
+            )
         } else {
             Ok(())
         }
     }
 
-    fn render_event(&self, event: &ExecutionEvent) -> io::Result<()> {
+    fn render_event(&self, writers: &mut Writers, event: &ExecutionEvent) -> io::Result<()> {
         match self.mode {
-            OutputMode::Json => {
-                #[cfg(test)]
-                if let Some(ref lines) = self.json_lines {
-                    let mut buf = Vec::new();
-                    write_json_event_with_identity(
-                        event,
-                        self.run_id,
-                        self.sequence.fetch_add(1, Ordering::Relaxed),
-                        &mut buf,
-                    )?;
-                    let line = String::from_utf8(buf).map_err(|_| {
-                        io::Error::new(io::ErrorKind::InvalidData, "non-UTF-8 JSON")
-                    })?;
-                    lines.lock().expect("json_lines lock").push(line);
-                    return Ok(());
-                }
-                let mut stdout = io::stdout().lock();
-                write_json_event_with_identity(
-                    event,
-                    self.run_id,
-                    self.sequence.fetch_add(1, Ordering::Relaxed),
-                    &mut stdout,
-                )
-            }
-            OutputMode::Terminal => self.render_terminal(event),
-            OutputMode::GithubActions => self.render_github_actions(event),
-            OutputMode::Live => self.render_live(event),
+            OutputMode::Json => write_json_event_with_identity(
+                event,
+                self.run_id,
+                self.sequence.fetch_add(1, Ordering::Relaxed),
+                &mut *writers.out,
+            ),
+            OutputMode::Terminal => self.render_terminal(writers, event),
+            OutputMode::GithubActions => self.render_github_actions(writers, event),
+            OutputMode::Live => self.render_live(writers, event),
         }
     }
 
-    fn render_terminal(&self, event: &ExecutionEvent) -> io::Result<()> {
-        let mut stderr = io::stderr().lock();
+    fn render_terminal(&self, writers: &mut Writers, event: &ExecutionEvent) -> io::Result<()> {
         match event {
             ExecutionEvent::TaskStarted { task, .. } => {
-                writeln!(stderr, "▶ {task}")
+                writeln!(&mut *writers.err, "▶ {task}")
             }
             ExecutionEvent::TaskOutput { .. } => {
                 let _ = event;
@@ -247,7 +286,10 @@ impl OutputSink {
                 if *attempt == 1 {
                     Ok(())
                 } else {
-                    writeln!(stderr, "↻ {task}: retry {attempt}/{max_attempts}")
+                    writeln!(
+                        &mut *writers.err,
+                        "↻ {task}: retry {attempt}/{max_attempts}"
+                    )
                 }
             }
             ExecutionEvent::TaskFinished {
@@ -256,7 +298,11 @@ impl OutputSink {
                 elapsed_ms,
                 ..
             } => {
-                writeln!(stderr, "{task}: {} in {elapsed_ms}ms", status.label())
+                writeln!(
+                    &mut *writers.err,
+                    "{task}: {} in {elapsed_ms}ms",
+                    status.label()
+                )
             }
             ExecutionEvent::RunFinished {
                 completed,
@@ -266,37 +312,38 @@ impl OutputSink {
                 blocked,
                 ..
             } => writeln!(
-                stderr,
+                &mut *writers.err,
                 "summary: {completed} completed, {cached} cached, {failed} failed, {cancelled} cancelled, {blocked} blocked"
             ),
             ExecutionEvent::RunStarted { .. } => Ok(()),
         }
     }
 
-    fn render_live(&self, event: &ExecutionEvent) -> io::Result<()> {
+    fn render_live(&self, writers: &mut Writers, event: &ExecutionEvent) -> io::Result<()> {
         match event {
             ExecutionEvent::TaskOutput { bytes, stream, .. } => {
                 if matches!(stream, TaskStream::Stderr) {
-                    let mut handle = io::stderr().lock();
-                    handle.write_all(bytes)?;
-                    handle.flush()
+                    writers.err.write_all(bytes)?;
+                    writers.err.flush()
                 } else {
-                    let mut handle = io::stdout().lock();
-                    handle.write_all(bytes)?;
-                    handle.flush()
+                    writers.out.write_all(bytes)?;
+                    writers.out.flush()
                 }
             }
-            _ => self.render_terminal(event),
+            _ => self.render_terminal(writers, event),
         }
     }
 
-    fn render_github_actions(&self, event: &ExecutionEvent) -> io::Result<()> {
+    fn render_github_actions(
+        &self,
+        writers: &mut Writers,
+        event: &ExecutionEvent,
+    ) -> io::Result<()> {
         match event {
             ExecutionEvent::TaskStarted { task, .. } => {
-                let mut stdout = io::stdout().lock();
-                writeln!(stdout, "::group::{task}")?;
-                writeln!(stdout, "▶ {task}")?;
-                stdout.flush()
+                writeln!(&mut *writers.out, "::group::{task}")?;
+                writeln!(&mut *writers.out, "▶ {task}")?;
+                writers.out.flush()
             }
             ExecutionEvent::TaskOutput { bytes, stream, .. } => {
                 if bytes.is_empty() {
@@ -307,21 +354,17 @@ impl OutputSink {
                     self.run_id,
                     self.sequence.fetch_add(1, Ordering::Relaxed)
                 );
-                {
-                    let mut control = io::stdout().lock();
-                    writeln!(control, "::stop-commands::{token}")?;
-                    control.flush()?;
-                }
+                writeln!(&mut *writers.out, "::stop-commands::{token}")?;
+                writers.out.flush()?;
                 let result = if matches!(stream, TaskStream::Stderr) {
-                    let mut handle = io::stderr().lock();
-                    write_line_terminated(&mut handle, bytes).and_then(|_| handle.flush())
+                    write_line_terminated(&mut *writers.err, bytes)
+                        .and_then(|()| writers.err.flush())
                 } else {
-                    let mut handle = io::stdout().lock();
-                    write_line_terminated(&mut handle, bytes).and_then(|_| handle.flush())
+                    write_line_terminated(&mut *writers.out, bytes)
+                        .and_then(|()| writers.out.flush())
                 };
-                let mut control = io::stdout().lock();
-                writeln!(control, "::{token}::")?;
-                control.flush()?;
+                writeln!(&mut *writers.out, "::{token}::")?;
+                writers.out.flush()?;
                 result
             }
             ExecutionEvent::TaskAttemptStarted {
@@ -331,9 +374,11 @@ impl OutputSink {
                 ..
             } => {
                 if *attempt > 1 {
-                    let mut stdout = io::stdout().lock();
-                    writeln!(stdout, "↻ {task}: retry {attempt}/{max_attempts}")?;
-                    stdout.flush()
+                    writeln!(
+                        &mut *writers.out,
+                        "↻ {task}: retry {attempt}/{max_attempts}"
+                    )?;
+                    writers.out.flush()
                 } else {
                     Ok(())
                 }
@@ -344,10 +389,13 @@ impl OutputSink {
                 elapsed_ms,
                 ..
             } => {
-                let mut stdout = io::stdout().lock();
-                writeln!(stdout, "{task}: {} in {elapsed_ms}ms", status.label())?;
-                writeln!(stdout, "::endgroup::")?;
-                stdout.flush()
+                writeln!(
+                    &mut *writers.out,
+                    "{task}: {} in {elapsed_ms}ms",
+                    status.label()
+                )?;
+                writeln!(&mut *writers.out, "::endgroup::")?;
+                writers.out.flush()
             }
             ExecutionEvent::RunFinished {
                 completed,
@@ -357,51 +405,13 @@ impl OutputSink {
                 blocked,
                 ..
             } => {
-                let mut stdout = io::stdout().lock();
                 writeln!(
-                    stdout,
+                    &mut *writers.out,
                     "summary: {completed} completed, {cached} cached, {failed} failed, {cancelled} cancelled, {blocked} blocked"
                 )?;
-                stdout.flush()
+                writers.out.flush()
             }
             ExecutionEvent::RunStarted { .. } => Ok(()),
-        }
-    }
-
-    fn start_section(&self, _node: &TaskNode) -> io::Result<()> {
-        // Group begin/end is now handled by the event renderer
-        // (TaskStarted emits ::group::, TaskFinished emits ::endgroup::).
-        Ok(())
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn present_summary(
-        &self,
-        summary: &crate::scheduler::ExecutionSummary,
-    ) -> io::Result<()> {
-        let _guard = self.lock.lock().expect("output lock is not poisoned");
-        self.render_event(&ExecutionEvent::run_finished(
-            summary.completed,
-            summary.cached,
-            summary.failed,
-            summary.cancelled,
-            summary.blocked,
-        ))
-    }
-
-    #[allow(dead_code)]
-    fn write_status<F>(&self, write: F) -> io::Result<()>
-    where
-        F: FnOnce(&mut dyn Write) -> io::Result<()>,
-    {
-        if self.mode == OutputMode::GithubActions {
-            let mut stdout = io::stdout().lock();
-            write(&mut stdout)?;
-            stdout.flush()
-        } else {
-            let mut stderr = io::stderr().lock();
-            write(&mut stderr)?;
-            stderr.flush()
         }
     }
 }
@@ -414,17 +424,11 @@ struct JsonEvent<'a> {
     event: &'a ExecutionEvent,
 }
 
-#[cfg(test)]
-fn write_json_event(event: &ExecutionEvent, writer: &mut impl Write) -> io::Result<()> {
-    serde_json::to_writer(&mut *writer, event).map_err(io::Error::other)?;
-    writer.write_all(b"\n")
-}
-
 fn write_json_event_with_identity(
     event: &ExecutionEvent,
     run_id: u64,
     sequence: u64,
-    writer: &mut impl Write,
+    writer: &mut (impl Write + ?Sized),
 ) -> io::Result<()> {
     serde_json::to_writer(
         &mut *writer,
@@ -446,23 +450,21 @@ fn run_identity() -> u64 {
     (nanos as u64) ^ u64::from(std::process::id())
 }
 
-fn write_bytes(bytes: &[u8], to_stderr: bool) -> io::Result<()> {
+fn write_bytes(writers: &mut Writers, bytes: &[u8], to_stderr: bool) -> io::Result<()> {
     if bytes.is_empty() {
         return Ok(());
     }
-    if to_stderr {
-        let mut handle = io::stderr().lock();
-        write_line_terminated(&mut handle, bytes)?;
-        handle.flush()
+    let handle: &mut dyn Write = if to_stderr {
+        &mut *writers.err
     } else {
-        let mut handle = io::stdout().lock();
-        write_line_terminated(&mut handle, bytes)?;
-        handle.flush()
-    }
+        &mut *writers.out
+    };
+    write_line_terminated(handle, bytes)?;
+    handle.flush()
 }
 
 /// Keep task metadata on its own line when a command omits its final newline.
-fn write_line_terminated(handle: &mut impl Write, bytes: &[u8]) -> io::Result<()> {
+fn write_line_terminated(handle: &mut (impl Write + ?Sized), bytes: &[u8]) -> io::Result<()> {
     handle.write_all(bytes)?;
     if !bytes.ends_with(b"\n") {
         handle.write_all(b"\n")?;
@@ -474,63 +476,158 @@ fn write_line_terminated(handle: &mut impl Write, bytes: &[u8]) -> io::Result<()
 mod tests {
     use super::*;
     use crate::scheduler::ExecutionSummary;
+    use std::sync::{Arc, Mutex};
 
-    #[test]
-    fn json_output_is_one_valid_object_per_line() {
-        let lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let sink = OutputSink {
-            mode: OutputMode::Json,
-            lock: Mutex::new(()),
-            run_id: 1,
-            sequence: AtomicU64::new(0),
-            json_lines: Some(lines.clone()),
-        };
+    /// A `Write` handle over a buffer the test can read back.
+    #[derive(Clone)]
+    struct SharedWriter(Arc<Mutex<Vec<u8>>>);
 
-        sink.present_start(&TaskNode::new("build"))
-            .expect("start event writes");
+    impl Write for SharedWriter {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            self.0
+                .lock()
+                .expect("shared writer lock")
+                .extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
 
-        let captured = lines.lock().unwrap();
-        assert_eq!(captured.len(), 1);
-        let event: serde_json::Value =
-            serde_json::from_str(&captured[0]).expect("valid JSON event");
-        assert_eq!(event["event"], "task_started");
-        assert_eq!(event["schema"], crate::events::EXECUTION_EVENT_SCHEMA);
-        assert_eq!(event["task"], "build");
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    type Captured = (OutputSink, Arc<Mutex<Vec<u8>>>, Arc<Mutex<Vec<u8>>>);
+
+    /// A sink with a pinned run identity, so CI output is byte-for-byte assertable.
+    fn captured(mode: OutputMode, run_id: u64) -> Captured {
+        let out = Arc::new(Mutex::new(Vec::new()));
+        let err = Arc::new(Mutex::new(Vec::new()));
+        let sink = OutputSink::test_sink(
+            mode,
+            run_id,
+            Box::new(SharedWriter(Arc::clone(&out))),
+            Box::new(SharedWriter(Arc::clone(&err))),
+        );
+        (sink, out, err)
+    }
+
+    fn text(buffer: &Arc<Mutex<Vec<u8>>>) -> String {
+        String::from_utf8(buffer.lock().expect("buffer lock").clone())
+            .expect("rendered output is UTF-8")
+    }
+
+    fn result(stdout: &[u8], cached: bool) -> TaskResult {
+        TaskResult {
+            output: crate::runner::CapturedOutput {
+                stdout: stdout.to_vec(),
+                stderr: Vec::new(),
+            },
+            elapsed: std::time::Duration::from_millis(42),
+            cached,
+        }
     }
 
     #[test]
-    fn json_run_started_event() {
-        let lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let sink = OutputSink {
-            mode: OutputMode::Json,
-            lock: Mutex::new(()),
-            run_id: 1,
-            sequence: AtomicU64::new(0),
-            json_lines: Some(lines.clone()),
-        };
+    fn terminal_renders_a_golden_transcript() {
+        let (sink, out, err) = captured(OutputMode::Terminal, 1);
+        let node = TaskNode::new("build");
 
-        sink.present_run_start(Path::new("/workspace"), 3)
-            .expect("run start event writes");
+        sink.present_start(&node).expect("start renders");
+        sink.present_attempt(&node, 2, 3).expect("attempt renders");
+        sink.present_success(&node, &result(b"hello\n", false))
+            .expect("success renders");
 
-        let captured = lines.lock().unwrap();
-        assert_eq!(captured.len(), 1);
-        let event: serde_json::Value =
-            serde_json::from_str(&captured[0]).expect("valid JSON event");
-        assert_eq!(event["event"], "run_started");
-        assert_eq!(event["task_count"], 3);
+        assert_eq!(text(&out), "hello\n");
+        assert_eq!(
+            text(&err),
+            "\u{25b6} build\n\u{21bb} build: retry 2/3\nbuild: completed in 42ms\n"
+        );
     }
 
     #[test]
-    fn json_run_finished_event() {
-        let lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let sink = OutputSink {
-            mode: OutputMode::Json,
-            lock: Mutex::new(()),
-            run_id: 1,
-            sequence: AtomicU64::new(0),
-            json_lines: Some(lines.clone()),
-        };
+    fn terminal_marks_a_cache_hit() {
+        let (sink, out, err) = captured(OutputMode::Terminal, 1);
+        let node = TaskNode::new("build");
 
+        sink.present_success(&node, &result(b"cached\n", true))
+            .expect("success renders");
+
+        assert_eq!(text(&out), "cached\n");
+        assert_eq!(text(&err), "build: cache hit in 42ms\n");
+    }
+
+    #[test]
+    fn live_streams_bytes_once_and_keeps_status_on_stderr() {
+        let (sink, out, err) = captured(OutputMode::Live, 1);
+        let node = TaskNode::new("build");
+
+        sink.present_start(&node).expect("start renders");
+        sink.present_live_output(&node, TaskStream::Stdout, b"streamed".to_vec())
+            .expect("live output renders");
+        sink.present_success(&node, &result(b"streamed", false))
+            .expect("success does not repeat live bytes");
+
+        assert_eq!(text(&out), "streamed");
+        assert_eq!(text(&err), "\u{25b6} build\nbuild: completed in 42ms\n");
+    }
+
+    #[test]
+    fn github_actions_wraps_task_output_in_stop_and_resume_markers() {
+        let (sink, out, _err) = captured(OutputMode::GithubActions, 7);
+        let node = TaskNode::new("build");
+
+        sink.present_start(&node).expect("start renders");
+        sink.present_success(&node, &result(b"::error:: injected\n", false))
+            .expect("success renders");
+
+        let rendered = text(&out);
+        assert!(rendered.starts_with("::group::build\n"), "{rendered}");
+        assert!(rendered.contains("::stop-commands::"), "{rendered}");
+        assert!(rendered.contains("::mono_output_7_"), "{rendered}");
+        assert!(rendered.contains("::error:: injected\n"), "{rendered}");
+        assert!(
+            rendered.ends_with("build: completed in 42ms\n::endgroup::\n"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn json_writes_one_identified_object_per_line_through_the_production_path() {
+        let (sink, out, err) = captured(OutputMode::Json, 7);
+        let node = TaskNode::new("build");
+
+        sink.present_run_start(Path::new("/workspace"), 1)
+            .expect("run start renders");
+        sink.present_start(&node).expect("start renders");
+        sink.present_success(&node, &result(b"hello\n", false))
+            .expect("success renders");
+
+        assert!(text(&err).is_empty(), "JSON writes nothing to stderr");
+        let lines = text(&out);
+        let events = lines
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("valid JSON"))
+            .collect::<Vec<_>>();
+
+        // run_started, task_started, task_output, task_finished
+        assert_eq!(events.len(), 4);
+        assert_eq!(events[0]["event"], "run_started");
+        assert_eq!(events[1]["event"], "task_started");
+        assert_eq!(events[2]["event"], "task_output");
+        assert_eq!(events[3]["event"], "task_finished");
+        assert!(events.iter().all(|event| event["run_id"] == 7));
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event["sequence"].as_u64().expect("sequence"))
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2, 3]
+        );
+    }
+
+    #[test]
+    fn json_run_finished_carries_the_summary_counts() {
+        let (sink, out, _err) = captured(OutputMode::Json, 7);
         let summary = ExecutionSummary {
             completed: 2,
             cached: 1,
@@ -538,206 +635,56 @@ mod tests {
             cancelled: 0,
             blocked: 0,
         };
+
         sink.present_run_finished(&summary)
-            .expect("run finished event writes");
+            .expect("summary renders");
 
-        let captured = lines.lock().unwrap();
-        assert_eq!(captured.len(), 1);
-        let event: serde_json::Value =
-            serde_json::from_str(&captured[0]).expect("valid JSON event");
-        assert_eq!(event["event"], "run_finished");
-        assert_eq!(event["completed"], 2);
-        assert_eq!(event["cached"], 1);
+        let events = text(&out)
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("valid JSON"))
+            .collect::<Vec<_>>();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["event"], "run_finished");
+        assert_eq!(events[0]["completed"], 2);
+        assert_eq!(events[0]["cached"], 1);
     }
 
     #[test]
-    fn present_summary_produces_json_event_in_json_mode() {
-        let lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let sink = OutputSink {
-            mode: OutputMode::Json,
-            lock: Mutex::new(()),
-            run_id: 1,
-            sequence: AtomicU64::new(0),
-            json_lines: Some(lines.clone()),
-        };
-
-        let summary = ExecutionSummary {
-            completed: 1,
-            cached: 0,
-            failed: 0,
-            cancelled: 0,
-            blocked: 0,
-        };
-        sink.present_summary(&summary)
-            .expect("summary event writes");
-
-        let captured = lines.lock().unwrap();
-        assert_eq!(captured.len(), 1);
-        let event: serde_json::Value =
-            serde_json::from_str(&captured[0]).expect("valid JSON event");
-        assert_eq!(event["event"], "run_finished");
-    }
-
-    #[test]
-    fn json_task_attempt_event() {
-        let lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let sink = OutputSink {
-            mode: OutputMode::Json,
-            lock: Mutex::new(()),
-            run_id: 1,
-            sequence: AtomicU64::new(0),
-            json_lines: Some(lines.clone()),
-        };
+    fn json_preserves_non_utf8_task_output_as_bytes() {
+        let (sink, out, _err) = captured(OutputMode::Json, 7);
         let node = TaskNode::new("build");
 
-        sink.present_attempt(&node, 2, 3)
-            .expect("attempt event writes");
+        sink.present_success(&node, &result(&[0u8, 255u8, 10u8], false))
+            .expect("success renders");
 
-        let captured = lines.lock().unwrap();
-        let event: serde_json::Value = serde_json::from_str(&captured[0]).unwrap();
-        assert_eq!(event["event"], "task_attempt_started");
-        assert_eq!(event["attempt"], 2);
-        assert_eq!(event["max_attempts"], 3);
-    }
-
-    #[test]
-    fn json_task_output_event() {
-        let lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let sink = OutputSink {
-            mode: OutputMode::Json,
-            lock: Mutex::new(()),
-            run_id: 1,
-            sequence: AtomicU64::new(0),
-            json_lines: Some(lines.clone()),
-        };
-
-        let node = TaskNode::new("build");
-
-        let result = TaskResult {
-            output: crate::runner::CapturedOutput {
-                stdout: b"hello\n".to_vec(),
-                stderr: Vec::new(),
-            },
-            elapsed: std::time::Duration::from_millis(42),
-            cached: false,
-        };
-
-        sink.present_success(&node, &result)
-            .expect("success event writes");
-
-        let captured = lines.lock().unwrap();
-        // TaskOutput (stdout) + TaskFinished
-        assert_eq!(captured.len(), 2);
-
+        let first = text(&out);
         let event: serde_json::Value =
-            serde_json::from_str(&captured[0]).expect("valid JSON event");
-        assert_eq!(event["event"], "task_output");
-        assert_eq!(event["stream"], "stdout");
-        assert_eq!(event["task"], "build");
-
-        let event: serde_json::Value =
-            serde_json::from_str(&captured[1]).expect("valid JSON event");
-        assert_eq!(event["event"], "task_finished");
-        assert_eq!(event["status"], "completed");
-        assert_eq!(event["elapsed_ms"], 42);
-    }
-
-    #[test]
-    fn json_task_output_preserves_non_utf8_bytes() {
-        let lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let sink = OutputSink {
-            mode: OutputMode::Json,
-            lock: Mutex::new(()),
-            run_id: 1,
-            sequence: AtomicU64::new(0),
-            json_lines: Some(lines.clone()),
-        };
-
-        let node = TaskNode::new("build");
-
-        // Bytes that are not valid UTF-8: null byte (0), raw byte 255, newline (10)
-        let result = TaskResult {
-            output: crate::runner::CapturedOutput {
-                stdout: vec![0u8, 255u8, 10u8],
-                stderr: Vec::new(),
-            },
-            elapsed: std::time::Duration::from_millis(42),
-            cached: false,
-        };
-
-        sink.present_success(&node, &result)
-            .expect("success event writes");
-
-        let captured = lines.lock().unwrap();
-        assert_eq!(captured.len(), 2, "TaskOutput + TaskFinished");
-
-        // Parse the TaskOutput event and verify the bytes field
-        let event: serde_json::Value =
-            serde_json::from_str(&captured[0]).expect("valid JSON event");
-        assert_eq!(event["event"], "task_output");
-
-        let actual_bytes: Vec<u8> = event["bytes"]
-            .as_array()
-            .expect("bytes should be a JSON array")
-            .iter()
-            .map(|v| v.as_u64().expect("each byte is a number") as u8)
-            .collect();
-        assert_eq!(
-            actual_bytes,
-            vec![0u8, 255u8, 10u8],
-            "non-UTF-8 bytes must round-trip through the JSON event"
-        );
-    }
-
-    #[test]
-    fn write_json_event_with_non_utf8_bytes_through_write_sink() {
-        // A Write sink that accumulates partial writes into a byte buffer.
-        struct AccumulatingWriter {
-            buffer: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
-        }
-
-        impl Write for AccumulatingWriter {
-            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-                let mut buffer = self.buffer.lock().expect("AccumulatingWriter lock");
-                buffer.extend_from_slice(buf);
-                Ok(buf.len())
-            }
-
-            fn flush(&mut self) -> io::Result<()> {
-                Ok(())
-            }
-        }
-
-        let buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let mut writer = AccumulatingWriter {
-            buffer: buffer.clone(),
-        };
-
-        let event = ExecutionEvent::TaskOutput {
-            schema: crate::events::EXECUTION_EVENT_SCHEMA,
-            task: "build".to_owned(),
-            stream: TaskStream::Stdout,
-            bytes: vec![0u8, 255u8, 10u8],
-        };
-
-        write_json_event(&event, &mut writer).expect("write_json_event succeeds");
-
-        let bytes = buffer.lock().expect("AccumulatingWriter buffer");
-        let json_line = String::from_utf8(bytes.clone()).expect("JSON output must be valid UTF-8");
-        let parsed: serde_json::Value =
-            serde_json::from_str(json_line.trim_end()).expect("parse JSON");
-        assert_eq!(parsed["event"], "task_output");
-        let actual_bytes: Vec<u8> = parsed["bytes"]
+            serde_json::from_str(first.lines().next().expect("a first event line"))
+                .expect("valid JSON");
+        let bytes = event["bytes"]
             .as_array()
             .expect("bytes array")
             .iter()
-            .map(|v| v.as_u64().expect("byte") as u8)
-            .collect();
-        assert_eq!(actual_bytes, vec![0u8, 255u8, 10u8]);
-        // The buffer must end with a newline.
-        assert!(
-            bytes.ends_with(b"\n"),
-            "JSON event must be newline-terminated"
-        );
+            .map(|value| value.as_u64().expect("byte") as u8)
+            .collect::<Vec<_>>();
+
+        assert_eq!(bytes, vec![0u8, 255u8, 10u8]);
+    }
+
+    #[test]
+    fn every_mode_renders_a_blocked_task() {
+        let node = TaskNode::new("build");
+
+        for mode in [
+            OutputMode::Terminal,
+            OutputMode::Json,
+            OutputMode::GithubActions,
+            OutputMode::Live,
+        ] {
+            let (sink, out, err) = captured(mode, 1);
+            sink.present_blocked(&node).expect("blocked renders");
+            let rendered = format!("{}{}", text(&out), text(&err));
+            assert!(rendered.contains("blocked"), "{mode:?}: {rendered}");
+        }
     }
 }
