@@ -6,9 +6,9 @@ on:
     workflows: [Release]
     types: [completed]
   schedule:
-    # Weekly, so upstream drift (runners, hashing tools, the release page) is
-    # caught without waiting for the next release.
-    - cron: '0 6 * * 1'
+    # Frequent validation catches upstream drift in runners, hashing tools, and
+    # the release page without waiting for the next release.
+    - cron: '0 */6 * * *'
 
 permissions:
   contents: read
@@ -74,19 +74,6 @@ jobs:
             echo 'No BUILD-METADATA.json asset; validating this legacy release without source metadata.'
           fi
 
-      - name: Write expected release inventory
-        if: steps.release.outputs.exists == 'true'
-        env:
-          RELEASE_TAG: ${{ steps.release.outputs.tag }}
-        shell: bash
-        run: |
-          cat > release-expected.txt <<EOF
-          mono-${RELEASE_TAG}-x86_64-unknown-linux-gnu.tar.gz
-          mono-${RELEASE_TAG}-aarch64-apple-darwin.tar.gz
-          mono-${RELEASE_TAG}-x86_64-apple-darwin.tar.gz
-          mono-${RELEASE_TAG}-x86_64-pc-windows-msvc.zip
-          EOF
-
       # Which gates can run depends on the metadata schema the release carries.
       # A release cut before the schema existed still gets the checksum and
       # version gates below. `release.yml` self-verifies what it writes, so a
@@ -117,9 +104,8 @@ jobs:
           fi
           echo "schema=$schema" >> "$GITHUB_OUTPUT"
 
-      # `release verify` inventories the directory it is handed, so the
-      # extracted binary stays outside `dist` to keep that inventory equal to
-      # the published asset set.
+      # The extracted binary stays outside `dist` so the release contract's
+      # inventory remains equal to the published asset set.
       - name: Extract the Linux artifact
         if: steps.release.outputs.exists == 'true'
         run: |
@@ -127,23 +113,6 @@ jobs:
           test -n "$archive"
           mkdir -p extracted
           tar -xzf "$archive" -C extracted
-
-      - name: Verify release metadata
-        if: ${{ steps.release.outputs.exists == 'true' && steps.metadata.outputs.schema != 'none' }}
-        env:
-          RELEASE_TAG: ${{ steps.release.outputs.tag }}
-        run: |
-          expected_commit="$(git rev-parse HEAD)"
-          actual_commit="$(jq -r .source_commit dist/BUILD-METADATA.json)"
-          test "$actual_commit" = "$expected_commit" || {
-            echo "metadata source commit $actual_commit does not match released source $expected_commit" >&2
-            exit 1
-          }
-          test "$(jq -r .repository dist/BUILD-METADATA.json)" = "$GITHUB_REPOSITORY"
-          test "$(jq -r .release_tag dist/BUILD-METADATA.json)" = "$RELEASE_TAG"
-          if [[ "$(git cat-file -t "$RELEASE_TAG")" == tag ]]; then
-            test "$(jq -r .tag_object dist/BUILD-METADATA.json)" = "$(git rev-parse "$RELEASE_TAG^{tag}")"
-          fi
 
       # `xtask` runs the release pipeline; the released binary orchestrates it.
       - name: Install Rust toolchain
@@ -164,17 +133,11 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
-      - name: Verify published artifact manifest
-        if: ${{ steps.release.outputs.exists == 'true' && steps.metadata.outputs.schema == 'current' }}
+      - name: Verify published artifact contract
+        if: ${{ steps.release.outputs.exists == 'true' && steps.metadata.outputs.schema == 'current' && hashFiles('xtask/Cargo.toml') != '' }}
         env:
           RELEASE_TAG: ${{ steps.release.outputs.tag }}
-        run: |
-          cargo run --locked --quiet -- release verify \
-            --directory dist \
-            --expected release-expected.txt \
-            --tag "$RELEASE_TAG" \
-            --commit "$(git rev-parse HEAD)" \
-            --repository "$GITHUB_REPOSITORY"
+        run: cargo run --locked --quiet -p xtask -- release-contract --directory dist --verify-only
 
       - name: Rebuild released Linux binary
         if: ${{ steps.release.outputs.exists == 'true' && hashFiles('xtask/Cargo.toml') != '' }}
@@ -205,7 +168,7 @@ jobs:
         env:
           RELEASE_TAG: ${{ steps.release.outputs.tag }}
           MONO_BIN: extracted/mono
-        run: '"$MONO_BIN" run release --output github-actions'
+        run: '"$MONO_BIN" run release --output text --ui stream'
 
       # Releases that predate the metadata schema, and releases cut before the
       # pipeline itself existed: the manifest says little, but the checksums and
@@ -215,3 +178,106 @@ jobs:
         run: |
           ( cd dist && sha256sum -c SHA256SUMS )
           ./extracted/mono --version
+
+  validate_platform:
+    name: Validate ${{ matrix.target }} artifact
+    if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive: tar.gz
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            archive: tar.gz
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            archive: tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: zip
+    steps:
+      - name: Find latest release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          if gh release view --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            tag="$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName)"
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo 'No release exists yet; platform validation is complete.'
+          fi
+
+      - name: Download platform artifact
+        if: steps.release.outputs.exists == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+        shell: bash
+        run: |
+          mkdir -p dist
+          gh release download "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern "mono-${RELEASE_TAG}-${{ matrix.target }}.${{ matrix.archive }}" \
+            --dir dist \
+            --clobber
+
+      - name: Extract Unix artifact
+        if: ${{ steps.release.outputs.exists == 'true' && matrix.archive == 'tar.gz' }}
+        env:
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+        shell: bash
+        run: |
+          mkdir -p extracted
+          tar -xzf "dist/mono-${RELEASE_TAG}-${{ matrix.target }}.tar.gz" -C extracted
+
+      - name: Extract Windows artifact
+        if: ${{ steps.release.outputs.exists == 'true' && matrix.archive == 'zip' }}
+        env:
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force extracted | Out-Null
+          Expand-Archive `
+            -LiteralPath "dist/mono-$env:RELEASE_TAG-${{ matrix.target }}.zip" `
+            -DestinationPath extracted `
+            -Force
+
+      - name: Verify Unix platform artifact
+        if: ${{ steps.release.outputs.exists == 'true' && matrix.archive == 'tar.gz' }}
+        env:
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+        shell: bash
+        run: |
+          test -f extracted/LICENSE
+          test -f extracted/README.md
+          reported="$(./extracted/mono --version)"
+          echo "$reported"
+          test "$reported" = "mono ${RELEASE_TAG}" || {
+            echo "artifact reports '$reported', expected 'mono ${RELEASE_TAG}'" >&2
+            exit 1
+          }
+
+      - name: Verify Windows artifact
+        if: ${{ steps.release.outputs.exists == 'true' && matrix.archive == 'zip' }}
+        env:
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+        shell: pwsh
+        run: |
+          if (-not (Test-Path extracted/LICENSE)) { throw 'missing extracted/LICENSE' }
+          if (-not (Test-Path extracted/README.md)) { throw 'missing extracted/README.md' }
+          $reported = (& extracted/mono.exe --version).Trim()
+          Write-Host $reported
+          if ($reported -ne "mono $env:RELEASE_TAG") {
+            throw "artifact reports '$reported', expected 'mono $env:RELEASE_TAG'"
+          }

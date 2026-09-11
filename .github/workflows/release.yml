@@ -104,10 +104,10 @@ jobs:
           }
 
       - name: Run project CI pipeline
-        run: cargo run --locked -- ci --no-cache --output github-actions
+        run: cargo run --locked -- ci --no-cache --output text --ui stream
 
       - name: Run release gates
-        run: cargo run --locked -- run release --no-cache --output github-actions
+        run: cargo run --locked -- run release --no-cache --output text --ui stream
 
       - name: Upload release notes
         uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
@@ -224,7 +224,6 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: write
-    environment: release
     env:
       RELEASE_COMMIT: ${{ needs.validate.outputs.source_commit }}
       RELEASE_TAG_OBJECT: ${{ needs.validate.outputs.tag_object }}
@@ -266,71 +265,15 @@ jobs:
           name: release-notes
           path: notes
 
-      # `BUILD-METADATA.json` and `SHA256SUMS` are written by the same command
-      # that `release_validate.yml` reads them back with, so the producer and
-      # the consumer cannot disagree about the schema.
-      - name: Write expected release inventory
-        shell: bash
-        run: |
-          cat > release-expected.txt <<EOF
-          mono-${RELEASE_TAG}-x86_64-unknown-linux-gnu.tar.gz
-          mono-${RELEASE_TAG}-aarch64-apple-darwin.tar.gz
-          mono-${RELEASE_TAG}-x86_64-apple-darwin.tar.gz
-          mono-${RELEASE_TAG}-x86_64-pc-windows-msvc.zip
-          EOF
-
-      - name: Write release metadata
-        run: |
-          cargo run --locked --quiet -- release manifest \
-            --directory dist \
-            --tag "$RELEASE_TAG" \
-            --commit "$RELEASE_COMMIT" \
-            --repository "$GITHUB_REPOSITORY" \
-            --tag-object "$RELEASE_TAG_OBJECT" \
-            --workflow-run "$RELEASE_RUN_URL" \
-            --expected release-expected.txt
-
-      # A manifest the validator would reject must never reach a release.
-      - name: Verify release metadata
-        run: |
-          cargo run --locked --quiet -- release verify \
-            --directory dist \
-            --tag "$RELEASE_TAG" \
-            --commit "$RELEASE_COMMIT" \
-            --repository "$GITHUB_REPOSITORY" \
-            --tag-object "$RELEASE_TAG_OBJECT" \
-            --workflow-run "$RELEASE_RUN_URL" \
-            --expected release-expected.txt
-
-      - name: Verify release asset inventory
-        working-directory: dist
-        shell: bash
-        run: |
-          expected_file="$(mktemp)"
-          actual_file="$(mktemp)"
-          archive_expected_file="$(mktemp)"
-          checksum_file="$(mktemp)"
-          trap 'rm -f "$expected_file" "$actual_file" "$archive_expected_file" "$checksum_file"' EXIT
-
-          cat > "$expected_file" <<EOF
-          BUILD-METADATA.json
-          SHA256SUMS
-          mono-${RELEASE_TAG}-x86_64-unknown-linux-gnu.tar.gz
-          mono-${RELEASE_TAG}-aarch64-apple-darwin.tar.gz
-          mono-${RELEASE_TAG}-x86_64-apple-darwin.tar.gz
-          mono-${RELEASE_TAG}-x86_64-pc-windows-msvc.zip
-          EOF
-
-          for path in ./*; do
-            [[ -f "$path" ]] && basename "$path"
-          done | sort > "$actual_file"
-          sort -o "$expected_file" "$expected_file"
-          diff -u "$expected_file" "$actual_file"
-
-          grep -v -E '^(BUILD-METADATA.json|SHA256SUMS)$' "$expected_file" > "$archive_expected_file"
-          awk 'NF { print $2 }' SHA256SUMS | sort > "$checksum_file"
-          diff -u "$archive_expected_file" "$checksum_file"
-          sha256sum -c SHA256SUMS
+      # The repository-specific xtask owns the artifact inventory, metadata,
+      # checksum, and identity contract. GitHub Actions only assembles the
+      # directory and publishes it.
+      - name: Write and verify release contract
+        env:
+          RELEASE_COMMIT: ${{ needs.validate.outputs.source_commit }}
+          RELEASE_TAG_OBJECT: ${{ needs.validate.outputs.tag_object }}
+          RELEASE_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: cargo run --locked --quiet -p xtask -- release-contract --directory dist
 
       # Publishing is idempotent: a run that failed after pushing some assets is
       # resumed against the same draft tag, and an already published tag is

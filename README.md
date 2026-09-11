@@ -195,7 +195,13 @@ Mono is intentionally opinionated about release process. Every Mono project gets
 - Release directories contain an explicit, verified artifact inventory and SHA-256 metadata.
 - Publishing remains an ordinary project task or CI step; Mono does not know registries or package managers.
 
-These are release conventions, not language or framework conventions. See [`docs/release-conventions.md`](docs/release-conventions.md).
+These are release conventions, not language or framework conventions.
+
+To create and push an annotated release tag—the tag push starts the GitHub release workflow:
+
+```console
+cargo run -p xtask -- tag --tag v0.1.3
+```
 
 Mono does not publish to npm, Cargo, Maven, PyPI, Docker, or any other registry. Those operations remain ordinary tasks or CI workflow steps, preserving the language-agnostic execution kernel.
 
