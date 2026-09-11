@@ -208,7 +208,7 @@ fn load_orders_dependencies_before_dependents() {
     let plan = project.plan(None, &[]).expect("plan succeeds");
 
     assert_eq!(
-        plan.iter().map(PlannedTask::task).collect::<Vec<_>>(),
+        plan.iter().map(PlannedTask::id).collect::<Vec<_>>(),
         vec!["base", "app"]
     );
 }
@@ -266,7 +266,7 @@ fn a_matrix_task_expands_to_one_instance_per_combination() {
     let plan = project.plan(None, &[]).expect("plan succeeds");
 
     assert_eq!(
-        plan.iter().map(PlannedTask::task).collect::<Vec<_>>(),
+        plan.iter().map(PlannedTask::id).collect::<Vec<_>>(),
         vec!["build[os=linux]", "build[os=mac]"]
     );
     assert_eq!(plan[0].command(), ["echo".to_owned(), "linux".to_owned()]);
@@ -281,7 +281,7 @@ fn an_explicit_matrix_instance_selects_one_combination() {
     let plan = project.plan(None, &[]).expect("plan succeeds");
 
     assert_eq!(plan.len(), 1);
-    assert_eq!(plan[0].task(), "build[os=linux]");
+    assert_eq!(plan[0].id(), "build[os=linux]");
 }
 
 #[test]
@@ -302,7 +302,7 @@ fn a_matrix_dependent_inherits_the_current_dimensions() {
     let plan = project.plan(None, &[]).expect("plan succeeds");
     let package = plan
         .iter()
-        .find(|task| task.task() == "package[os=linux]")
+        .find(|task| task.id() == "package[os=linux]")
         .expect("package instance exists");
 
     assert_eq!(

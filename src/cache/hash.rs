@@ -186,3 +186,31 @@ pub(super) fn ensure_no_symlink_components(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hex_digest_uses_lowercase_two_digit_encoding() {
+        assert_eq!(hex_digest(&[0x00, 0x01, 0xab, 0xff]), "0001abff");
+    }
+
+    #[test]
+    fn cached_paths_accept_nested_relative_names_only() {
+        assert!(validate_cached_path("dist/app.bin").is_ok());
+        for unsafe_path in ["", "/tmp/app", "../app", "dist/../../app"] {
+            assert!(validate_cached_path(unsafe_path).is_err(), "{unsafe_path}");
+        }
+    }
+
+    #[test]
+    fn hash_string_framing_distinguishes_different_value_boundaries() {
+        let mut first = Sha256::new();
+        hash_strings(&mut first, &["ab".to_owned(), "c".to_owned()]);
+        let mut second = Sha256::new();
+        hash_strings(&mut second, &["a".to_owned(), "bc".to_owned()]);
+
+        assert_ne!(first.finalize(), second.finalize());
+    }
+}

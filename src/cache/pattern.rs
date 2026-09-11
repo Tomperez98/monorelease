@@ -249,3 +249,42 @@ fn relative_path(path: &Path) -> String {
         .collect::<Vec<_>>()
         .join("/")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ordered_patterns_apply_the_last_matching_selection() {
+        let binding = [
+            "src/**".to_owned(),
+            "!src/generated/**".to_owned(),
+            "src/generated/keep.txt".to_owned(),
+        ];
+        let patterns = CachePatterns::compile(&binding);
+
+        assert!(patterns.matches("src/main.rs"));
+        assert!(!patterns.matches("src/generated/drop.txt"));
+        assert!(patterns.matches("src/generated/keep.txt"));
+    }
+
+    #[test]
+    fn double_star_matches_zero_or_more_path_segments() {
+        let binding = ["src/**/Cargo.toml".to_owned()];
+        let patterns = CachePatterns::compile(&binding);
+
+        assert!(patterns.matches("src/Cargo.toml"));
+        assert!(patterns.matches("src/a/b/Cargo.toml"));
+        assert!(!patterns.matches("tests/Cargo.toml"));
+    }
+
+    #[test]
+    fn directory_pruning_rejects_unreachable_subtrees() {
+        let binding = ["src/**/*.rs".to_owned()];
+        let patterns = CachePatterns::compile(&binding);
+
+        assert!(patterns.could_match_below("src"));
+        assert!(patterns.could_match_below("src/lib"));
+        assert!(!patterns.could_match_below("target"));
+    }
+}

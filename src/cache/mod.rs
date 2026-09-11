@@ -51,6 +51,55 @@ pub(crate) struct CacheSession {
     environment: BTreeMap<String, String>,
 }
 
+/// The cache interface consumed by the scheduler.
+///
+/// Production: [`CacheStore`].  Test: [`ScriptedCache`].
+pub(crate) trait CacheBackend: Send + Sync {
+    fn prepare(
+        &self,
+        project_root: &Path,
+        environment: BTreeMap<String, String>,
+    ) -> Result<CacheSession, CacheError>;
+
+    fn task_key(
+        &self,
+        session: &CacheSession,
+        task: &PlannedTask,
+        dependency_keys: &[String],
+    ) -> Result<String, CacheError>;
+
+    fn lookup(&self, task: &PlannedTask, key: &str) -> Result<Option<TaskResult>, CacheError>;
+
+    fn store(&self, task: &PlannedTask, key: &str, result: &TaskResult) -> Result<(), CacheError>;
+}
+
+impl CacheBackend for CacheStore {
+    fn prepare(
+        &self,
+        project_root: &Path,
+        environment: BTreeMap<String, String>,
+    ) -> Result<CacheSession, CacheError> {
+        self.prepare(project_root, environment)
+    }
+
+    fn task_key(
+        &self,
+        session: &CacheSession,
+        task: &PlannedTask,
+        dependency_keys: &[String],
+    ) -> Result<String, CacheError> {
+        self.task_key_with_session(session, task, dependency_keys)
+    }
+
+    fn lookup(&self, task: &PlannedTask, key: &str) -> Result<Option<TaskResult>, CacheError> {
+        self.lookup(task, key)
+    }
+
+    fn store(&self, task: &PlannedTask, key: &str, result: &TaskResult) -> Result<(), CacheError> {
+        self.store(task, key, result)
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct CacheMetadata {
     version: u32,
@@ -109,7 +158,7 @@ impl CacheStore {
         hash_string(&mut hasher, &CACHE_FORMAT_VERSION.to_string());
         hash_string(&mut hasher, std::env::consts::OS);
         hash_string(&mut hasher, std::env::consts::ARCH);
-        hash_string(&mut hasher, task.task());
+        hash_string(&mut hasher, task.id());
         hash_string(
             &mut hasher,
             &task
@@ -118,7 +167,7 @@ impl CacheStore {
                 .map_err(|_| CacheError::Invalid {
                     message: format!(
                         "task '{}' working directory is outside the project root",
-                        task.task()
+                        task.id()
                     ),
                 })?
                 .to_string_lossy(),
@@ -400,6 +449,20 @@ impl StdError for CacheError {
             Self::Io { source, .. } => Some(source),
             Self::Json { source, .. } => Some(source),
             Self::Invalid { .. } => None,
+        }
+    }
+}
+
+#[cfg(test)]
+impl CacheSession {
+    /// A session that requires no filesystem access.
+    ///
+    /// Useful for fake-cache implementations that must return a valid session
+    /// without reading a real manifest or environment.
+    pub(crate) fn for_test() -> Self {
+        Self {
+            project_manifest: Vec::new(),
+            environment: BTreeMap::new(),
         }
     }
 }

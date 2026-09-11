@@ -6,6 +6,8 @@
 use std::io;
 use std::process::{Child, Command, ExitStatus};
 
+use crate::runner::{ChildProcess, ProcessExit};
+
 // ---------------------------------------------------------------------------
 // Public interface
 // ---------------------------------------------------------------------------
@@ -87,6 +89,37 @@ impl ManagedChild {
             .stderr
             .take()
             .map(|pipe| Box::new(pipe) as Box<dyn std::io::Read + Send>)
+    }
+}
+
+impl ChildProcess for ManagedChild {
+    fn stdout(&mut self) -> Option<Box<dyn std::io::Read + Send>> {
+        ManagedChild::take_stdout(self)
+    }
+
+    fn stderr(&mut self) -> Option<Box<dyn std::io::Read + Send>> {
+        ManagedChild::take_stderr(self)
+    }
+
+    fn try_wait(&mut self) -> io::Result<Option<ProcessExit>> {
+        ManagedChild::try_wait(self).map(|result| match result {
+            WaitResult::Running => None,
+            WaitResult::Exited(status) => Some(ProcessExit {
+                code: status.code(),
+                success: status.success(),
+            }),
+        })
+    }
+
+    fn wait(&mut self) -> io::Result<ProcessExit> {
+        ManagedChild::wait(self).map(|status| ProcessExit {
+            code: status.code(),
+            success: status.success(),
+        })
+    }
+
+    fn terminate_tree(&mut self) -> io::Result<()> {
+        ManagedChild::terminate_tree(self)
     }
 }
 

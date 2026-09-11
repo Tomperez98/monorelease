@@ -254,7 +254,7 @@ fn format_plan(project: &Project, plan: &[PlannedTask]) -> String {
         output.push('\n');
         output.push_str(&format!(
             "would run {} in {}: {}",
-            task.task(),
+            task.id(),
             task.cwd().display(),
             format_command(task.command())
         ));

@@ -74,10 +74,6 @@ impl PlannedTask {
         &self.id
     }
 
-    pub fn task(&self) -> &str {
-        &self.id
-    }
-
     pub fn project(&self) -> &str {
         &self.project
     }

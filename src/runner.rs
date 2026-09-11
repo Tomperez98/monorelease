@@ -1,5 +1,6 @@
 //! Structured subprocess execution for root-project tasks.
 
+use std::collections::BTreeMap;
 use std::error::Error as StdError;
 use std::fmt;
 use std::io::{self, Read};
@@ -11,8 +12,54 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::config::StdinMode;
-use crate::process::{ManagedChild, WaitResult};
+use crate::process::ManagedChild;
 use crate::project::PlannedTask;
+
+// ---------------------------------------------------------------------------
+// Runner process vocabulary
+// ---------------------------------------------------------------------------
+
+/// The observable result of a completed subprocess.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ProcessExit {
+    pub(crate) code: Option<i32>,
+    pub(crate) success: bool,
+}
+
+/// A live subprocess whose output and lifecycle the runner can observe.
+pub(crate) trait ChildProcess: Send {
+    fn stdout(&mut self) -> Option<Box<dyn Read + Send>>;
+    fn stderr(&mut self) -> Option<Box<dyn Read + Send>>;
+    fn try_wait(&mut self) -> io::Result<Option<ProcessExit>>;
+    fn wait(&mut self) -> io::Result<ProcessExit>;
+    fn terminate_tree(&mut self) -> io::Result<()>;
+}
+
+/// A factory for spawning child processes through the runner.
+pub(crate) trait ProcessLauncher: Send + Sync {
+    fn spawn(&self, spec: &ProcessSpec<'_>) -> io::Result<Box<dyn ChildProcess>>;
+}
+
+/// The validated process specification the runner passes to the launcher.
+///
+/// Carries the already-validated program, arguments, working directory,
+/// environment variables, and stdin mode.  The launcher is responsible for
+/// requesting piped stdout/stderr.
+pub(crate) struct ProcessSpec<'a> {
+    pub(crate) program: &'a str,
+    pub(crate) args: &'a [String],
+    pub(crate) cwd: &'a Path,
+    pub(crate) env: &'a BTreeMap<String, String>,
+    pub(crate) stdin: StdinMode,
+}
+
+/// A clock abstraction so the runner can be driven deterministically in tests.
+pub(crate) trait RunnerClock: Send + Sync {
+    fn now(&self) -> Instant;
+    fn sleep(&self, duration: Duration);
+}
+
+// ---------------------------------------------------------------------------
 
 /// First wait between child-status polls. Short tasks finish after one or two
 /// of these instead of stalling for a fixed interval.
@@ -131,13 +178,69 @@ pub(crate) trait TaskExecutor: Send + Sync {
     ) -> Result<TaskResult, RunnerError>;
 }
 
+/// Production subprocess launcher using [`ManagedChild`].
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ProductionLauncher;
+
+impl ProcessLauncher for ProductionLauncher {
+    fn spawn(&self, spec: &ProcessSpec<'_>) -> io::Result<Box<dyn ChildProcess>> {
+        let mut command = Command::new(spec.program);
+        command
+            .args(spec.args)
+            .current_dir(spec.cwd)
+            .envs(spec.env)
+            .stdin(match spec.stdin {
+                StdinMode::Null => Stdio::null(),
+                StdinMode::Inherit => Stdio::inherit(),
+            })
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let child = ManagedChild::spawn(&mut command)?;
+        Ok(Box::new(child))
+    }
+}
+
+/// Production wall-clock implementation.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct WallClock;
+
+impl RunnerClock for WallClock {
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+
+    fn sleep(&self, duration: Duration) {
+        thread::sleep(duration);
+    }
+}
+
 /// Executes root-project tasks without changing the process-global working directory.
-#[derive(Debug, Clone, Default)]
-pub struct Runner;
+pub struct Runner {
+    launcher: Arc<dyn ProcessLauncher>,
+    clock: Arc<dyn RunnerClock>,
+}
+
+impl std::fmt::Debug for Runner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Runner").finish_non_exhaustive()
+    }
+}
 
 impl Runner {
     pub fn new() -> Self {
-        Self
+        Self {
+            launcher: Arc::new(ProductionLauncher),
+            clock: Arc::new(WallClock),
+        }
+    }
+
+    /// Private constructor for unit tests that inject fake services.
+    #[cfg(test)]
+    pub(crate) fn with_services(
+        launcher: Arc<dyn ProcessLauncher>,
+        clock: Arc<dyn RunnerClock>,
+    ) -> Self {
+        Self { launcher, clock }
     }
 
     /// Execute one planned task and return its output and timing.
@@ -163,7 +266,7 @@ impl Runner {
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
             return Err(RunnerError::Cancelled(Box::new(CancelledTask {
                 project: planned.project().to_owned(),
-                task: planned.task().to_owned(),
+                task: planned.id().to_owned(),
                 output: CapturedOutput::default(),
                 elapsed: Duration::ZERO,
             })));
@@ -175,7 +278,7 @@ impl Runner {
                 .split_first()
                 .ok_or_else(|| RunnerError::EmptyCommand {
                     project: planned.project().to_owned(),
-                    task: planned.task().to_owned(),
+                    task: planned.id().to_owned(),
                 })?;
         assert!(planned.timeout() > Duration::ZERO);
         assert!(planned.max_output_bytes() > 0);
@@ -183,34 +286,31 @@ impl Runner {
         assert!(planned.cwd().is_absolute());
         assert!(planned.cwd().starts_with(planned.root()));
 
-        let started = Instant::now();
-        let mut command = Command::new(program);
-        command
-            .args(args)
-            .current_dir(planned.cwd())
-            .envs(planned.env())
-            .stdin(match planned.stdin() {
-                StdinMode::Null => Stdio::null(),
-                StdinMode::Inherit => Stdio::inherit(),
-            })
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-
-        let mut managed =
-            ManagedChild::spawn(&mut command).map_err(|source| RunnerError::Spawn {
+        let spec = ProcessSpec {
+            program,
+            args,
+            cwd: planned.cwd(),
+            env: planned.env(),
+            stdin: planned.stdin(),
+        };
+        let started = self.clock.now();
+        let mut child = self
+            .launcher
+            .spawn(&spec)
+            .map_err(|source| RunnerError::Spawn {
                 project: planned.project().to_owned(),
-                task: planned.task().to_owned(),
+                task: planned.id().to_owned(),
                 command: planned.command().to_vec(),
                 cwd: planned.cwd().to_path_buf(),
                 source,
             })?;
 
-        let stdout = managed
-            .take_stdout()
-            .expect("stdout was configured as piped");
-        let stderr = managed
-            .take_stderr()
-            .expect("stderr was configured as piped");
+        let stdout = child
+            .stdout()
+            .expect("launcher must configure stdout as piped");
+        let stderr = child
+            .stderr()
+            .expect("launcher must configure stderr as piped");
         let (limit_sender, limit_receiver) = mpsc::channel();
         let output_limit = planned.max_output_bytes();
         let reader_done = Arc::new(AtomicU8::new(0));
@@ -241,79 +341,74 @@ impl Runner {
         // `None` means the run is already cancelled, so no wait is attempted:
         // cancellation is decided before the child is touched, exactly as
         // before this refactor.
-        let status = loop {
+        let exit = loop {
             if exceeded_stream.is_none()
                 && let Ok(stream) = limit_receiver.try_recv()
             {
                 exceeded_stream = Some(stream);
             }
             let cancelled = cancellation.is_some_and(CancellationToken::is_cancelled);
-            let wait = (!cancelled).then(|| managed.try_wait());
+            let wait = (!cancelled).then(|| child.try_wait());
             let outcome = match &wait {
-                Some(Ok(WaitResult::Exited(_))) => WaitOutcome::Exited,
+                Some(Ok(Some(_))) => WaitOutcome::Exited,
                 Some(Err(_)) => WaitOutcome::Failed,
                 _ => WaitOutcome::Running,
             };
+            let elapsed = self.clock.now().duration_since(started);
             match poll_decision(
                 cancelled,
                 exceeded_stream,
                 outcome,
                 reader_done.load(Ordering::Acquire),
-                started.elapsed(),
+                elapsed,
                 planned.timeout(),
                 poll_interval,
             ) {
                 PollDecision::Cancel => {
-                    terminate_tree(
-                        &mut managed,
+                    terminate_tree(&mut *child, planned.project(), planned.id(), "cancellation")?;
+                    let wait_result = child.wait();
+                    // Join both readers before checking either result. A wait
+                    // error must not detach a reader blocked on a descendant pipe.
+                    let joined = join_output(
                         planned.project(),
-                        planned.task(),
-                        "cancellation",
-                    )?;
-                    managed.wait().map_err(|source| RunnerError::Wait {
-                        project: planned.project().to_owned(),
-                        task: planned.task().to_owned(),
-                        source,
-                    })?;
-                    let output = join_output(
-                        planned.project(),
-                        planned.task(),
+                        planned.id(),
                         stdout_reader,
                         stderr_reader,
-                    )?
-                    .output;
+                    );
+                    wait_result.map_err(|source| RunnerError::Wait {
+                        project: planned.project().to_owned(),
+                        task: planned.id().to_owned(),
+                        source,
+                    })?;
+                    let output = joined?.output;
                     return Err(RunnerError::Cancelled(Box::new(CancelledTask {
                         project: planned.project().to_owned(),
-                        task: planned.task().to_owned(),
+                        task: planned.id().to_owned(),
                         output,
-                        elapsed: started.elapsed(),
+                        elapsed: self.clock.now().duration_since(started),
                     })));
                 }
                 PollDecision::OutputLimit(stream_name) => {
-                    terminate_tree(
-                        &mut managed,
-                        planned.project(),
-                        planned.task(),
-                        "output limit",
-                    )?;
-                    managed.wait().map_err(|source| RunnerError::Wait {
-                        project: planned.project().to_owned(),
-                        task: planned.task().to_owned(),
-                        source,
-                    })?;
+                    terminate_tree(&mut *child, planned.project(), planned.id(), "output limit")?;
+                    let wait_result = child.wait();
                     let joined = join_output(
                         planned.project(),
-                        planned.task(),
+                        planned.id(),
                         stdout_reader,
                         stderr_reader,
-                    )?;
+                    );
+                    wait_result.map_err(|source| RunnerError::Wait {
+                        project: planned.project().to_owned(),
+                        task: planned.id().to_owned(),
+                        source,
+                    })?;
                     return Err(RunnerError::OutputLimit(Box::new(OutputLimitTask {
                         project: planned.project().to_owned(),
-                        task: planned.task().to_owned(),
+                        task: planned.id().to_owned(),
                         stream: stream_name,
                         limit: output_limit,
-                        output: joined.output,
-                        elapsed: started.elapsed(),
+                        output: joined?.output,
+                        elapsed: self.clock.now().duration_since(started),
                     })));
                 }
                 PollDecision::Exited {
@@ -321,48 +416,45 @@ impl Runner {
                 } => {
                     if descendants_may_hold_pipes {
                         terminate_tree(
-                            &mut managed,
+                            &mut *child,
                             planned.project(),
-                            planned.task(),
+                            planned.id(),
                             "descendant cleanup",
                         )?;
                     }
                     match wait {
-                        Some(Ok(WaitResult::Exited(status))) => break status,
+                        Some(Ok(Some(exit))) => break exit,
                         _ => unreachable!("PollDecision::Exited implies an exited child"),
                     }
                 }
                 PollDecision::Timeout => {
-                    terminate_tree(&mut managed, planned.project(), planned.task(), "timeout")?;
-                    managed.wait().map_err(|source| RunnerError::Wait {
-                        project: planned.project().to_owned(),
-                        task: planned.task().to_owned(),
-                        source,
-                    })?;
-                    let output = join_output(
+                    terminate_tree(&mut *child, planned.project(), planned.id(), "timeout")?;
+                    let wait_result = child.wait();
+                    let joined = join_output(
                         planned.project(),
-                        planned.task(),
+                        planned.id(),
                         stdout_reader,
                         stderr_reader,
-                    )?
-                    .output;
+                    );
+                    wait_result.map_err(|source| RunnerError::Wait {
+                        project: planned.project().to_owned(),
+                        task: planned.id().to_owned(),
+                        source,
+                    })?;
                     return Err(RunnerError::TimedOut(Box::new(TimedOutTask {
                         project: planned.project().to_owned(),
-                        task: planned.task().to_owned(),
+                        task: planned.id().to_owned(),
                         command: planned.command().to_vec(),
                         cwd: planned.cwd().to_path_buf(),
                         timeout: planned.timeout(),
-                        output,
-                        elapsed: started.elapsed(),
+                        output: joined?.output,
+                        elapsed: self.clock.now().duration_since(started),
                     })));
                 }
                 PollDecision::WaitFailed => {
-                    if let Err(error) = terminate_tree(
-                        &mut managed,
-                        planned.project(),
-                        planned.task(),
-                        "wait error",
-                    ) {
+                    if let Err(error) =
+                        terminate_tree(&mut *child, planned.project(), planned.id(), "wait error")
+                    {
                         let _ = stdout_reader.join();
                         let _ = stderr_reader.join();
                         return Err(error);
@@ -375,12 +467,12 @@ impl Runner {
                     };
                     return Err(RunnerError::Wait {
                         project: planned.project().to_owned(),
-                        task: planned.task().to_owned(),
+                        task: planned.id().to_owned(),
                         source,
                     });
                 }
                 PollDecision::Sleep(duration) => {
-                    thread::sleep(duration);
+                    self.clock.sleep(duration);
                     poll_interval = next_poll_interval(poll_interval);
                 }
             }
@@ -388,15 +480,15 @@ impl Runner {
 
         let joined = join_output(
             planned.project(),
-            planned.task(),
+            planned.id(),
             stdout_reader,
             stderr_reader,
         )?;
-        let elapsed = started.elapsed();
+        let elapsed = self.clock.now().duration_since(started);
         if let Some(stream) = joined.exceeded_stream {
             return Err(RunnerError::OutputLimit(Box::new(OutputLimitTask {
                 project: planned.project().to_owned(),
-                task: planned.task().to_owned(),
+                task: planned.id().to_owned(),
                 stream,
                 limit: output_limit,
                 output: joined.output,
@@ -404,13 +496,13 @@ impl Runner {
             })));
         }
         let output = joined.output;
-        if !status.success() {
+        if !exit.success {
             return Err(RunnerError::Failed(Box::new(FailedTask {
                 project: planned.project().to_owned(),
-                task: planned.task().to_owned(),
+                task: planned.id().to_owned(),
                 command: planned.command().to_vec(),
                 cwd: planned.cwd().to_path_buf(),
-                code: status.code(),
+                code: exit.code,
                 output,
                 elapsed,
             })));
@@ -436,6 +528,7 @@ impl TaskExecutor for Runner {
     }
 }
 
+#[derive(Debug)]
 struct StreamCapture {
     bytes: Vec<u8>,
     exceeded: bool,
@@ -447,12 +540,12 @@ struct JoinedOutput {
 }
 
 fn terminate_tree(
-    managed: &mut ManagedChild,
+    child: &mut dyn ChildProcess,
     project: &str,
     task: &str,
     operation: &'static str,
 ) -> Result<(), RunnerError> {
-    managed
+    child
         .terminate_tree()
         .map_err(|source| RunnerError::Terminate {
             project: project.to_owned(),
@@ -505,24 +598,22 @@ fn join_output(
     stdout_reader: thread::JoinHandle<io::Result<StreamCapture>>,
     stderr_reader: thread::JoinHandle<io::Result<StreamCapture>>,
 ) -> Result<JoinedOutput, RunnerError> {
-    let stdout = stdout_reader
-        .join()
-        .expect("stdout reader thread panicked")
-        .map_err(|source| RunnerError::OutputRead {
-            project: project.to_owned(),
-            task: task.to_owned(),
-            stream: "stdout",
-            source,
-        })?;
-    let stderr = stderr_reader
-        .join()
-        .expect("stderr reader thread panicked")
-        .map_err(|source| RunnerError::OutputRead {
-            project: project.to_owned(),
-            task: task.to_owned(),
-            stream: "stderr",
-            source,
-        })?;
+    // Join both reader threads before checking either result so a failure
+    // from the first stream does not detach the second reader thread.
+    let stdout_result = stdout_reader.join().expect("stdout reader thread panicked");
+    let stderr_result = stderr_reader.join().expect("stderr reader thread panicked");
+    let stdout = stdout_result.map_err(|source| RunnerError::OutputRead {
+        project: project.to_owned(),
+        task: task.to_owned(),
+        stream: "stdout",
+        source,
+    })?;
+    let stderr = stderr_result.map_err(|source| RunnerError::OutputRead {
+        project: project.to_owned(),
+        task: task.to_owned(),
+        stream: "stderr",
+        source,
+    })?;
     let exceeded_stream = stdout
         .exceeded
         .then_some("stdout")
@@ -773,6 +864,7 @@ mod tests {
     use crate::project::Project;
     use crate::testing::TempDir;
     use std::fs;
+    use std::sync::Mutex;
 
     fn project_with_task(command: &str, timeout_seconds: Option<u64>) -> (TempDir, Project) {
         let temp = TempDir::new();
@@ -1231,6 +1323,447 @@ mod tests {
         for error in &bare {
             assert!(error.source().is_none(), "{error}");
             assert!(!error.to_string().is_empty(), "{error}");
+        }
+    }
+
+    #[test]
+    fn read_stream_retains_bytes_up_to_the_exact_limit_without_a_notification() {
+        let (limit_sender, limit_receiver) = mpsc::channel();
+
+        let capture = read_stream(
+            Box::new(std::io::Cursor::new(b"12345678".to_vec())),
+            8,
+            "stdout",
+            limit_sender,
+            None,
+        )
+        .expect("read succeeds");
+
+        assert_eq!(capture.bytes, b"12345678");
+        assert!(!capture.exceeded);
+        assert!(
+            limit_receiver.try_recv().is_err(),
+            "an exact-limit stream must not send a limit notification"
+        );
+    }
+
+    #[test]
+    fn read_stream_truncates_and_reports_an_overflowing_stream_once() {
+        let (limit_sender, limit_receiver) = mpsc::channel();
+        let callback = Arc::new(|stream: &'static str, bytes: &[u8]| {
+            assert_eq!(stream, "stdout");
+            assert_eq!(
+                bytes, b"12345678",
+                "the callback sees only the visible prefix"
+            );
+            Ok(())
+        }) as OutputCallback;
+
+        let capture = read_stream(
+            Box::new(std::io::Cursor::new(b"123456789".to_vec())),
+            8,
+            "stdout",
+            limit_sender,
+            Some(callback),
+        )
+        .expect("read succeeds");
+
+        assert_eq!(capture.bytes, b"12345678");
+        assert!(capture.exceeded);
+        assert_eq!(limit_receiver.try_recv(), Ok("stdout"));
+        assert!(
+            limit_receiver.try_recv().is_err(),
+            "the stream name must be sent exactly once"
+        );
+    }
+
+    #[test]
+    fn read_stream_returns_a_callback_io_error_to_the_reader() {
+        let (limit_sender, _limit_receiver) = mpsc::channel();
+        let callback = Arc::new(|_stream: &'static str, _bytes: &[u8]| {
+            Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "consumer hung up",
+            ))
+        }) as OutputCallback;
+
+        let error = read_stream(
+            Box::new(std::io::Cursor::new(b"123".to_vec())),
+            8,
+            "stdout",
+            limit_sender,
+            Some(callback),
+        )
+        .expect_err("a failing callback must fail the read");
+
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+    }
+
+    // -----------------------------------------------------------------------
+    // Deterministic fake-driver tests (Phase C)
+    // -----------------------------------------------------------------------
+
+    /// A fake child whose `try_wait` and `wait` responses are scripted.
+    struct ScriptedChild {
+        stdout_data: Vec<u8>,
+        stderr_data: Vec<u8>,
+        try_wait_states: Vec<io::Result<Option<ProcessExit>>>,
+        wait_response: io::Result<ProcessExit>,
+        terminated: Arc<AtomicBool>,
+        cancel_on_first_try_wait: Option<CancellationToken>,
+        blocking_readers: bool,
+        next_try_wait: usize,
+    }
+
+    struct ReleaseReader {
+        bytes: Vec<u8>,
+        released: Arc<AtomicBool>,
+        emitted: bool,
+    }
+
+    impl Read for ReleaseReader {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            while !self.released.load(Ordering::Acquire) {
+                thread::yield_now();
+            }
+            if self.emitted {
+                return Ok(0);
+            }
+            self.emitted = true;
+            let length = self.bytes.len().min(buffer.len());
+            buffer[..length].copy_from_slice(&self.bytes[..length]);
+            Ok(length)
+        }
+    }
+
+    impl ChildProcess for ScriptedChild {
+        fn stdout(&mut self) -> Option<Box<dyn Read + Send>> {
+            if self.blocking_readers {
+                Some(Box::new(ReleaseReader {
+                    bytes: std::mem::take(&mut self.stdout_data),
+                    released: Arc::clone(&self.terminated),
+                    emitted: false,
+                }))
+            } else {
+                Some(Box::new(std::io::Cursor::new(std::mem::take(
+                    &mut self.stdout_data,
+                ))))
+            }
+        }
+
+        fn stderr(&mut self) -> Option<Box<dyn Read + Send>> {
+            if self.blocking_readers {
+                Some(Box::new(ReleaseReader {
+                    bytes: std::mem::take(&mut self.stderr_data),
+                    released: Arc::clone(&self.terminated),
+                    emitted: false,
+                }))
+            } else {
+                Some(Box::new(std::io::Cursor::new(std::mem::take(
+                    &mut self.stderr_data,
+                ))))
+            }
+        }
+
+        fn try_wait(&mut self) -> io::Result<Option<ProcessExit>> {
+            let idx = self.next_try_wait;
+            if idx == 0
+                && let Some(cancellation) = &self.cancel_on_first_try_wait
+            {
+                cancellation.cancel();
+            }
+            // Re-spawn the last state once we run out of scripted entries.
+            if idx >= self.try_wait_states.len() {
+                let last = self.try_wait_states.last().expect("at least one state");
+                return match last {
+                    Ok(inner) => Ok(*inner),
+                    Err(_) => Err(io::Error::other("wait failed")),
+                };
+            }
+            self.next_try_wait += 1;
+            match &self.try_wait_states[idx] {
+                Ok(inner) => Ok(*inner),
+                Err(_) => Err(io::Error::other("wait failed")),
+            }
+        }
+
+        fn wait(&mut self) -> io::Result<ProcessExit> {
+            match &self.wait_response {
+                Ok(exit) => Ok(*exit),
+                Err(_) => Err(io::Error::other("wait failed")),
+            }
+        }
+
+        fn terminate_tree(&mut self) -> io::Result<()> {
+            self.terminated.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    /// A launcher that produces a single pre-built `ScriptedChild`.
+    struct FakeLauncher {
+        child: Mutex<Option<ScriptedChild>>,
+    }
+
+    impl FakeLauncher {
+        fn new(child: ScriptedChild) -> (Self, Arc<AtomicBool>) {
+            let terminated_flag = Arc::clone(&child.terminated);
+            (
+                Self {
+                    child: Mutex::new(Some(child)),
+                },
+                terminated_flag,
+            )
+        }
+    }
+
+    impl ProcessLauncher for FakeLauncher {
+        fn spawn(&self, _spec: &ProcessSpec<'_>) -> io::Result<Box<dyn ChildProcess>> {
+            Ok(Box::new(
+                self.child
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .expect("FakeLauncher spawned only once"),
+            ))
+        }
+    }
+
+    /// A clock whose `now` and `sleep` advance by scripted durations.
+    #[derive(Clone)]
+    struct FakeClock {
+        now: Arc<Mutex<Instant>>,
+    }
+
+    impl FakeClock {
+        fn new() -> Self {
+            Self {
+                now: Arc::new(Mutex::new(Instant::now())),
+            }
+        }
+    }
+
+    impl RunnerClock for FakeClock {
+        fn now(&self) -> Instant {
+            *self.now.lock().unwrap()
+        }
+
+        fn sleep(&self, duration: Duration) {
+            thread::yield_now();
+            let mut now = self.now.lock().unwrap();
+            *now += duration;
+        }
+    }
+
+    /// Helper: create a small PlannedTask for fake-runner tests.
+    fn fake_planned_task(timeout_secs: u64) -> (TempDir, PlannedTask) {
+        let temp = TempDir::new();
+        let config = format!(
+            "[project]\nname = \"fixture\"\n\n[pipelines.ci]\ntasks = [\"build\"]\n\n[tasks.build]\ncommand = [\"echo\", \"hi\"]\ntimeout_seconds = {timeout_secs}\n"
+        );
+        std::fs::write(crate::config::config_path(temp.path()), &config)
+            .expect("write project config");
+        let project = Project::load(temp.path()).expect("project loads");
+        let plan = project.plan(None, &[]).expect("plan succeeds");
+        (temp, plan.into_iter().next().expect("one planned task"))
+    }
+
+    #[test]
+    fn fake_timeout_returns_timed_out_without_real_waiting() {
+        // Child never exits; clock advances past the timeout.
+        let child = ScriptedChild {
+            stdout_data: Vec::new(),
+            stderr_data: Vec::new(),
+            try_wait_states: vec![Ok(None)],
+            wait_response: Ok(ProcessExit {
+                code: Some(0),
+                success: true,
+            }),
+            terminated: Arc::new(AtomicBool::new(false)),
+            cancel_on_first_try_wait: None,
+            blocking_readers: false,
+            next_try_wait: 0,
+        };
+        let (launcher, _terminated) = FakeLauncher::new(child);
+        let clock = FakeClock::new();
+        let runner = Runner::with_services(Arc::new(launcher), Arc::new(clock.clone()));
+        let (_temp, planned) = fake_planned_task(1u64);
+
+        // Advance the clock past the timeout before running so the first
+        // poll immediately exceeds the timeout.
+        *clock.now.lock().unwrap() += Duration::from_secs(2);
+
+        let result = runner.run_with_options(planned.root(), &planned, None, None);
+
+        assert!(
+            matches!(&result, Err(RunnerError::TimedOut(..))),
+            "expected TimedOut, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn fake_cancellation_terminates_child_and_returns_cancelled() {
+        let cancel = CancellationToken::new();
+        let child = ScriptedChild {
+            stdout_data: Vec::new(),
+            stderr_data: Vec::new(),
+            try_wait_states: vec![Ok(None)],
+            wait_response: Ok(ProcessExit {
+                code: Some(0),
+                success: true,
+            }),
+            terminated: Arc::new(AtomicBool::new(false)),
+            cancel_on_first_try_wait: Some(cancel.clone()),
+            blocking_readers: false,
+            next_try_wait: 0,
+        };
+        let terminated_flag = Arc::clone(&child.terminated);
+        let (launcher, _) = FakeLauncher::new(child);
+        let clock = FakeClock::new();
+        let runner = Runner::with_services(Arc::new(launcher), Arc::new(clock));
+        let (_temp, planned) = fake_planned_task(60);
+
+        // The fake child cancels the token during the first in-flight poll.
+        let result = runner.run_with_options(planned.root(), &planned, Some(&cancel), None);
+
+        assert!(
+            matches!(&result, Err(RunnerError::Cancelled(..))),
+            "expected Cancelled, got {result:?}"
+        );
+        // The driver calls terminate_tree when cancellation fires.
+        assert!(terminated_flag.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn fake_wait_error_returns_wait_and_joins_readers() {
+        let child = ScriptedChild {
+            stdout_data: b"x".to_vec(),
+            stderr_data: b"y".to_vec(),
+            try_wait_states: vec![Err(io::Error::other("broken"))],
+            wait_response: Err(io::Error::other("broken")),
+            terminated: Arc::new(AtomicBool::new(false)),
+            cancel_on_first_try_wait: None,
+            blocking_readers: false,
+            next_try_wait: 0,
+        };
+        let (launcher, _terminated) = FakeLauncher::new(child);
+        let clock = FakeClock::new();
+        let runner = Runner::with_services(Arc::new(launcher), Arc::new(clock));
+        let (_temp, planned) = fake_planned_task(60);
+
+        let result = runner.run_with_options(planned.root(), &planned, None, None);
+
+        assert!(
+            matches!(&result, Err(RunnerError::Wait { .. })),
+            "expected Wait, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn fake_callback_error_produces_output_read() {
+        let child = ScriptedChild {
+            stdout_data: b"hello".to_vec(),
+            stderr_data: Vec::new(),
+            try_wait_states: vec![Ok(Some(ProcessExit {
+                code: Some(0),
+                success: true,
+            }))],
+            wait_response: Ok(ProcessExit {
+                code: Some(0),
+                success: true,
+            }),
+            terminated: Arc::new(AtomicBool::new(false)),
+            cancel_on_first_try_wait: None,
+            blocking_readers: false,
+            next_try_wait: 0,
+        };
+        let (launcher, _terminated) = FakeLauncher::new(child);
+        let clock = FakeClock::new();
+        let runner = Runner::with_services(Arc::new(launcher), Arc::new(clock));
+        let (_temp, planned) = fake_planned_task(60);
+        let callback = Arc::new(|_stream: &'static str, _bytes: &[u8]| {
+            Err(io::Error::new(io::ErrorKind::BrokenPipe, "consumer failed"))
+        }) as OutputCallback;
+
+        let result = runner.run_with_options(planned.root(), &planned, None, Some(callback));
+
+        assert!(
+            matches!(
+                &result,
+                Err(RunnerError::OutputRead {
+                    stream: "stdout",
+                    ..
+                })
+            ),
+            "expected OutputRead stdout, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn fake_exit_unfinished_readers_invokes_descendant_cleanup() {
+        let terminated = Arc::new(AtomicBool::new(false));
+        let child = ScriptedChild {
+            stdout_data: b"hello".to_vec(),
+            stderr_data: b"world".to_vec(),
+            try_wait_states: vec![Ok(Some(ProcessExit {
+                code: Some(0),
+                success: true,
+            }))],
+            wait_response: Ok(ProcessExit {
+                code: Some(0),
+                success: true,
+            }),
+            terminated: Arc::clone(&terminated),
+            cancel_on_first_try_wait: None,
+            blocking_readers: true,
+            next_try_wait: 0,
+        };
+        let flag = Arc::clone(&child.terminated);
+        let (launcher, _) = FakeLauncher::new(child);
+        let clock = FakeClock::new();
+        let runner = Runner::with_services(Arc::new(launcher), Arc::new(clock));
+        let (_temp, planned) = fake_planned_task(60);
+
+        let result = runner.run_with_options(planned.root(), &planned, None, None);
+
+        assert!(result.is_ok(), "expected Ok, got {result:?}");
+        assert!(
+            flag.load(Ordering::SeqCst),
+            "unfinished readers must trigger descendant cleanup"
+        );
+    }
+
+    #[test]
+    fn fake_failed_exit_maps_status_code() {
+        let child = ScriptedChild {
+            stdout_data: b"error".to_vec(),
+            stderr_data: Vec::new(),
+            try_wait_states: vec![Ok(Some(ProcessExit {
+                code: Some(42),
+                success: false,
+            }))],
+            wait_response: Ok(ProcessExit {
+                code: Some(42),
+                success: false,
+            }),
+            terminated: Arc::new(AtomicBool::new(false)),
+            cancel_on_first_try_wait: None,
+            blocking_readers: false,
+            next_try_wait: 0,
+        };
+        let (launcher, _terminated) = FakeLauncher::new(child);
+        let clock = FakeClock::new();
+        let runner = Runner::with_services(Arc::new(launcher), Arc::new(clock));
+        let (_temp, planned) = fake_planned_task(60);
+
+        let result = runner.run_with_options(planned.root(), &planned, None, None);
+
+        match result {
+            Err(RunnerError::Failed(ref failed)) => {
+                assert_eq!(failed.code, Some(42), "exit code mismatch");
+                assert_eq!(failed.output.stdout, b"error");
+            }
+            other => panic!("expected Failed, got {other:?}"),
         }
     }
 }
