@@ -262,9 +262,10 @@ jobs:
           test -f extracted/LICENSE
           test -f extracted/README.md
           reported="$(./extracted/mono --version)"
+          expected="mono ${RELEASE_TAG#v}"
           echo "$reported"
-          test "$reported" = "mono ${RELEASE_TAG}" || {
-            echo "artifact reports '$reported', expected 'mono ${RELEASE_TAG}'" >&2
+          test "$reported" = "$expected" || {
+            echo "artifact reports '$reported', expected '$expected'" >&2
             exit 1
           }
 
@@ -277,7 +278,8 @@ jobs:
           if (-not (Test-Path extracted/LICENSE)) { throw 'missing extracted/LICENSE' }
           if (-not (Test-Path extracted/README.md)) { throw 'missing extracted/README.md' }
           $reported = (& extracted/mono.exe --version).Trim()
+          $expected = "mono " + $env:RELEASE_TAG.Substring(1)
           Write-Host $reported
-          if ($reported -ne "mono $env:RELEASE_TAG") {
-            throw "artifact reports '$reported', expected 'mono $env:RELEASE_TAG'"
+          if ($reported -ne $expected) {
+            throw "artifact reports '$reported', expected '$expected'"
           }
