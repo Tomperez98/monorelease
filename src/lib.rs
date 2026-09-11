@@ -32,25 +32,27 @@ pub use commands::changelog::{
     scaffold as changelog_scaffold, validate as changelog_validate,
 };
 pub use commands::ci::{
-    CiError, PipelineExecution, ci, ci_with_jobs, clean_cache, graph, plan, run_pipeline,
-    run_pipeline_with_cache, run_pipeline_with_jobs, run_pipeline_with_mode,
+    CiError, PipelineExecution, clean_cache, graph, plan, run_pipeline_with_mode,
 };
 pub use commands::doctor::{DoctorError, doctor};
 pub use commands::init::{InitError, init, init_standalone};
 pub use commands::list::{ListError, list};
 pub use commands::release::{
-    ReleaseCommandError, manifest as release_manifest, source as release_source,
-    verify as release_verify,
+    DEFAULT_DIRECTORY as DEFAULT_RELEASE_DIRECTORY, ReleaseCommandError,
+    manifest as release_manifest, source as release_source, verify as release_verify,
 };
 pub use config::{
     CONFIG_FILE_NAME, MonorepoConfig, PackageConfig, PipelineConfig, TaskConfig,
     WORKSPACE_PACKAGE_NAME, WorkspaceConfig, config_path, render_config,
 };
 pub use output::OutputMode;
+// `CiError::Scheduler` already exposes this type in its public variant; naming it
+// lets a caller tell a failed task apart from a scheduler or cache failure.
 pub use release::{
     Artifact, ReleaseError, ReleaseIdentity, ReleaseManifest, create_manifest, verify_checksums,
     verify_manifest, verify_source,
 };
+pub use scheduler::SchedulerError;
 pub use workspace::{Package, PlannedTask, TaskNode, Workspace, WorkspaceError};
 
 /// Every expected failure a `monorelease` command can report.

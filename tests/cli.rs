@@ -3,7 +3,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 
 /// A unique directory that deletes itself when the test ends.
 struct TempDir(PathBuf);
@@ -392,6 +392,7 @@ fn ci_reports_failed_task_output_and_context() {
     // reports its failure, so it would not be counted as blocked.
     let output = monorelease(&["ci", "--jobs", "1"], temp.path());
 
+    // A task that exits non-zero is a failed request (1), not a failed tool (3).
     assert_eq!(output.status.code(), Some(1));
     assert!(stderr(&output).contains("boom"));
     assert!(stderr(&output).contains("api/build"));
@@ -498,4 +499,80 @@ fn plan_and_graph_commands_expose_task_dependencies() {
     let graph = monorelease(&["graph"], temp.path());
     assert!(graph.status.success(), "stderr: {}", stderr(&graph));
     assert!(stdout(&graph).contains("web:build <- shared:build"));
+}
+
+#[test]
+fn a_consumer_that_hangs_up_is_not_a_failure() {
+    let temp = TempDir::new("broken-pipe");
+    assert!(monorelease(&["init"], temp.path()).status.success());
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_monorelease"))
+        .arg("list")
+        .current_dir(temp.path())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn monorelease");
+    // Close the read end the way `monorelease list | head` would. The child is
+    // still parsing and loading the workspace, so its write loses the race.
+    drop(child.stdout.take());
+
+    let output = child.wait_with_output().expect("wait for monorelease");
+
+    assert!(
+        output.status.success(),
+        "a hung-up consumer must not be a failure: {output:?}"
+    );
+    assert!(
+        !stderr(&output).contains("panicked"),
+        "a hung-up consumer must not panic: {}",
+        stderr(&output)
+    );
+}
+
+#[test]
+fn an_empty_argument_is_rejected_while_parsing() {
+    let temp = TempDir::new("empty-argument");
+    assert!(monorelease(&["init"], temp.path()).status.success());
+
+    // Without edge validation `task ""` ran an empty plan and reported success:
+    // a green build that did nothing.
+    for args in [
+        vec!["task", ""],
+        vec!["run", "--task", ""],
+        vec!["run", ""],
+        vec!["plan", "--package", ""],
+    ] {
+        let output = monorelease(&args, temp.path());
+
+        assert_eq!(output.status.code(), Some(2), "args: {args:?}");
+    }
+}
+
+#[test]
+fn an_unusable_worker_count_is_rejected_while_parsing() {
+    let temp = TempDir::new("jobs-invalid");
+    assert!(monorelease(&["init"], temp.path()).status.success());
+
+    // The scheduler requires at least one worker, so the bound belongs on the
+    // flag rather than surfacing as a failed run.
+    for jobs in ["0", "many"] {
+        let output = monorelease(&["run", "--jobs", jobs], temp.path());
+
+        assert_eq!(output.status.code(), Some(2), "jobs: {jobs}");
+    }
+}
+
+#[test]
+fn a_filesystem_failure_exits_with_three() {
+    let temp = TempDir::new("tool-failure");
+    // The target is a file, so the workspace root cannot be created: the command
+    // was understood and the environment refused to carry it out.
+    let occupied = temp.path().join("occupied");
+    fs::write(&occupied, "not a directory").expect("write occupying file");
+
+    let output = monorelease(&["--dir", occupied.to_str().unwrap(), "init"], temp.path());
+
+    assert_eq!(output.status.code(), Some(3));
+    assert!(stderr(&output).contains("could not create directory"));
 }

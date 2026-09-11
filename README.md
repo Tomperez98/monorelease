@@ -1,4 +1,4 @@
-# monorelease
+# mono (release)
 
 Run every package's tasks in dependency order, from one `monorepo.toml` — in any language.
 
@@ -117,7 +117,7 @@ depends_on = ["shared:build"]
 | Flag | Default | Effect |
 | --- | --- | --- |
 | `--package NAME` | all packages | Restrict the run to one package, keeping its transitive dependencies. |
-| `--jobs N` | machine CPUs | Maximum independent tasks to execute concurrently. Defaults to this machine's available parallelism. |
+| `--jobs N` | machine CPUs | Maximum independent tasks to execute concurrently. Must be at least `1`. Defaults to this machine's available parallelism. |
 | `--dry-run` | off | Resolve and print the plan; run nothing and touch no cache. |
 | `--no-cache` | off | Skip reading and writing the cache for this run. |
 | `--force` | off | Ignore cache hits and refresh successful entries. |
@@ -128,6 +128,17 @@ monorelease task test --package web --jobs 4
 monorelease run release --dry-run
 monorelease --dir examples/echo task build --jobs 2
 ```
+
+## Exit codes
+
+| Code | Meaning |
+| --- | --- |
+| `0` | The command succeeded. |
+| `1` | The command was understood and failed: an invalid or unreadable manifest, an absent `--dir`, an unknown task or package, a task that exited non-zero, or a changelog or release check that did not pass. |
+| `2` | The command line was wrong. `clap` rejects it while parsing, so a bad value never reaches the pipeline — `--jobs 0` and empty values such as `--package ""` fail here. |
+| `3` | `monorelease` could not carry the command out: `init` could not write the manifest, `changelog` or `release` could not read or write its files, `git` could not be run, the cache could not be updated, or task output could not be written. |
+
+`1` and `3` are the useful pair in CI: `1` means the pipeline is red, `3` means the tool never got far enough to tell you.
 
 ## Manifest model
 

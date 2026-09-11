@@ -8,6 +8,9 @@ use crate::release::{
     ReleaseError, ReleaseIdentity, create_manifest, verify_manifest, verify_source,
 };
 
+/// Default directory holding the release artifacts and their metadata.
+pub const DEFAULT_DIRECTORY: &str = "dist";
+
 pub fn manifest(
     directory: &Path,
     identity: ReleaseIdentity,
