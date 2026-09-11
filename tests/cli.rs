@@ -389,3 +389,40 @@ fn an_interrupted_run_does_not_report_success() {
          reported error in scheduler::classify"
     );
 }
+
+/// `std::env::vars()` panics when any ambient variable is not valid Unicode. The
+/// cache session gathers the environment once, so calling `vars()` there aborts
+/// the whole run because of an unrelated variable — `vars_os` plus a lossy
+/// conversion does not. The variable is set on the child process rather than
+/// with `set_var`, which is `unsafe` in Rust 2024 and racy under parallel tests.
+#[cfg(unix)]
+#[test]
+fn a_non_unicode_environment_variable_does_not_abort_a_cached_run() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    let temp = TempDir::new("non-unicode-env");
+    write_project(
+        temp.path(),
+        "[pipelines.ci]\ntasks = [\"build\"]\n\n[tasks.build]\ncommand = [\"sh\", \"-c\", \"cat seed > artifact\"]\ncache = true\ninputs = [\"seed\"]\noutputs = [\"artifact\"]\ncache_env = [\"*\"]\n",
+    );
+    fs::write(temp.path().join("seed"), "hello").unwrap();
+
+    // Deliberately no `--no-cache`: the cache session only prepares when the
+    // cache is enabled, and preparing is where the environment is gathered.
+    let output = Command::new(env!("CARGO_BIN_EXE_mono"))
+        .args(["ci"])
+        .current_dir(temp.path())
+        .env(
+            "MONO_TEST_NON_UNICODE",
+            OsString::from_vec(vec![0xff, 0xfe]),
+        )
+        .output()
+        .expect("run mono");
+
+    assert!(
+        output.status.success(),
+        "a non-UTF-8 environment variable aborted the run: {}",
+        stderr(&output)
+    );
+}

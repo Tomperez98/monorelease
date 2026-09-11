@@ -1653,7 +1653,14 @@ with
     // state it cannot be told about.
     let cache_session =
         if !matches!(cache_mode, CacheMode::NoCache) && plan.iter().any(PlannedTask::cache) {
-            let environment = std::env::vars().collect::<BTreeMap<_, _>>();
+            let environment = std::env::vars_os()
+                .map(|(key, value)| {
+                    (
+                        key.to_string_lossy().into_owned(),
+                        value.to_string_lossy().into_owned(),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>();
             Some(Arc::new(
                 cache
                     .prepare(&root, environment)
@@ -1694,11 +1701,33 @@ Also update the two call sites in `src/cache.rs::tests` at the existing `changin
 Run: `cargo test --lib cache::tests::`
 Expected: all PASS (17 tests in the module).
 
-Run: `grep -rn "std::env::var\|std::env::vars" src/`
-Expected: exactly one hit, in `src/scheduler.rs`.
+Run: `grep -rn "std::env::var" src/`
+Expected: exactly one hit, in `src/scheduler.rs`. See the as-built note below for why it must be `vars_os`, not `vars`.
 
 Run: `cargo test --workspace --all-targets --all-features`
 Expected: PASS.
+
+**As-built note — a plan bug found in execution, and the fix (required).**
+
+The version of the environment collection originally specified here was `std::env::vars().collect::<BTreeMap<_, _>>()`. That is a regression, and it is subtle enough to be worth stating precisely.
+
+`std::env::vars()` **panics** if any ambient variable is not valid Unicode. The original code only reached it on the wildcard path:
+
+```rust
+        if task.cache_env().iter().any(|variable| variable == "*") {
+            environment.extend(std::env::vars());          // panics on non-Unicode
+        } else {
+            for variable in task.cache_env() {
+                ...
+                        .or_else(|| std::env::var(variable).ok())   // no panic; None
+                        .unwrap_or_else(|| "<unset>".to_owned()),
+```
+
+Because `prepare` gathers the whole environment eagerly whenever *any* task is cacheable, `vars()` moves that panic onto **every** cached run — a project using only named `cache_env` entries would abort because of an entirely unrelated non-Unicode variable. That is the wrong side of the panic/return line: a non-Unicode var is an expected environmental condition, not a broken invariant.
+
+The fix, now reflected in the snippet above: collect with `std::env::vars_os()` and convert lossily. Neither path panics any more, and a non-Unicode variable still contributes a stable value to the key instead of collapsing to `"<unset>"` (which previously made every non-Unicode value hash identically — a latent cache-correctness bug).
+
+`tests/cli.rs::a_non_unicode_environment_variable_does_not_abort_a_cached_run` pins it: it spawns `mono` with `MONO_TEST_NON_UNICODE` set to invalid UTF-8 and asserts a clean exit. Verified by mutation — reverting to `vars()` makes the child panic at `library/std/src/env.rs:168` and the test fail. The variable is set on the child rather than via `set_var`, which is `unsafe` in Rust 2024 and racy under parallel tests.
 
 - [ ] **Step 6: Commit**
 
