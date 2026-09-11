@@ -35,7 +35,8 @@ pub use changelog::{
 pub use commands::changelog::{
     ChangelogError, DEFAULT_NOTES_PATH as DEFAULT_RELEASE_NOTES_PATH,
     DEFAULT_PATH as DEFAULT_CHANGELOG_PATH, notes as changelog_notes,
-    scaffold as changelog_scaffold, validate as changelog_validate,
+    scaffold as changelog_scaffold, scaffold_on as changelog_scaffold_on,
+    validate as changelog_validate,
 };
 pub use commands::ci::{
     CiError, PipelineExecution, clean_cache, graph, graph_with_output, plan, plan_with_output,

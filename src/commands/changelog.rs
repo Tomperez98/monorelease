@@ -22,12 +22,21 @@ pub fn validate(path: &Path) -> Result<String, ChangelogError> {
     ))
 }
 
+/// Scaffold an entry dated today.
 pub fn scaffold(path: &Path, version: &str) -> Result<String, ChangelogError> {
+    scaffold_on(path, version, &today())
+}
+
+/// Scaffold an entry with an explicit date.
+///
+/// The clock is a parameter rather than a call, so the rendered changelog is
+/// deterministic and a test can assert the date.
+pub fn scaffold_on(path: &Path, version: &str, date: &str) -> Result<String, ChangelogError> {
     let request = Request::parse(version).map_err(ChangelogError::Invalid)?;
     let text = read(path)?;
     let mut changelog = Changelog::parse(&text).map_err(|message| invalid(path, message))?;
     let action = changelog
-        .scaffold(request, &today(), &[])
+        .scaffold(request, date, &[])
         .map_err(|message| invalid(path, message))?;
     write(path, &changelog.render())?;
     Ok(format!(
@@ -184,6 +193,27 @@ mod tests {
                 .unwrap()
                 .filter_map(Result::ok)
                 .all(|entry| !entry.file_name().to_string_lossy().ends_with(".tmp"))
+        );
+    }
+
+    #[test]
+    fn scaffold_on_writes_the_supplied_date() {
+        let temp = TempDir::new();
+        let path = temp.path().join(DEFAULT_PATH);
+        fs::write(&path, "# Changelog\n\n## 1.0.0\nReleased: 2026-01-01\n").unwrap();
+
+        // Deliberately not today's date. If this were the current date, the test
+        // could not tell `scaffold_on` using the parameter apart from
+        // `scaffold_on` ignoring it and calling `today()`, and would pass for
+        // the wrong reason until the clock moved on.
+        scaffold_on(&path, "1.1.0", "2001-02-03").expect("scaffold succeeds");
+
+        let rendered = fs::read_to_string(&path).unwrap();
+        assert!(rendered.contains("## 1.1.0\n"), "{rendered}");
+        assert!(rendered.contains("Released: 2001-02-03\n"), "{rendered}");
+        assert!(
+            !rendered.contains(&format!("Released: {}\n", today())),
+            "scaffold_on must not fall back to the wall clock: {rendered}"
         );
     }
 }
