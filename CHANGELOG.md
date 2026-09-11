@@ -2,7 +2,8 @@
 
 Notable changes per release, newest first.
 
-## (unreleased)
+## 0.1.4
+Released: 2026-09-11
 
 ### Breaking Changes
 

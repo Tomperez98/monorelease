@@ -42,13 +42,11 @@ pub(crate) fn run(directory: &Path, verify_only: bool) -> Result<(), Error> {
     };
 
     let cleanup = fs::remove_file(&expected_path);
-    if let Err(error) = cleanup {
-        if result.is_ok() {
-            return Err(Error::Command(format!(
-                "failed to remove temporary release inventory {}: {error}",
-                expected_path.display()
-            )));
-        }
+    if let (Err(error), true) = (cleanup, result.is_ok()) {
+        return Err(Error::Command(format!(
+            "failed to remove temporary release inventory {}: {error}",
+            expected_path.display()
+        )));
     }
 
     let action = result?;
