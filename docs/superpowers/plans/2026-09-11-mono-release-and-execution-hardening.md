@@ -13,7 +13,7 @@
 ### Task 1: Remove obsolete package terminology
 
 **Files:**
-- Modify: `src/workspace.rs`
+- Modify: `src/project.rs`
 - Modify: `src/commands/ci.rs`
 - Modify: `src/runner.rs`
 - Modify: `src/cache.rs`

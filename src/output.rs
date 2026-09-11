@@ -10,8 +10,8 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::events::{ExecutionEvent, TaskStatus, TaskStream};
+use crate::project::TaskNode;
 use crate::runner::{RunnerError, TaskResult};
-use crate::workspace::TaskNode;
 
 /// Selects the output contract for a pipeline run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -22,6 +22,8 @@ pub enum OutputMode {
     Json,
     /// GitHub Actions log groups with status on stdout.
     GithubActions,
+    /// Stream task output as it arrives while keeping status on stderr.
+    Live,
 }
 
 /// Owns task presentation so worker threads never write directly to the
@@ -55,8 +57,8 @@ impl OutputSink {
 
     pub(crate) fn present_success(&self, node: &TaskNode, result: &TaskResult) -> io::Result<()> {
         let _guard = self.lock.lock().expect("output lock is not poisoned");
-        if self.mode == OutputMode::Json {
-            // Emit separate TaskOutput events so the JSON stream is lossless.
+        if matches!(self.mode, OutputMode::Json | OutputMode::GithubActions) {
+            // Emit separate TaskOutput events so the JSON stream and CI log are lossless.
             if !result.output.stdout.is_empty() {
                 self.render_event(&ExecutionEvent::task_output(
                     node,
@@ -73,8 +75,10 @@ impl OutputSink {
             }
         } else {
             self.start_section(node)?;
-            write_bytes(&result.output.stdout, false)?;
-            write_bytes(&result.output.stderr, true)?;
+            if self.mode != OutputMode::Live || result.cached {
+                write_bytes(&result.output.stdout, false)?;
+                write_bytes(&result.output.stderr, true)?;
+            }
         }
         let status = if result.cached {
             TaskStatus::Cached
@@ -95,7 +99,7 @@ impl OutputSink {
 
     pub(crate) fn present_failure(&self, node: &TaskNode, error: &RunnerError) -> io::Result<()> {
         let _guard = self.lock.lock().expect("output lock is not poisoned");
-        if self.mode == OutputMode::Json {
+        if matches!(self.mode, OutputMode::Json | OutputMode::GithubActions) {
             if let Some(output) = error.output() {
                 if !output.stdout.is_empty() {
                     self.render_event(&ExecutionEvent::task_output(
@@ -112,7 +116,7 @@ impl OutputSink {
                     ))?;
                 }
             }
-        } else {
+        } else if self.mode != OutputMode::Live {
             self.start_section(node)?;
             if let Some(output) = error.output() {
                 write_bytes(&output.stdout, false)?;
@@ -122,6 +126,7 @@ impl OutputSink {
         let status = match error {
             RunnerError::TimedOut(_) => TaskStatus::TimedOut,
             RunnerError::OutputLimit(_) => TaskStatus::OutputLimit,
+            RunnerError::Cancelled(_) => TaskStatus::Cancelled,
             _ => TaskStatus::Failed,
         };
         self.render_event(&ExecutionEvent::task_finished(
@@ -131,10 +136,38 @@ impl OutputSink {
         ))
     }
 
-    pub(crate) fn present_run_start(&self, workspace: &Path, task_count: usize) -> io::Result<()> {
+    pub(crate) fn is_live(&self) -> bool {
+        self.mode == OutputMode::Live
+    }
+
+    pub(crate) fn present_attempt(
+        &self,
+        node: &TaskNode,
+        attempt: u32,
+        max_attempts: u32,
+    ) -> io::Result<()> {
+        let _guard = self.lock.lock().expect("output lock is not poisoned");
+        self.render_event(&ExecutionEvent::task_attempt_started(
+            node,
+            attempt,
+            max_attempts,
+        ))
+    }
+
+    pub(crate) fn present_live_output(
+        &self,
+        node: &TaskNode,
+        stream: TaskStream,
+        bytes: Vec<u8>,
+    ) -> io::Result<()> {
+        let _guard = self.lock.lock().expect("output lock is not poisoned");
+        self.render_event(&ExecutionEvent::task_output(node, stream, bytes))
+    }
+
+    pub(crate) fn present_run_start(&self, project: &Path, task_count: usize) -> io::Result<()> {
         let _guard = self.lock.lock().expect("output lock is not poisoned");
         self.render_event(&ExecutionEvent::run_started(
-            workspace.to_path_buf(),
+            project.to_path_buf(),
             task_count,
         ))
     }
@@ -155,6 +188,7 @@ impl OutputSink {
                 summary.completed,
                 summary.cached,
                 summary.failed,
+                summary.cancelled,
                 summary.blocked,
             ))
         } else {
@@ -190,6 +224,7 @@ impl OutputSink {
             }
             OutputMode::Terminal => self.render_terminal(event),
             OutputMode::GithubActions => self.render_github_actions(event),
+            OutputMode::Live => self.render_live(event),
         }
     }
 
@@ -203,6 +238,18 @@ impl OutputSink {
                 let _ = event;
                 Ok(())
             }
+            ExecutionEvent::TaskAttemptStarted {
+                task,
+                attempt,
+                max_attempts,
+                ..
+            } => {
+                if *attempt == 1 {
+                    Ok(())
+                } else {
+                    writeln!(stderr, "↻ {task}: retry {attempt}/{max_attempts}")
+                }
+            }
             ExecutionEvent::TaskFinished {
                 task,
                 status,
@@ -215,13 +262,31 @@ impl OutputSink {
                 completed,
                 cached,
                 failed,
+                cancelled,
                 blocked,
                 ..
             } => writeln!(
                 stderr,
-                "summary: {completed} completed, {cached} cached, {failed} failed, {blocked} blocked"
+                "summary: {completed} completed, {cached} cached, {failed} failed, {cancelled} cancelled, {blocked} blocked"
             ),
             ExecutionEvent::RunStarted { .. } => Ok(()),
+        }
+    }
+
+    fn render_live(&self, event: &ExecutionEvent) -> io::Result<()> {
+        match event {
+            ExecutionEvent::TaskOutput { bytes, stream, .. } => {
+                if matches!(stream, TaskStream::Stderr) {
+                    let mut handle = io::stderr().lock();
+                    handle.write_all(bytes)?;
+                    handle.flush()
+                } else {
+                    let mut handle = io::stdout().lock();
+                    handle.write_all(bytes)?;
+                    handle.flush()
+                }
+            }
+            _ => self.render_terminal(event),
         }
     }
 
@@ -237,14 +302,40 @@ impl OutputSink {
                 if bytes.is_empty() {
                     return Ok(());
                 }
-                if matches!(stream, TaskStream::Stderr) {
+                let token = format!(
+                    "mono_output_{}_{}",
+                    self.run_id,
+                    self.sequence.fetch_add(1, Ordering::Relaxed)
+                );
+                {
+                    let mut control = io::stdout().lock();
+                    writeln!(control, "::stop-commands::{token}")?;
+                    control.flush()?;
+                }
+                let result = if matches!(stream, TaskStream::Stderr) {
                     let mut handle = io::stderr().lock();
-                    write_line_terminated(&mut handle, bytes)?;
-                    handle.flush()
+                    write_line_terminated(&mut handle, bytes).and_then(|_| handle.flush())
                 } else {
                     let mut handle = io::stdout().lock();
-                    write_line_terminated(&mut handle, bytes)?;
-                    handle.flush()
+                    write_line_terminated(&mut handle, bytes).and_then(|_| handle.flush())
+                };
+                let mut control = io::stdout().lock();
+                writeln!(control, "::{token}::")?;
+                control.flush()?;
+                result
+            }
+            ExecutionEvent::TaskAttemptStarted {
+                task,
+                attempt,
+                max_attempts,
+                ..
+            } => {
+                if *attempt > 1 {
+                    let mut stdout = io::stdout().lock();
+                    writeln!(stdout, "↻ {task}: retry {attempt}/{max_attempts}")?;
+                    stdout.flush()
+                } else {
+                    Ok(())
                 }
             }
             ExecutionEvent::TaskFinished {
@@ -262,13 +353,14 @@ impl OutputSink {
                 completed,
                 cached,
                 failed,
+                cancelled,
                 blocked,
                 ..
             } => {
                 let mut stdout = io::stdout().lock();
                 writeln!(
                     stdout,
-                    "summary: {completed} completed, {cached} cached, {failed} failed, {blocked} blocked"
+                    "summary: {completed} completed, {cached} cached, {failed} failed, {cancelled} cancelled, {blocked} blocked"
                 )?;
                 stdout.flush()
             }
@@ -292,6 +384,7 @@ impl OutputSink {
             summary.completed,
             summary.cached,
             summary.failed,
+            summary.cancelled,
             summary.blocked,
         ))
     }
@@ -442,6 +535,7 @@ mod tests {
             completed: 2,
             cached: 1,
             failed: 0,
+            cancelled: 0,
             blocked: 0,
         };
         sink.present_run_finished(&summary)
@@ -471,6 +565,7 @@ mod tests {
             completed: 1,
             cached: 0,
             failed: 0,
+            cancelled: 0,
             blocked: 0,
         };
         sink.present_summary(&summary)
@@ -481,6 +576,28 @@ mod tests {
         let event: serde_json::Value =
             serde_json::from_str(&captured[0]).expect("valid JSON event");
         assert_eq!(event["event"], "run_finished");
+    }
+
+    #[test]
+    fn json_task_attempt_event() {
+        let lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = OutputSink {
+            mode: OutputMode::Json,
+            lock: Mutex::new(()),
+            run_id: 1,
+            sequence: AtomicU64::new(0),
+            json_lines: Some(lines.clone()),
+        };
+        let node = TaskNode::new("build");
+
+        sink.present_attempt(&node, 2, 3)
+            .expect("attempt event writes");
+
+        let captured = lines.lock().unwrap();
+        let event: serde_json::Value = serde_json::from_str(&captured[0]).unwrap();
+        assert_eq!(event["event"], "task_attempt_started");
+        assert_eq!(event["attempt"], 2);
+        assert_eq!(event["max_attempts"], 3);
     }
 
     #[test]

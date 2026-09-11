@@ -129,6 +129,19 @@ fn unknown_task_suggests_the_closest_global_task() {
     assert!(stderr(&output).contains("Did you mean 'test'?"));
 }
 
+#[test]
+fn cacheable_tasks_cannot_inherit_standard_input() {
+    let temp = TempDir::new("cache-stdin");
+    write_project(
+        temp.path(),
+        "[pipelines.ci]\ntasks = [\"build\"]\n\n[tasks.build]\ncommand = [\"echo\", \"build\"]\ncache = true\ninputs = [\"input.txt\"]\nstdin = \"inherit\"\n",
+    );
+    fs::write(temp.path().join("input.txt"), "input").unwrap();
+    let output = mono(&["check"], temp.path());
+    assert!(!output.status.success());
+    assert!(stderr(&output).contains("cannot inherit standard input"));
+}
+
 #[cfg(unix)]
 #[test]
 fn cache_reuses_root_task_outputs_and_supports_bypass() {
@@ -208,7 +221,7 @@ fn json_output_contains_lifecycle_events() {
 }
 
 #[test]
-fn old_workspace_shape_is_rejected() {
+fn non_project_manifest_shape_is_rejected() {
     let temp = TempDir::new("old-shape");
     fs::write(
         temp.path().join("mono.toml"),
@@ -242,7 +255,13 @@ fn plan_json_is_a_stable_machine_document() {
     assert_eq!(document["kind"], "plan");
     assert_eq!(document["tasks"][0]["id"], "build");
     assert_eq!(document["tasks"][0]["env"][0], "TOKEN");
+    assert_eq!(document["tasks"][0]["stdin"], "null");
     assert!(document["tasks"][0].get("secret").is_none());
+
+    let dry_run = mono(&["--output", "json", "run", "--dry-run"], temp.path());
+    assert!(dry_run.status.success(), "{}", stderr(&dry_run));
+    let dry_run_document: serde_json::Value = serde_json::from_slice(&dry_run.stdout).unwrap();
+    assert_eq!(dry_run_document["kind"], "plan");
 }
 
 #[test]
@@ -259,6 +278,58 @@ fn list_json_contains_pipelines_and_tasks() {
     assert_eq!(document["kind"], "list");
     assert_eq!(document["pipelines"][0]["name"], "ci");
     assert_eq!(document["tasks"][0]["id"], "build");
+}
+
+#[test]
+fn json_success_documents_cover_non_execution_commands() {
+    let temp = TempDir::new("json-success");
+    let init = mono(&["--output", "json", "init"], temp.path());
+    assert!(init.status.success(), "{}", stderr(&init));
+    let init_document: serde_json::Value = serde_json::from_slice(&init.stdout).unwrap();
+    assert_eq!(init_document["schema"], 1);
+    assert_eq!(init_document["kind"], "init");
+
+    let clean = mono(&["--output", "json", "cache", "clean"], temp.path());
+    assert!(clean.status.success(), "{}", stderr(&clean));
+    let clean_document: serde_json::Value = serde_json::from_slice(&clean.stdout).unwrap();
+    assert_eq!(clean_document["kind"], "cache_clean");
+}
+
+#[cfg(unix)]
+#[test]
+fn github_actions_output_disables_command_processing_for_task_output() {
+    let temp = TempDir::new("github-output");
+    write_project(
+        temp.path(),
+        "[pipelines.ci]\ntasks = [\"build\"]\n\n[tasks.build]\ncommand = [\"sh\", \"-c\", \"printf '::error:: injected'\"]\n",
+    );
+    let output = mono(
+        &["--output", "github-actions", "run", "--no-cache"],
+        temp.path(),
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.contains("::stop-commands::"), "{text}");
+    assert!(text.contains("::mono_output_"), "{text}");
+    assert!(text.contains("::error:: injected"), "{text}");
+}
+
+#[cfg(unix)]
+#[test]
+fn live_output_streams_task_bytes_and_reports_summary() {
+    let temp = TempDir::new("live-output");
+    write_project(
+        temp.path(),
+        "[pipelines.ci]\ntasks = [\"build\"]\n\n[tasks.build]\ncommand = [\"sh\", \"-c\", \"printf one; sleep 0.02; printf two\"]\n",
+    );
+    let output = mono(&["--output", "live", "run", "--no-cache"], temp.path());
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(stdout(&output).contains("onetwo"), "{}", stdout(&output));
+    assert!(
+        stdout(&output).contains("1 completed"),
+        "{}",
+        stdout(&output)
+    );
 }
 
 #[test]

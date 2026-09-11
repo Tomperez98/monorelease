@@ -10,17 +10,18 @@ use std::thread;
 
 use crate::cache::{CacheError, CacheMode, CacheSession, CacheStore};
 use crate::output::OutputSink;
-use crate::runner::{Runner, RunnerError, TaskResult};
-use crate::workspace::{PlannedTask, TaskNode, Workspace};
+use crate::project::{PlannedTask, Project, TaskNode};
+use crate::runner::{CancellationToken, Runner, RunnerError, TaskResult};
 
 /// Execute a validated plan while starting newly-ready tasks immediately.
 pub(crate) fn execute_plan(
-    workspace: &Workspace,
+    project: &Project,
     plan: &[PlannedTask],
     jobs: usize,
     runner: &Runner,
-    output: &OutputSink,
+    output: &Arc<OutputSink>,
     cache_mode: CacheMode,
+    cancellation: &CancellationToken,
 ) -> Result<ExecutionSummary, SchedulerError> {
     assert!(jobs > 0, "scheduler requires at least one worker");
 
@@ -56,7 +57,7 @@ pub(crate) fn execute_plan(
         .iter()
         .filter_map(|(node, count)| (*count == 0).then_some(node.clone()))
         .collect::<BTreeSet<_>>();
-    let root = Arc::new(workspace.root.clone());
+    let root = Arc::new(project.root.clone());
     let cache = CacheStore::new(&root);
     let cache_session =
         if !matches!(cache_mode, CacheMode::NoCache) && plan.iter().any(PlannedTask::cache) {
@@ -68,7 +69,7 @@ pub(crate) fn execute_plan(
         };
 
     output
-        .present_run_start(&workspace.root, plan.len())
+        .present_run_start(&project.root, plan.len())
         .map_err(SchedulerError::Output)?;
     let force = matches!(cache_mode, CacheMode::Force);
     let (sender, receiver) = mpsc::channel::<(TaskNode, WorkerReport)>();
@@ -91,13 +92,16 @@ pub(crate) fn execute_plan(
     let mut cacheable = BTreeMap::<TaskNode, bool>::new();
     let mut cache_error = None;
     let mut output_error = None;
-    let mut stopping = false;
+    let mut stopping = cancellation.is_cancelled();
 
     while !active.is_empty()
         || (!ready.is_empty() && (!stopping || has_ready_finalizer(&ready, &tasks)))
     {
         assert!(active.len() <= jobs, "scheduler exceeded its worker limit");
         while active.len() < jobs {
+            if cancellation.is_cancelled() {
+                stopping = true;
+            }
             let finalizers_allowed = if stopping {
                 !active.iter().any(|node| {
                     !tasks
@@ -165,6 +169,8 @@ pub(crate) fn execute_plan(
                     force,
                     dependency_keys,
                     runner: runner.clone(),
+                    cancellation: cancellation.clone(),
+                    output: Arc::clone(output),
                 })
                 .expect("worker pool remains alive while tasks are dispatched");
             active.insert(node);
@@ -216,6 +222,11 @@ pub(crate) fn execute_plan(
                         }
                     }
                 }
+                continue;
+            }
+            WorkerReport::OutputFailed(error) => {
+                output_error = Some(error);
+                stopping = true;
                 continue;
             }
         };
@@ -284,7 +295,11 @@ pub(crate) fn execute_plan(
                     .map_err(SchedulerError::Output)?;
             }
             Err(error) => {
-                summary.failed += 1;
+                if matches!(error, RunnerError::Cancelled(_)) {
+                    summary.cancelled += 1;
+                } else {
+                    summary.failed += 1;
+                }
                 output
                     .present_failure(&node, &error)
                     .map_err(SchedulerError::Output)?;
@@ -293,7 +308,7 @@ pub(crate) fn execute_plan(
         }
     }
     assert_eq!(
-        summary.completed + summary.cached + summary.failed + summary.blocked,
+        summary.completed + summary.cached + summary.failed + summary.cancelled + summary.blocked,
         plan.len(),
         "scheduler result accounting must cover the entire plan"
     );
@@ -319,6 +334,9 @@ pub(crate) fn execute_plan(
     output
         .present_run_finished(&summary)
         .map_err(SchedulerError::Output)?;
+    if cancellation.is_cancelled() && summary.cancelled == 0 && summary.blocked > 0 {
+        return Err(SchedulerError::Cancelled);
+    }
     Ok(summary)
 }
 
@@ -373,6 +391,8 @@ struct WorkerJob {
     force: bool,
     dependency_keys: Vec<String>,
     runner: Runner,
+    cancellation: CancellationToken,
+    output: Arc<OutputSink>,
 }
 
 fn worker_loop(
@@ -409,6 +429,8 @@ fn execute_task(job: WorkerJob) -> WorkerReport {
         force,
         dependency_keys,
         runner,
+        cancellation,
+        output,
     } = job;
     let mut key = None;
     if can_cache {
@@ -437,8 +459,28 @@ fn execute_task(job: WorkerJob) -> WorkerReport {
     }
 
     let mut attempt = 0;
+    let output_callback = if output.is_live() {
+        let output = Arc::clone(&output);
+        let node = task.node();
+        Some(Arc::new(move |stream, bytes: &[u8]| {
+            let stream = if stream == "stderr" {
+                crate::events::TaskStream::Stderr
+            } else {
+                crate::events::TaskStream::Stdout
+            };
+            output.present_live_output(&node, stream, bytes.to_vec())
+        }) as crate::runner::OutputCallback)
+    } else {
+        None
+    };
     let result = loop {
-        match runner.run(&root, &task) {
+        if let Err(error) =
+            output.present_attempt(&task.node(), attempt + 1, task.retries().saturating_add(1))
+        {
+            return WorkerReport::OutputFailed(error);
+        }
+        let task_cancellation = (!task.is_finalizer()).then_some(&cancellation);
+        match runner.run_with_options(&root, &task, task_cancellation, output_callback.clone()) {
             Ok(result) => break Ok(result),
             Err(_error) if attempt < task.retries() => {
                 attempt += 1;
@@ -481,6 +523,8 @@ enum WorkerReport {
     },
     /// Cache state could not be computed or read, so the task never started.
     CacheFailed(CacheError),
+    /// The output renderer failed before the task attempt could start.
+    OutputFailed(std::io::Error),
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -488,6 +532,7 @@ pub(crate) struct ExecutionSummary {
     pub(crate) completed: usize,
     pub(crate) cached: usize,
     pub(crate) failed: usize,
+    pub(crate) cancelled: usize,
     pub(crate) blocked: usize,
 }
 
@@ -500,6 +545,7 @@ pub enum SchedulerError {
         dependency: TaskNode,
     },
     NoReadyWork,
+    Cancelled,
     Output(std::io::Error),
 }
 
@@ -514,6 +560,7 @@ impl fmt::Display for SchedulerError {
                 dependency.id, task.id
             ),
             Self::NoReadyWork => write!(f, "scheduler found no ready task in the execution plan"),
+            Self::Cancelled => f.write_str("execution was cancelled"),
             Self::Output(error) => write!(f, "could not write task output: {error}"),
         }
     }
@@ -524,7 +571,7 @@ impl StdError for SchedulerError {
         match self {
             Self::Task(error) => Some(error.as_ref()),
             Self::Cache(error) => Some(error),
-            Self::UnresolvedDependency { .. } | Self::NoReadyWork => None,
+            Self::UnresolvedDependency { .. } | Self::NoReadyWork | Self::Cancelled => None,
             Self::Output(error) => Some(error),
         }
     }

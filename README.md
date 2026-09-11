@@ -78,8 +78,9 @@ mono --dir services/api task api-test
 | `mono changelog ...` | Apply Mono's documented changelog conventions. |
 | `mono release ...` | Create or verify provider-neutral artifact metadata. |
 
-All commands accept the global `--output terminal|json|github-actions` option.
-Terminal output is intended for people, while JSON output is a versioned,
+All commands accept the global `--output terminal|live|json|github-actions` option.
+Terminal output is buffered for deterministic presentation, while `live` streams
+raw task output as it arrives. JSON output is a versioned,
 newline-delimited machine contract. `run` and `task` additionally emit
 execution lifecycle events (`run_started`, `task_started`, `task_output`,
 `task_finished`, and `run_finished`). `plan`, `graph`, `list`, and `check`
@@ -97,7 +98,7 @@ reported.
 | `--dry-run` | Resolve and print the plan without running commands. |
 | `--no-cache` | Skip cache reads and writes. |
 | `--force` | Ignore cache hits and refresh successful entries. |
-| `--output terminal\|json\|github-actions` | Select the output contract. |
+| `--output terminal\|live\|json\|github-actions` | Select the output contract. |
 
 ## Manifest model
 
@@ -146,6 +147,7 @@ Task fields:
 | `depends_on` | `[]` | Global task IDs that must complete first. |
 | `cwd` | project root | Existing directory inside the project root. |
 | `env` | `{}` | Extra child-process environment. |
+| `stdin` | `null` | Use `inherit` to pass the parent process's standard input through. |
 | `cache` | `false` | Allow successful results to be reused. |
 | `inputs` | `[]` | Relative patterns included in the cache fingerprint. |
 | `outputs` | `[]` | Relative files copied into and restored from the cache. |
@@ -166,7 +168,8 @@ Task fields:
 - A normal task failure stops new normal work. In-flight tasks finish, then pipeline finalizers run as cleanup work.
 - Finalizers are not cacheable because a cache hit must not skip cleanup side effects.
 - Timeouts terminate the complete child process tree using Unix process groups or Windows Job Objects.
-- Output is captured and presented in deterministic plan order. JSON output is newline-delimited and preserves non-UTF-8 task output as byte arrays.
+- Output is captured and presented in deterministic plan order by default. `live` streams task bytes while preserving lifecycle summaries. JSON output is newline-delimited and preserves non-UTF-8 task output as byte arrays.
+- Ctrl-C cancels running normal tasks, terminates their process trees, and still permits finalizer tasks to run.
 - Direct execution never changes Mono's process-global working directory.
 
 ## Release conventions

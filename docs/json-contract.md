@@ -20,18 +20,20 @@ monotonically increasing `sequence` order. `run_id` identifies one invocation.
 ```json
 {"run_id":123,"sequence":0,"event":"run_started","schema":1,"project":"/repo","task_count":2}
 {"run_id":123,"sequence":1,"event":"task_started","schema":1,"task":"build"}
-{"run_id":123,"sequence":2,"event":"task_output","schema":1,"task":"build","stream":"stdout","bytes":[111,107,10]}
-{"run_id":123,"sequence":3,"event":"task_finished","schema":1,"task":"build","status":"completed","elapsed_ms":12}
-{"run_id":123,"sequence":4,"event":"run_finished","schema":1,"completed":1,"cached":0,"failed":0,"blocked":0}
+{"run_id":123,"sequence":2,"event":"task_attempt_started","schema":1,"task":"build","attempt":1,"max_attempts":2}
+{"run_id":123,"sequence":3,"event":"task_output","schema":1,"task":"build","stream":"stdout","bytes":[111,107,10]}
+{"run_id":123,"sequence":4,"event":"task_finished","schema":1,"task":"build","status":"completed","elapsed_ms":12}
+{"run_id":123,"sequence":5,"event":"run_finished","schema":1,"completed":1,"cached":0,"failed":0,"cancelled":0,"blocked":0}
 ```
 
 Event meanings:
 
 - `run_started`: the validated plan is about to execute;
 - `task_started`: a task was dispatched;
+- `task_attempt_started`: one actual process invocation began; retries emit another event;
 - `task_output`: captured output, represented as bytes so non-UTF-8 output is preserved;
-- `task_finished`: one of `completed`, `cached`, `failed`, `timed_out`, `output_limit`, or `blocked`;
-- `run_finished`: final task counts.
+- `task_finished`: one of `completed`, `cached`, `failed`, `timed_out`, `output_limit`, `cancelled`, or `blocked`;
+- `run_finished`: final task counts, including `cancelled`.
 
 Task output is emitted before its `task_finished` event. Concurrent tasks may
 finish in any order, but `sequence` is always increasing and presentation is
@@ -61,7 +63,8 @@ serialized by Mono.
       "retry_backoff_seconds": 0,
       "finalizer": false,
       "depends_on": ["build"],
-      "env": ["MODE"]
+      "env": ["MODE"],
+      "stdin": "null"
     }
   ]
 }
@@ -110,6 +113,11 @@ A successful `mono check --output json` returns:
 ```
 
 ## Errors
+
+A successful non-execution command in JSON mode is one document with `schema`,
+`kind`, `status: "ok"`, and a human-readable `message`. Examples include
+`init`, `cache_clean`, `changelog_validate`, `release_manifest`, and
+`release_verify`.
 
 A command failure in JSON mode is one JSON document on stdout:
 

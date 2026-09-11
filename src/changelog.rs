@@ -164,42 +164,46 @@ impl Changelog {
     }
 
     fn validate(&self) -> Result<(), String> {
-        for entry in &self.entries {
-            let Heading::Version(version) = entry.heading else {
-                continue;
-            };
-            match entry.body.lines().find(|line| !line.trim().is_empty()) {
-                None => {
-                    return Err(format!(
-                        "entry `## {version}` is empty; it must start with `Released: <yyyy-mm-dd>`"
-                    ));
-                }
-                Some(line) if !line.starts_with("Released: ") => {
-                    return Err(format!(
-                        "entry `## {version}` must start with `Released: <yyyy-mm-dd>`, found `{line}`"
-                    ));
-                }
-                Some(_) => {}
-            }
-        }
+        let mut previous_version = None;
+        let mut unreleased_seen = false;
 
-        let mut previous = None;
-        for entry in &self.entries {
+        for (index, entry) in self.entries.iter().enumerate() {
             match entry.heading {
                 Heading::Version(version) => {
-                    if let Some(previous) = previous
+                    match entry.body.lines().find(|line| !line.trim().is_empty()) {
+                        None => {
+                            return Err(format!(
+                                "entry `## {version}` is empty; it must start with `Released: <yyyy-mm-dd>`"
+                            ));
+                        }
+                        Some(line) if !valid_release_line(line) => {
+                            return Err(format!(
+                                "entry `## {version}` must start with `Released: <yyyy-mm-dd>` with a valid date, found `{line}`"
+                            ));
+                        }
+                        Some(_) => {}
+                    }
+
+                    if let Some(previous) = previous_version
                         && version >= previous
                     {
                         return Err(format!(
                             "entries must be newest first: `## {version}` appears after `## {previous}`"
                         ));
                     }
-                    previous = Some(version);
+                    previous_version = Some(version);
                 }
-                Heading::Unreleased if previous.is_some() => {
-                    return Err("`## (unreleased)` must be the newest entry".to_owned());
+                Heading::Unreleased => {
+                    if unreleased_seen {
+                        return Err(
+                            "the changelog may contain only one `## (unreleased)` entry".to_owned()
+                        );
+                    }
+                    if index != 0 {
+                        return Err("`## (unreleased)` must be the newest entry".to_owned());
+                    }
+                    unreleased_seen = true;
                 }
-                Heading::Unreleased => {}
             }
         }
         Ok(())
@@ -264,6 +268,46 @@ impl Changelog {
         }
         text
     }
+}
+
+fn valid_release_line(line: &str) -> bool {
+    let Some(date) = line.strip_prefix("Released: ") else {
+        return false;
+    };
+    valid_date(date)
+}
+
+fn valid_date(date: &str) -> bool {
+    let bytes = date.as_bytes();
+    if bytes.len() != 10
+        || bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || !bytes
+            .iter()
+            .enumerate()
+            .all(|(index, byte)| matches!(index, 4 | 7) || byte.is_ascii_digit())
+    {
+        return false;
+    }
+
+    let year = date[0..4].parse::<u32>().ok();
+    let month = date[5..7].parse::<u32>().ok();
+    let day = date[8..10].parse::<u32>().ok();
+    let (Some(year), Some(month), Some(day)) = (year, month, day) else {
+        return false;
+    };
+    if !(1..=12).contains(&month) || day == 0 {
+        return false;
+    }
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let days_in_month = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => unreachable!("month was validated above"),
+    };
+    day <= days_in_month
 }
 
 fn new_entry_body(date: &str, bullets: &[String]) -> String {
@@ -351,5 +395,23 @@ mod tests {
         assert!(Version::parse("01.2.3").is_none());
         assert!(Version::parse("1.2").is_none());
         assert!(Version::parse("1.2.x").is_none());
+    }
+
+    #[test]
+    fn release_dates_are_real_iso_dates() {
+        assert!(valid_date("2026-09-11"));
+        assert!(valid_date("2024-02-29"));
+        assert!(!valid_date("2023-02-29"));
+        assert!(!valid_date("2026-04-31"));
+        assert!(!valid_date("2026-9-11"));
+    }
+
+    #[test]
+    fn rejects_duplicate_unreleased_entries() {
+        let error = Changelog::parse(
+            "# Changelog\n\n## (unreleased)\n\nPending.\n\n## (unreleased)\n\nMore pending.\n",
+        )
+        .unwrap_err();
+        assert!(error.contains("only one"));
     }
 }

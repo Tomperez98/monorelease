@@ -5,13 +5,14 @@ use std::fmt;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::config::StdinMode;
 use crate::process::{ManagedChild, WaitResult};
-use crate::workspace::PlannedTask;
+use crate::project::PlannedTask;
 
 /// First wait between child-status polls. Short tasks finish after one or two
 /// of these instead of stalling for a fixed interval.
@@ -35,6 +36,26 @@ pub struct TaskResult {
     pub cached: bool,
 }
 
+/// A cancellation signal shared by the scheduler and running task processes.
+#[derive(Clone, Debug, Default)]
+pub struct CancellationToken(Arc<AtomicBool>);
+
+impl CancellationToken {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn cancel(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+}
+
+pub(crate) type OutputCallback = Arc<dyn Fn(&'static str, &[u8]) -> io::Result<()> + Send + Sync>;
+
 /// Executes root-project tasks without changing the process-global working directory.
 #[derive(Debug, Clone, Default)]
 pub struct Runner;
@@ -45,11 +66,31 @@ impl Runner {
     }
 
     /// Execute one planned task and return its output and timing.
+    #[allow(dead_code)]
     pub fn run(
         &self,
-        workspace_root: &Path,
+        project_root: &Path,
         planned: &PlannedTask,
     ) -> Result<TaskResult, RunnerError> {
+        self.run_with_options(project_root, planned, None, None)
+    }
+
+    pub(crate) fn run_with_options(
+        &self,
+        project_root: &Path,
+        planned: &PlannedTask,
+        cancellation: Option<&CancellationToken>,
+        output_callback: Option<OutputCallback>,
+    ) -> Result<TaskResult, RunnerError> {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return Err(RunnerError::Cancelled(Box::new(CancelledTask {
+                project: planned.project().to_owned(),
+                task: planned.task().to_owned(),
+                output: CapturedOutput::default(),
+                elapsed: Duration::ZERO,
+            })));
+        }
+
         let (program, args) =
             planned
                 .command()
@@ -60,7 +101,7 @@ impl Runner {
                 })?;
         assert!(planned.timeout() > Duration::ZERO);
         assert!(planned.max_output_bytes() > 0);
-        assert!(planned.root().starts_with(workspace_root));
+        assert!(planned.root().starts_with(project_root));
         assert!(planned.cwd().is_absolute());
         assert!(planned.cwd().starts_with(planned.root()));
 
@@ -70,7 +111,10 @@ impl Runner {
             .args(args)
             .current_dir(planned.cwd())
             .envs(planned.env())
-            .stdin(Stdio::null())
+            .stdin(match planned.stdin() {
+                StdinMode::Null => Stdio::null(),
+                StdinMode::Inherit => Stdio::inherit(),
+            })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
@@ -94,18 +138,21 @@ impl Runner {
         let reader_done = Arc::new(AtomicU8::new(0));
         let stdout_reader = {
             let limit_sender = limit_sender.clone();
+            let callback = output_callback.clone();
             let done = Arc::clone(&reader_done);
             thread::spawn(move || {
-                let result = read_stream(stdout, output_limit, "stdout", limit_sender);
+                let result = read_stream(stdout, output_limit, "stdout", limit_sender, callback);
                 done.fetch_add(1, Ordering::Release);
                 result
             })
         };
         let stderr_reader = {
             let limit_sender_clone = limit_sender.clone();
+            let callback = output_callback;
             let done = Arc::clone(&reader_done);
             thread::spawn(move || {
-                let result = read_stream(stderr, output_limit, "stderr", limit_sender_clone);
+                let result =
+                    read_stream(stderr, output_limit, "stderr", limit_sender_clone, callback);
                 done.fetch_add(1, Ordering::Release);
                 result
             })
@@ -120,6 +167,32 @@ impl Runner {
             // Check stream-limit notification before checking child status
             // so overflow is detected even when the notification arrives
             // between polls.
+            if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                terminate_tree(
+                    &mut managed,
+                    planned.project(),
+                    planned.task(),
+                    "cancellation",
+                )?;
+                managed.wait().map_err(|source| RunnerError::Wait {
+                    project: planned.project().to_owned(),
+                    task: planned.task().to_owned(),
+                    source,
+                })?;
+                let output = join_output(
+                    planned.project(),
+                    planned.task(),
+                    stdout_reader,
+                    stderr_reader,
+                )?
+                .output;
+                return Err(RunnerError::Cancelled(Box::new(CancelledTask {
+                    project: planned.project().to_owned(),
+                    task: planned.task().to_owned(),
+                    output,
+                    elapsed: started.elapsed(),
+                })));
+            }
             if exceeded_stream.is_none()
                 && let Ok(stream) = limit_receiver.try_recv()
             {
@@ -291,6 +364,7 @@ fn read_stream(
     limit: usize,
     stream_name: &'static str,
     limit_sender: mpsc::Sender<&'static str>,
+    output_callback: Option<OutputCallback>,
 ) -> io::Result<StreamCapture> {
     let mut output = Vec::with_capacity(limit.min(8192));
     let mut buffer = [0u8; 8192];
@@ -304,6 +378,10 @@ fn read_stream(
             continue;
         }
         let remaining = limit.saturating_sub(output.len());
+        let visible = read.min(remaining);
+        if let Some(callback) = output_callback.as_ref() {
+            callback(stream_name, &buffer[..visible])?;
+        }
         if read > remaining {
             output.extend_from_slice(&buffer[..remaining]);
             exceeded = true;
@@ -389,6 +467,14 @@ pub struct OutputLimitTask {
     elapsed: Duration,
 }
 
+#[derive(Debug)]
+pub struct CancelledTask {
+    project: String,
+    task: String,
+    output: CapturedOutput,
+    elapsed: Duration,
+}
+
 /// Expected failures while spawning or executing a project task.
 #[derive(Debug)]
 pub enum RunnerError {
@@ -421,6 +507,7 @@ pub enum RunnerError {
         source: io::Error,
     },
     OutputLimit(Box<OutputLimitTask>),
+    Cancelled(Box<CancelledTask>),
     Failed(Box<FailedTask>),
     TimedOut(Box<TimedOutTask>),
 }
@@ -431,6 +518,7 @@ impl RunnerError {
             Self::Failed(details) => Some(&details.output),
             Self::TimedOut(details) => Some(&details.output),
             Self::OutputLimit(details) => Some(&details.output),
+            Self::Cancelled(details) => Some(&details.output),
             Self::EmptyCommand { .. }
             | Self::Spawn { .. }
             | Self::Wait { .. }
@@ -444,6 +532,7 @@ impl RunnerError {
             Self::Failed(details) => Some(details.elapsed),
             Self::TimedOut(details) => Some(details.elapsed),
             Self::OutputLimit(details) => Some(details.elapsed),
+            Self::Cancelled(details) => Some(details.elapsed),
             Self::EmptyCommand { .. }
             | Self::Spawn { .. }
             | Self::Wait { .. }
@@ -496,6 +585,9 @@ impl fmt::Display for RunnerError {
                 "{}/{} exceeded the {} output limit of {} bytes",
                 details.project, details.task, details.stream, details.limit
             ),
+            Self::Cancelled(details) => {
+                write!(f, "{}/{} was cancelled", details.project, details.task)
+            }
             Self::Failed(details) => write!(
                 f,
                 "{}/{} ({}) failed in {} with exit status {}",
@@ -555,11 +647,11 @@ pub fn format_command(command: &[String]) -> String {
 mod tests {
     use super::*;
     use crate::config::config_path;
+    use crate::project::Project;
     use crate::testing::TempDir;
-    use crate::workspace::Workspace;
     use std::fs;
 
-    fn workspace_with_task(command: &str, timeout_seconds: Option<u64>) -> (TempDir, Workspace) {
+    fn project_with_task(command: &str, timeout_seconds: Option<u64>) -> (TempDir, Project) {
         let temp = TempDir::new();
         let timeout = timeout_seconds
             .map(|seconds| format!("timeout_seconds = {seconds}\n"))
@@ -569,17 +661,17 @@ mod tests {
             format!("[project]\nname = \"fixture\"\n\n[pipelines.ci]\ntasks = [\"build\"]\n\n[tasks.build]\ncommand = [\"sh\", \"-c\", \"{command}\"]\n{timeout}"),
         )
         .expect("write project manifest");
-        let project = Workspace::load(temp.path()).expect("project loads");
+        let project = Project::load(temp.path()).expect("project loads");
         (temp, project)
     }
 
     #[cfg(unix)]
     #[test]
     fn runs_a_task_and_returns_captured_output_without_printing() {
-        let (_temp, workspace) = workspace_with_task("printf stdout; printf stderr >&2", None);
-        let plan = workspace.plan(None, &[]).expect("plan succeeds");
+        let (_temp, project) = project_with_task("printf stdout; printf stderr >&2", None);
+        let plan = project.plan(None, &[]).expect("plan succeeds");
         let result = Runner::new()
-            .run(&workspace.root, &plan[0])
+            .run(&project.root, &plan[0])
             .expect("task succeeds");
 
         assert_eq!(result.output.stdout, b"stdout");
@@ -589,13 +681,13 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn returns_failed_task_output_for_the_presenter() {
-        let (_temp, workspace) = workspace_with_task("printf failed >&2; exit 7", None);
-        let plan = workspace.plan(None, &[]).expect("plan succeeds");
+        let (_temp, project) = project_with_task("printf failed >&2; exit 7", None);
+        let plan = project.plan(None, &[]).expect("plan succeeds");
         let error = Runner::new()
-            .run(&workspace.root, &plan[0])
+            .run(&project.root, &plan[0])
             .expect_err("task must fail");
 
-        assert!(error.to_string().contains("project/build"));
+        assert!(error.to_string().contains("fixture/build"));
         assert_eq!(
             error.output().expect("failed output is captured").stderr,
             b"failed"
@@ -605,10 +697,10 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn terminates_a_task_that_exceeds_its_timeout() {
-        let (_temp, workspace) = workspace_with_task("sleep 2", Some(1));
-        let plan = workspace.plan(None, &[]).expect("plan succeeds");
+        let (_temp, project) = project_with_task("sleep 2", Some(1));
+        let plan = project.plan(None, &[]).expect("plan succeeds");
         let error = Runner::new()
-            .run(&workspace.root, &plan[0])
+            .run(&project.root, &plan[0])
             .expect_err("task must time out");
 
         assert!(matches!(error, RunnerError::TimedOut(_)));
@@ -617,18 +709,37 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn cancellation_terminates_a_running_task() {
+        let (_temp, project) = project_with_task("sleep 5", None);
+        let plan = project.plan(None, &[]).expect("plan succeeds");
+        let cancellation = CancellationToken::new();
+        let signal = cancellation.clone();
+        let thread = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            signal.cancel();
+        });
+
+        let error = Runner::new()
+            .run_with_options(&project.root, &plan[0], Some(&cancellation), None)
+            .expect_err("task must be cancelled");
+        thread.join().expect("cancellation thread joins");
+        assert!(matches!(error, RunnerError::Cancelled(_)));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn timeout_terminates_descendants_before_their_delayed_write() {
         let temp = TempDir::new();
         let marker = temp.path().join("descendant-finished");
         let marker_text = marker.to_string_lossy();
-        let (_temp, workspace) = workspace_with_task(
+        let (_temp, project) = project_with_task(
             &format!("(sleep 5; printf leaked > '{marker_text}') & wait"),
             Some(1),
         );
-        let plan = workspace.plan(None, &[]).expect("plan succeeds");
+        let plan = project.plan(None, &[]).expect("plan succeeds");
 
         let error = Runner::new()
-            .run(&workspace.root, &plan[0])
+            .run(&project.root, &plan[0])
             .expect_err("task must time out");
         assert!(matches!(error, RunnerError::TimedOut(_)));
 
@@ -649,15 +760,15 @@ mod tests {
         // completes without touching it, and a normal successful exit must
         // not terminate its tree.  Only timeout and output-limit paths
         // terminate trees.
-        let (_temp, workspace) = workspace_with_task(
+        let (_temp, project) = project_with_task(
             &format!(
                 "exec 1>&- 2>&-; (sleep 3; printf leaked > '{marker_text}') </dev/null >/dev/null 2>&1 & sleep 0.5; exit 0"
             ),
             None,
         );
-        let plan = workspace.plan(None, &[]).expect("plan succeeds");
+        let plan = project.plan(None, &[]).expect("plan succeeds");
         Runner::new()
-            .run(&workspace.root, &plan[0])
+            .run(&project.root, &plan[0])
             .expect("task succeeds");
 
         std::thread::sleep(std::time::Duration::from_secs(4));
@@ -670,15 +781,15 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn stops_and_reports_when_task_output_exceeds_the_limit() {
-        let (_temp, mut workspace) = workspace_with_task("printf 123456789", None);
-        workspace
+        let (_temp, mut project) = project_with_task("printf 123456789", None);
+        project
             .tasks
             .get_mut("build")
             .expect("fixture task exists")
             .max_output_bytes = 8;
-        let plan = workspace.plan(None, &[]).expect("plan succeeds");
+        let plan = project.plan(None, &[]).expect("plan succeeds");
         let error = Runner::new()
-            .run(&workspace.root, &plan[0])
+            .run(&project.root, &plan[0])
             .expect_err("task output must be bounded");
 
         assert!(matches!(error, RunnerError::OutputLimit(_)));
@@ -717,10 +828,10 @@ mod tests {
         )
         .expect("write manifest");
 
-        let workspace = Workspace::load(temp.path()).expect("workspace loads");
-        let plan = workspace.plan(None, &[]).expect("plan succeeds");
+        let project = Project::load(temp.path()).expect("project loads");
+        let plan = project.plan(None, &[]).expect("plan succeeds");
         Runner::new()
-            .run(&workspace.root, &plan[0])
+            .run(&project.root, &plan[0])
             .expect("task succeeds");
 
         std::thread::sleep(std::time::Duration::from_secs(6));

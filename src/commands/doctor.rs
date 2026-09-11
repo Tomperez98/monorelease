@@ -4,24 +4,24 @@ use std::error::Error as StdError;
 use std::fmt;
 use std::path::Path;
 
-use crate::workspace::{Workspace, WorkspaceError};
+use crate::project::{Project, ProjectError};
 
 /// Validate that `dir` resolves to a healthy root-project manifest.
 pub fn doctor(dir: &Path) -> Result<(), DoctorError> {
-    Workspace::load(dir)?;
+    Project::load(dir)?;
     Ok(())
 }
 
 /// Expected failures of [`doctor`].
 #[derive(Debug)]
 pub enum DoctorError {
-    Workspace(WorkspaceError),
+    Project(ProjectError),
 }
 
 impl fmt::Display for DoctorError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Workspace(error) => error.fmt(f),
+            Self::Project(error) => error.fmt(f),
         }
     }
 }
@@ -29,14 +29,14 @@ impl fmt::Display for DoctorError {
 impl StdError for DoctorError {
     fn source(&self) -> Option<&(dyn StdError + 'static)> {
         match self {
-            Self::Workspace(error) => Some(error),
+            Self::Project(error) => Some(error),
         }
     }
 }
 
-impl From<WorkspaceError> for DoctorError {
-    fn from(error: WorkspaceError) -> Self {
-        Self::Workspace(error)
+impl From<ProjectError> for DoctorError {
+    fn from(error: ProjectError) -> Self {
+        Self::Project(error)
     }
 }
 

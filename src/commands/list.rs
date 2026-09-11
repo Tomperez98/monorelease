@@ -5,15 +5,15 @@ use std::fmt;
 use std::path::Path;
 
 use crate::output::OutputMode;
+use crate::project::{Project, ProjectError};
 use crate::runner::format_command;
-use crate::workspace::{Workspace, WorkspaceError};
 
 pub fn list(path: &Path) -> Result<String, ListError> {
     list_with_output(path, OutputMode::Terminal)
 }
 
 pub fn list_with_output(path: &Path, output_mode: OutputMode) -> Result<String, ListError> {
-    let project = Workspace::load(path)?;
+    let project = Project::load(path)?;
     if output_mode == OutputMode::Json {
         return serde_json::to_string(&ListDocument::from(&project))
             .map_err(|source| ListError::Json { source });
@@ -67,10 +67,11 @@ struct ListPipeline<'a> {
 struct ListTask<'a> {
     id: &'a str,
     command: &'a [String],
+    stdin: &'static str,
 }
 
-impl<'a> From<&'a Workspace> for ListDocument<'a> {
-    fn from(project: &'a Workspace) -> Self {
+impl<'a> From<&'a Project> for ListDocument<'a> {
+    fn from(project: &'a Project) -> Self {
         Self {
             schema: crate::events::EXECUTION_EVENT_SCHEMA,
             kind: "list",
@@ -92,6 +93,7 @@ impl<'a> From<&'a Workspace> for ListDocument<'a> {
                 .map(|(id, task)| ListTask {
                     id,
                     command: &task.command,
+                    stdin: task.stdin.as_str(),
                 })
                 .collect(),
         }
@@ -100,14 +102,14 @@ impl<'a> From<&'a Workspace> for ListDocument<'a> {
 
 #[derive(Debug)]
 pub enum ListError {
-    Workspace(WorkspaceError),
+    Project(ProjectError),
     Json { source: serde_json::Error },
 }
 
 impl fmt::Display for ListError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Workspace(error) => error.fmt(f),
+            Self::Project(error) => error.fmt(f),
             Self::Json { source } => write!(f, "could not serialize list output: {source}"),
         }
     }
@@ -116,14 +118,14 @@ impl fmt::Display for ListError {
 impl StdError for ListError {
     fn source(&self) -> Option<&(dyn StdError + 'static)> {
         match self {
-            Self::Workspace(error) => Some(error),
+            Self::Project(error) => Some(error),
             Self::Json { source } => Some(source),
         }
     }
 }
 
-impl From<WorkspaceError> for ListError {
-    fn from(error: WorkspaceError) -> Self {
-        Self::Workspace(error)
+impl From<ProjectError> for ListError {
+    fn from(error: ProjectError) -> Self {
+        Self::Project(error)
     }
 }

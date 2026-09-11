@@ -70,6 +70,24 @@ pub struct ProjectConfig {
     pub default_pipeline: String,
 }
 
+/// How a task receives standard input.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum StdinMode {
+    #[default]
+    Null,
+    Inherit,
+}
+
+impl StdinMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Null => "null",
+            Self::Inherit => "inherit",
+        }
+    }
+}
+
 /// A task command and orchestration metadata. Every path is relative to the
 /// project root unless the command itself receives an absolute value.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -82,6 +100,8 @@ pub struct TaskConfig {
     pub cwd: Option<String>,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+    #[serde(default)]
+    pub stdin: StdinMode,
     #[serde(default)]
     pub cache: bool,
     #[serde(default)]
@@ -178,7 +198,18 @@ mod tests {
 
         assert_eq!(parsed.tasks["build"].timeout_seconds, 600);
         assert_eq!(parsed.tasks["build"].max_output_bytes, 16 * 1024 * 1024);
+        assert_eq!(parsed.tasks["build"].stdin, StdinMode::Null);
         assert!(parsed.tasks["build"].depends_on.is_empty());
+    }
+
+    #[test]
+    fn task_can_inherit_standard_input() {
+        let parsed = MonoConfig::parse(
+            "[project]\nname = \"worker\"\n\n[tasks.login]\ncommand = [\"login\"]\nstdin = \"inherit\"\n",
+        )
+        .expect("project parses");
+
+        assert_eq!(parsed.tasks["login"].stdin, StdinMode::Inherit);
     }
 
     #[test]
@@ -188,7 +219,7 @@ mod tests {
     }
 
     #[test]
-    fn old_workspace_and_package_shapes_are_not_root_projects() {
+    fn non_project_manifest_shapes_are_rejected() {
         assert!(MonoConfig::parse("[workspace]\nname = \"repo\"\n").is_err());
         assert!(MonoConfig::parse("[package]\nname = \"app\"\n").is_err());
     }

@@ -4,7 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::config::{MonoConfig, config_path};
-use crate::workspace::{WorkspaceError, validate_schema};
+use crate::project::{ProjectError, validate_schema};
 
 #[derive(Debug)]
 pub(crate) struct DiscoveredRoot {
@@ -13,8 +13,8 @@ pub(crate) struct DiscoveredRoot {
 }
 
 /// Find the nearest root `mono.toml`, walking upward from `start`.
-pub(crate) fn find_root(start: &Path) -> Result<DiscoveredRoot, WorkspaceError> {
-    let start = fs::canonicalize(start).map_err(|source| WorkspaceError::Io {
+pub(crate) fn find_root(start: &Path) -> Result<DiscoveredRoot, ProjectError> {
+    let start = fs::canonicalize(start).map_err(|source| ProjectError::Io {
         path: start.to_path_buf(),
         source,
     })?;
@@ -40,17 +40,17 @@ pub(crate) fn find_root(start: &Path) -> Result<DiscoveredRoot, WorkspaceError> 
         }
     }
 
-    Err(WorkspaceError::MissingRoot {
+    Err(ProjectError::MissingRoot {
         start: start_for_error,
     })
 }
 
-pub(crate) fn read_manifest(path: &Path) -> Result<MonoConfig, WorkspaceError> {
-    let contents = fs::read_to_string(path).map_err(|source| WorkspaceError::Io {
+pub(crate) fn read_manifest(path: &Path) -> Result<MonoConfig, ProjectError> {
+    let contents = fs::read_to_string(path).map_err(|source| ProjectError::Io {
         path: path.to_path_buf(),
         source,
     })?;
-    MonoConfig::parse(&contents).map_err(|source| WorkspaceError::Parse {
+    MonoConfig::parse(&contents).map_err(|source| ProjectError::Parse {
         path: path.to_path_buf(),
         source,
     })

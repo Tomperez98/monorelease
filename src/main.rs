@@ -22,10 +22,11 @@ use std::process::ExitCode;
 use clap::builder::NonEmptyStringValueParser;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use mono::{
-    CacheMode, ChangelogError, CiError, DEFAULT_CHANGELOG_PATH, DEFAULT_RELEASE_DIRECTORY,
-    DEFAULT_RELEASE_NOTES_PATH, Error, InitError, OutputMode, PipelineExecution,
-    ReleaseCommandError, ReleaseError, ReleaseIdentity, SchedulerError, changelog_notes,
-    changelog_scaffold, changelog_validate, release_manifest, release_source, release_verify,
+    CacheMode, CancellationToken, ChangelogError, CiError, DEFAULT_CHANGELOG_PATH,
+    DEFAULT_RELEASE_DIRECTORY, DEFAULT_RELEASE_NOTES_PATH, Error, InitError, OutputMode,
+    PipelineExecution, ReleaseCommandError, ReleaseError, ReleaseIdentity, SchedulerError,
+    changelog_notes, changelog_scaffold, changelog_validate, release_manifest, release_source,
+    release_verify,
 };
 
 #[derive(Parser)]
@@ -54,6 +55,8 @@ enum OutputFormat {
     Json,
     #[value(name = "github-actions")]
     GithubActions,
+    #[value(name = "live")]
+    Live,
 }
 
 impl From<OutputFormat> for OutputMode {
@@ -62,6 +65,7 @@ impl From<OutputFormat> for OutputMode {
             OutputFormat::Terminal => Self::Terminal,
             OutputFormat::Json => Self::Json,
             OutputFormat::GithubActions => Self::GithubActions,
+            OutputFormat::Live => Self::Live,
         }
     }
 }
@@ -333,7 +337,16 @@ fn main() -> ExitCode {
     } = Cli::parse();
     let output = output.into();
 
-    let code = match run(root, output, command) {
+    let cancellation = CancellationToken::new();
+    if let Err(error) = ctrlc::set_handler({
+        let cancellation = cancellation.clone();
+        move || cancellation.cancel()
+    }) {
+        eprintln!("mono: could not install Ctrl-C handler: {error}");
+        return ExitCode::from(EXIT_TOOL);
+    }
+
+    let code = match run(root, output, command, cancellation) {
         Ok(summary) => emit_summary(&mut io::stdout().lock(), &summary),
         Err(error) if output == OutputMode::Json => {
             emit_error(&mut io::stdout().lock(), &error, output)
@@ -403,14 +416,14 @@ fn exit_code(error: &Error) -> u8 {
         Error::Release(ReleaseCommandError::Release(error)) => release_exit_code(error),
         // A project failure is a rejected request, not a failed tool.
         //
-        // `WorkspaceError::Io` is overloaded: it covers failing to read a
+        // `ProjectError::Io` is overloaded: it covers failing to read a
         // manifest *and* failing to resolve a directory the manifest declares,
         // such as a task `cwd`. The second is exactly the defect `mono
         // check` exists to report, so the variant cannot be split by exit code
         // here. A genuine environment failure surfaces as a write error, which
         // is classified in `init_exit_code`, `changelog_exit_code`, and
         // `release_exit_code`.
-        Error::Doctor(_) | Error::List(_) | Error::Ci(CiError::Workspace(_)) => EXIT_FAILED,
+        Error::Doctor(_) | Error::List(_) | Error::Ci(CiError::Project(_)) => EXIT_FAILED,
     }
 }
 
@@ -426,7 +439,7 @@ fn scheduler_exit_code(error: &SchedulerError) -> u8 {
     match error {
         // A task ran and reported failure. The pipeline being red is a result,
         // not a malfunction, so it is the caller's failure and not the tool's.
-        SchedulerError::Task(_) => EXIT_FAILED,
+        SchedulerError::Task(_) | SchedulerError::Cancelled => EXIT_FAILED,
         // The scheduler never got far enough to run the pipeline.
         SchedulerError::Cache(_)
         | SchedulerError::Output(_)
@@ -481,42 +494,63 @@ const NO_TASK_FILTER: &[String] = &[];
 ///
 /// Each subcommand owns a small helper below, so this match reads as a dispatch
 /// table and each helper documents the failure space it can surface.
-fn run(root: PathBuf, output: OutputMode, command: Option<Commands>) -> Result<String, Error> {
+fn run(
+    root: PathBuf,
+    output: OutputMode,
+    command: Option<Commands>,
+    cancellation: CancellationToken,
+) -> Result<String, Error> {
     match command {
-        None => run_default_pipeline(&root, output),
-        Some(Commands::Init) => run_init(&root),
+        None => run_default_pipeline(&root, output, cancellation),
+        Some(Commands::Init) => run_init(&root, output),
         Some(Commands::Run {
             pipeline,
             tasks,
             options,
-        }) => execute_pipeline(&root, pipeline.as_deref(), &tasks, options, output),
+        }) => execute_pipeline(
+            &root,
+            pipeline.as_deref(),
+            &tasks,
+            options,
+            output,
+            cancellation,
+        ),
         Some(Commands::Task { tasks, options }) => {
-            execute_pipeline(&root, None, &tasks, options, output)
+            execute_pipeline(&root, None, &tasks, options, output, cancellation)
         }
         Some(Commands::Check) => run_check(&root, output),
         Some(Commands::List) => run_list(&root, output),
         Some(Commands::Plan { pipeline }) => run_plan(&root, pipeline.as_deref(), output),
         Some(Commands::Graph { pipeline }) => run_graph(&root, pipeline.as_deref(), output),
-        Some(Commands::Cache { command }) => run_cache(&root, command),
-        Some(Commands::Changelog { command }) => run_changelog(&root, command),
-        Some(Commands::Release { command }) => run_release(&root, command),
+        Some(Commands::Cache { command }) => run_cache(&root, command, output),
+        Some(Commands::Changelog { command }) => run_changelog(&root, command, output),
+        Some(Commands::Release { command }) => run_release(&root, command, output),
     }
 }
 
 /// Run the default pipeline when no subcommand is given.
-fn run_default_pipeline(root: &Path, output: OutputMode) -> Result<String, Error> {
+fn run_default_pipeline(
+    root: &Path,
+    output: OutputMode,
+    cancellation: CancellationToken,
+) -> Result<String, Error> {
     execute_pipeline(
         root,
         None,
         NO_TASK_FILTER,
         ExecutionOptions::default(),
         output,
+        cancellation,
     )
 }
 
-fn run_init(root: &Path) -> Result<String, Error> {
+fn run_init(root: &Path, output: OutputMode) -> Result<String, Error> {
     let written = mono::init(root)?;
-    Ok(format!("initialized {}", written.display()))
+    Ok(success_document(
+        output,
+        "init",
+        format!("initialized {}", written.display()),
+    ))
 }
 
 /// Run one pipeline or task selection with the parsed execution options.
@@ -526,6 +560,7 @@ fn execute_pipeline(
     tasks: &[String],
     options: ExecutionOptions,
     output: OutputMode,
+    cancellation: CancellationToken,
 ) -> Result<String, Error> {
     Ok(mono::run_pipeline_with_mode(
         root,
@@ -536,12 +571,13 @@ fn execute_pipeline(
         PipelineExecution {
             cache: cache_mode(options.no_cache, options.force),
             output,
+            cancellation,
         },
     )?)
 }
 
 fn run_check(root: &Path, output: OutputMode) -> Result<String, Error> {
-    let project = mono::Workspace::load(root).map_err(mono::DoctorError::from)?;
+    let project = mono::Project::load(root).map_err(mono::DoctorError::from)?;
     if output == OutputMode::Json {
         Ok(format!(
             "{{\"schema\":{},\"kind\":\"check\",\"status\":\"ok\",\"project\":{}}}",
@@ -576,35 +612,52 @@ fn run_graph(root: &Path, pipeline: Option<&str>, output: OutputMode) -> Result<
     )?)
 }
 
-fn run_cache(root: &Path, command: CacheCommands) -> Result<String, Error> {
+fn run_cache(root: &Path, command: CacheCommands, output: OutputMode) -> Result<String, Error> {
     match command {
-        CacheCommands::Clean => Ok(mono::clean_cache(root)?),
+        CacheCommands::Clean => Ok(success_document(
+            output,
+            "cache_clean",
+            mono::clean_cache(root)?,
+        )),
     }
 }
 
-fn run_changelog(root: &Path, command: ChangelogCommands) -> Result<String, Error> {
-    match command {
-        ChangelogCommands::Validate { file } => Ok(changelog_validate(&resolve_path(root, file))?),
-        ChangelogCommands::Scaffold { version, file } => {
-            Ok(changelog_scaffold(&resolve_path(root, file), &version)?)
-        }
+fn run_changelog(
+    root: &Path,
+    command: ChangelogCommands,
+    output: OutputMode,
+) -> Result<String, Error> {
+    let (kind, message) = match command {
+        ChangelogCommands::Validate { file } => (
+            "changelog_validate",
+            changelog_validate(&resolve_path(root, file))?,
+        ),
+        ChangelogCommands::Scaffold { version, file } => (
+            "changelog_scaffold",
+            changelog_scaffold(&resolve_path(root, file), &version)?,
+        ),
         ChangelogCommands::Notes {
             version,
             file,
             output_file,
-        } => Ok(changelog_notes(
-            &resolve_path(root, file),
-            &version,
-            &resolve_path(root, output_file),
-        )?),
-    }
+        } => (
+            "changelog_notes",
+            changelog_notes(
+                &resolve_path(root, file),
+                &version,
+                &resolve_path(root, output_file),
+            )?,
+        ),
+    };
+    Ok(success_document(output, kind, message))
 }
 
-fn run_release(root: &Path, command: ReleaseCommands) -> Result<String, Error> {
-    match command {
-        ReleaseCommands::Source { identity } => {
-            Ok(release_source(root, &identity.tag, &identity.commit)?)
-        }
+fn run_release(root: &Path, command: ReleaseCommands, output: OutputMode) -> Result<String, Error> {
+    let (kind, message) = match command {
+        ReleaseCommands::Source { identity } => (
+            "release_source",
+            release_source(root, &identity.tag, &identity.commit)?,
+        ),
         ReleaseCommands::Manifest {
             directory,
             expected,
@@ -612,11 +665,10 @@ fn run_release(root: &Path, command: ReleaseCommands) -> Result<String, Error> {
         } => {
             let directory = resolve_path(root, directory);
             let expected = expected.map(|path| resolve_path(root, path));
-            Ok(release_manifest(
-                &directory,
-                identity.resolve(),
-                expected.as_deref(),
-            )?)
+            (
+                "release_manifest",
+                release_manifest(&directory, identity.resolve(), expected.as_deref())?,
+            )
         }
         ReleaseCommands::Verify {
             directory,
@@ -625,12 +677,26 @@ fn run_release(root: &Path, command: ReleaseCommands) -> Result<String, Error> {
         } => {
             let directory = resolve_path(root, directory);
             let expected = expected.map(|path| resolve_path(root, path));
-            Ok(release_verify(
-                &directory,
-                identity.resolve(),
-                expected.as_deref(),
-            )?)
+            (
+                "release_verify",
+                release_verify(&directory, identity.resolve(), expected.as_deref())?,
+            )
         }
+    };
+    Ok(success_document(output, kind, message))
+}
+
+fn success_document(output: OutputMode, kind: &str, message: String) -> String {
+    if output == OutputMode::Json {
+        serde_json::json!({
+            "schema": mono::JSON_OUTPUT_SCHEMA,
+            "kind": kind,
+            "status": "ok",
+            "message": message,
+        })
+        .to_string()
+    } else {
+        message
     }
 }
 
@@ -651,7 +717,7 @@ fn resolve_path(root: &Path, path: PathBuf) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mono::{DoctorError, ListError, WorkspaceError};
+    use mono::{DoctorError, ListError, ProjectError};
 
     /// A writer that fails every write, standing in for a consumer that hung up
     /// (`BrokenPipe`) or a disk that is full (`StorageFull`).
@@ -667,15 +733,15 @@ mod tests {
         }
     }
 
-    fn missing_root() -> WorkspaceError {
-        WorkspaceError::MissingRoot {
+    fn missing_root() -> ProjectError {
+        ProjectError::MissingRoot {
             start: PathBuf::from("."),
         }
     }
 
-    fn missing_declared_directory() -> WorkspaceError {
+    fn missing_declared_directory() -> ProjectError {
         // A task `cwd` that the manifest declares but the worktree lacks.
-        WorkspaceError::Io {
+        ProjectError::Io {
             path: PathBuf::from("packages/api/missing"),
             source: io::Error::new(io::ErrorKind::NotFound, "missing"),
         }
@@ -728,7 +794,7 @@ mod tests {
 
     #[test]
     fn a_broken_stderr_does_not_mask_the_failure() {
-        let error = Error::Doctor(DoctorError::Workspace(missing_root()));
+        let error = Error::Doctor(DoctorError::Project(missing_root()));
         let mut sink = FailingWriter(io::ErrorKind::BrokenPipe);
 
         assert_eq!(
@@ -742,9 +808,9 @@ mod tests {
         for error in [
             Error::Init(InitError::AlreadyInitialized(PathBuf::from("mono.toml"))),
             Error::Init(InitError::AlreadyInitialized(PathBuf::from("mono.toml"))),
-            Error::Doctor(DoctorError::Workspace(missing_root())),
-            Error::Doctor(DoctorError::Workspace(missing_declared_directory())),
-            Error::List(ListError::Workspace(WorkspaceError::MissingTask {
+            Error::Doctor(DoctorError::Project(missing_root())),
+            Error::Doctor(DoctorError::Project(missing_declared_directory())),
+            Error::List(ListError::Project(ProjectError::MissingTask {
                 task: "missing".to_owned(),
                 suggestion: None,
             })),

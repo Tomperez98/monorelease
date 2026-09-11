@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use serde::Serialize;
 
-use crate::config::{PipelineConfig, TaskConfig, config_path, validate_process_value};
+use crate::config::{PipelineConfig, StdinMode, TaskConfig, config_path, validate_process_value};
 use crate::discovery::find_root;
 
 /// A task identity in the single root graph.
@@ -22,8 +22,10 @@ pub struct TaskNode {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlannedTask {
     id: String,
+    project: String,
     root: PathBuf,
     command: Vec<String>,
+    stdin: StdinMode,
     cwd: PathBuf,
     env: BTreeMap<String, String>,
     cache: bool,
@@ -58,14 +60,12 @@ impl PlannedTask {
         &self.id
     }
 
-    /// Compatibility accessor for callers that use task terminology.
     pub fn task(&self) -> &str {
         &self.id
     }
 
-    /// Stable project label used by the process error adapter.
     pub fn project(&self) -> &str {
-        "project"
+        &self.project
     }
 
     pub fn root(&self) -> &Path {
@@ -74,6 +74,10 @@ impl PlannedTask {
 
     pub fn command(&self) -> &[String] {
         &self.command
+    }
+
+    pub fn stdin(&self) -> StdinMode {
+        self.stdin
     }
 
     pub fn cwd(&self) -> &Path {
@@ -131,7 +135,7 @@ impl PlannedTask {
 
 /// A complete, validated root project.
 #[derive(Debug, Clone)]
-pub struct Workspace {
+pub struct Project {
     pub root: PathBuf,
     pub name: String,
     pub default_pipeline: String,
@@ -139,12 +143,9 @@ pub struct Workspace {
     pub tasks: BTreeMap<String, TaskConfig>,
 }
 
-/// Preferred name for the root-only execution model.
-pub type Project = Workspace;
-
-impl Workspace {
+impl Project {
     /// Find and load the nearest root `mono.toml`.
-    pub fn load(start: &Path) -> Result<Self, WorkspaceError> {
+    pub fn load(start: &Path) -> Result<Self, ProjectError> {
         let discovered = find_root(start)?;
         let root = discovered.root;
         let config = discovered.config;
@@ -158,7 +159,7 @@ impl Workspace {
             &config.project.default_pipeline,
         )?;
         if config.pipelines.is_empty() {
-            return Err(WorkspaceError::InvalidProject {
+            return Err(ProjectError::InvalidProject {
                 message: "project must define at least one pipeline".to_owned(),
             });
         }
@@ -167,13 +168,13 @@ impl Workspace {
         }
         for (pipeline_name, pipeline) in &config.pipelines {
             if pipeline.tasks.is_empty() && pipeline.finally.is_empty() {
-                return Err(WorkspaceError::InvalidProject {
+                return Err(ProjectError::InvalidProject {
                     message: format!("pipeline '{pipeline_name}' has no tasks"),
                 });
             }
             for task_name in pipeline.tasks.iter().chain(&pipeline.finally) {
                 validate_task_reference(task_name).map_err(|message| {
-                    WorkspaceError::InvalidManifest {
+                    ProjectError::InvalidManifest {
                         path: manifest_path.clone(),
                         message: format!("pipeline '{pipeline_name}': {message}"),
                     }
@@ -205,16 +206,12 @@ impl Workspace {
         assert!(self.pipelines.contains_key(&self.default_pipeline));
     }
 
-    pub fn scope_label(&self) -> &'static str {
-        "project"
-    }
-
     /// Produce a dependency-first plan for a pipeline or explicit task roots.
     pub fn plan(
         &self,
         pipeline: Option<&str>,
         requested_tasks: &[String],
-    ) -> Result<Vec<PlannedTask>, WorkspaceError> {
+    ) -> Result<Vec<PlannedTask>, ProjectError> {
         let mut ordered_nodes = self.plan_nodes(pipeline, requested_tasks)?;
         let mut finalizers = BTreeSet::new();
         if requested_tasks.is_empty() {
@@ -255,7 +252,7 @@ impl Workspace {
         &self,
         pipeline: Option<&str>,
         requested_tasks: &[String],
-    ) -> Result<Vec<(TaskNode, Vec<TaskNode>)>, WorkspaceError> {
+    ) -> Result<Vec<(TaskNode, Vec<TaskNode>)>, ProjectError> {
         let nodes = self.plan_nodes(pipeline, requested_tasks)?;
         nodes
             .into_iter()
@@ -271,7 +268,7 @@ impl Workspace {
         &self,
         pipeline: Option<&str>,
         requested_tasks: &[String],
-    ) -> Result<Vec<TaskNode>, WorkspaceError> {
+    ) -> Result<Vec<TaskNode>, ProjectError> {
         let task_names: Vec<String> = if requested_tasks.is_empty() {
             let name = pipeline.unwrap_or(&self.default_pipeline);
             self.pipelines
@@ -283,7 +280,7 @@ impl Workspace {
             requested_tasks.to_vec()
         };
         if task_names.is_empty() {
-            return Err(WorkspaceError::InvalidProject {
+            return Err(ProjectError::InvalidProject {
                 message: "the selected pipeline has no tasks".to_owned(),
             });
         }
@@ -301,8 +298,8 @@ impl Workspace {
         Ok(ordered)
     }
 
-    fn root_nodes(&self, task_name: &str) -> Result<Vec<TaskNode>, WorkspaceError> {
-        let base = base_task_name(task_name).map_err(|_| WorkspaceError::InvalidTaskReference {
+    fn root_nodes(&self, task_name: &str) -> Result<Vec<TaskNode>, ProjectError> {
+        let base = base_task_name(task_name).map_err(|_| ProjectError::InvalidTaskReference {
             reference: task_name.to_owned(),
             from: TaskNode::new(task_name),
         })?;
@@ -311,13 +308,13 @@ impl Workspace {
             .get(base)
             .ok_or_else(|| self.missing_task(task_name))?;
         let dimensions =
-            task_dimensions(task_name).map_err(|_| WorkspaceError::InvalidTaskReference {
+            task_dimensions(task_name).map_err(|_| ProjectError::InvalidTaskReference {
                 reference: task_name.to_owned(),
                 from: TaskNode::new(task_name),
             })?;
         if !dimensions.is_empty() {
             validate_matrix_instance(&task.matrix, &dimensions).map_err(|message| {
-                WorkspaceError::InvalidTask {
+                ProjectError::InvalidTask {
                     task: task_name.to_owned(),
                     message,
                 }
@@ -325,7 +322,7 @@ impl Workspace {
             return Ok(vec![TaskNode::new(task_name)]);
         }
         let instances = matrix_instances(&task.matrix, &BTreeMap::new()).map_err(|message| {
-            WorkspaceError::InvalidTask {
+            ProjectError::InvalidTask {
                 task: task_name.to_owned(),
                 message,
             }
@@ -336,10 +333,10 @@ impl Workspace {
             .collect())
     }
 
-    fn validate_graph(&self) -> Result<(), WorkspaceError> {
+    fn validate_graph(&self) -> Result<(), ProjectError> {
         for task_name in self.tasks.keys() {
             if task_name.is_empty() || task_name.contains(['[', ']', '=', ',']) {
-                return Err(WorkspaceError::InvalidTaskName {
+                return Err(ProjectError::InvalidTaskName {
                     task: task_name.clone(),
                 });
             }
@@ -353,7 +350,7 @@ impl Workspace {
         Ok(())
     }
 
-    fn validate_pipelines(&self) -> Result<(), WorkspaceError> {
+    fn validate_pipelines(&self) -> Result<(), ProjectError> {
         if !self.pipelines.contains_key(&self.default_pipeline) {
             return Err(self.unknown_pipeline(&self.default_pipeline));
         }
@@ -369,7 +366,7 @@ impl Workspace {
         state: &mut BTreeMap<TaskNode, VisitState>,
         stack: &mut Vec<TaskNode>,
         order: &mut Vec<TaskNode>,
-    ) -> Result<(), WorkspaceError> {
+    ) -> Result<(), ProjectError> {
         match state.get(node) {
             Some(VisitState::Visited) => return Ok(()),
             Some(VisitState::Visiting) => {
@@ -379,7 +376,7 @@ impl Workspace {
                     .expect("visiting task is on stack");
                 let mut path = stack[start..].to_vec();
                 path.push(node.clone());
-                return Err(WorkspaceError::TaskCycle { path });
+                return Err(ProjectError::TaskCycle { path });
             }
             None => {}
         }
@@ -396,9 +393,9 @@ impl Workspace {
         Ok(())
     }
 
-    fn planned_task(&self, node: TaskNode, finalizer: bool) -> Result<PlannedTask, WorkspaceError> {
+    fn planned_task(&self, node: TaskNode, finalizer: bool) -> Result<PlannedTask, ProjectError> {
         let base = base_task_name(&node.id)
-            .map_err(|_| WorkspaceError::InvalidTaskReference {
+            .map_err(|_| ProjectError::InvalidTaskReference {
                 reference: node.id.clone(),
                 from: node.clone(),
             })?
@@ -408,36 +405,36 @@ impl Workspace {
             .get(&base)
             .ok_or_else(|| self.missing_task(&node.id))?;
         let dimensions =
-            task_dimensions(&node.id).map_err(|_| WorkspaceError::InvalidTaskReference {
+            task_dimensions(&node.id).map_err(|_| ProjectError::InvalidTaskReference {
                 reference: node.id.clone(),
                 from: node.clone(),
             })?;
         validate_matrix_instance(&task.matrix, &dimensions).map_err(|message| {
-            WorkspaceError::InvalidTask {
+            ProjectError::InvalidTask {
                 task: node.id.clone(),
                 message,
             }
         })?;
         if finalizer && task.cache {
-            return Err(WorkspaceError::InvalidTask {
+            return Err(ProjectError::InvalidTask {
                 task: node.id.clone(),
                 message: "finalizer tasks cannot be cached".to_owned(),
             });
         }
         let interpolate = |value: &str| {
-            interpolate_value(value, &dimensions).map_err(|message| WorkspaceError::InvalidTask {
+            interpolate_value(value, &dimensions).map_err(|message| ProjectError::InvalidTask {
                 task: node.id.clone(),
                 message,
             })
         };
         let cwd = interpolate(task.cwd.as_deref().unwrap_or("."))?;
         let cwd_path =
-            fs::canonicalize(self.root.join(&cwd)).map_err(|source| WorkspaceError::Io {
+            fs::canonicalize(self.root.join(&cwd)).map_err(|source| ProjectError::Io {
                 path: self.root.join(&cwd),
                 source,
             })?;
         if !cwd_path.starts_with(&self.root) || !cwd_path.is_dir() {
-            return Err(WorkspaceError::InvalidTask {
+            return Err(ProjectError::InvalidTask {
                 task: node.id.clone(),
                 message: "cwd must resolve to a directory inside the project root".to_owned(),
             });
@@ -452,7 +449,7 @@ impl Workspace {
             .env
             .iter()
             .map(|(key, value)| Ok((key.clone(), interpolate(value)?)))
-            .collect::<Result<BTreeMap<_, _>, WorkspaceError>>()?;
+            .collect::<Result<BTreeMap<_, _>, ProjectError>>()?;
         let inputs = task
             .inputs
             .iter()
@@ -465,8 +462,10 @@ impl Workspace {
             .collect::<Result<Vec<_>, _>>()?;
         let planned = PlannedTask {
             id: node.id,
+            project: self.name.clone(),
             root: self.root.clone(),
             command,
+            stdin: task.stdin,
             cwd: cwd_path,
             env,
             cache: task.cache,
@@ -475,7 +474,7 @@ impl Workspace {
             cache_env: task.cache_env.clone(),
             timeout: Duration::from_secs(task.timeout_seconds),
             max_output_bytes: usize::try_from(task.max_output_bytes).map_err(|_| {
-                WorkspaceError::InvalidTask {
+                ProjectError::InvalidTask {
                     task: base.clone(),
                     message: "max_output_bytes does not fit in platform usize".to_owned(),
                 }
@@ -491,8 +490,8 @@ impl Workspace {
         Ok(planned)
     }
 
-    fn task_config(&self, node: &TaskNode) -> Result<&TaskConfig, WorkspaceError> {
-        let base = base_task_name(&node.id).map_err(|_| WorkspaceError::InvalidTaskReference {
+    fn task_config(&self, node: &TaskNode) -> Result<&TaskConfig, ProjectError> {
+        let base = base_task_name(&node.id).map_err(|_| ProjectError::InvalidTaskReference {
             reference: node.id.clone(),
             from: node.clone(),
         })?;
@@ -505,19 +504,19 @@ impl Workspace {
         &self,
         current: &TaskNode,
         references: &[String],
-    ) -> Result<Vec<TaskNode>, WorkspaceError> {
+    ) -> Result<Vec<TaskNode>, ProjectError> {
         let mut resolved = Vec::new();
         for reference in references {
             let base = self.resolve_task_ref(current, reference)?;
             let task = self.task_config(&base)?;
             let explicit =
-                task_dimensions(&base.id).map_err(|_| WorkspaceError::InvalidTaskReference {
+                task_dimensions(&base.id).map_err(|_| ProjectError::InvalidTaskReference {
                     reference: reference.clone(),
                     from: current.clone(),
                 })?;
             if !explicit.is_empty() {
                 validate_matrix_instance(&task.matrix, &explicit).map_err(|message| {
-                    WorkspaceError::InvalidTask {
+                    ProjectError::InvalidTask {
                         task: base.id.clone(),
                         message,
                     }
@@ -526,13 +525,13 @@ impl Workspace {
                 continue;
             }
             let current_dimensions =
-                task_dimensions(&current.id).map_err(|_| WorkspaceError::InvalidTaskReference {
+                task_dimensions(&current.id).map_err(|_| ProjectError::InvalidTaskReference {
                     reference: current.id.clone(),
                     from: current.clone(),
                 })?;
             for instance in
                 matrix_instances(&task.matrix, &current_dimensions).map_err(|message| {
-                    WorkspaceError::InvalidTask {
+                    ProjectError::InvalidTask {
                         task: base.id.clone(),
                         message,
                     }
@@ -551,32 +550,32 @@ impl Workspace {
         &self,
         current: &TaskNode,
         reference: &str,
-    ) -> Result<TaskNode, WorkspaceError> {
-        validate_task_reference(reference).map_err(|_| WorkspaceError::InvalidTaskReference {
+    ) -> Result<TaskNode, ProjectError> {
+        validate_task_reference(reference).map_err(|_| ProjectError::InvalidTaskReference {
             reference: reference.to_owned(),
             from: current.clone(),
         })?;
         Ok(TaskNode::new(reference.to_owned()))
     }
 
-    fn missing_task(&self, task: &str) -> WorkspaceError {
-        WorkspaceError::MissingTask {
+    fn missing_task(&self, task: &str) -> ProjectError {
+        ProjectError::MissingTask {
             task: task.to_owned(),
             suggestion: closest_name(task, self.tasks.keys()),
         }
     }
 
-    fn unknown_pipeline(&self, name: &str) -> WorkspaceError {
-        WorkspaceError::UnknownPipeline {
+    fn unknown_pipeline(&self, name: &str) -> ProjectError {
+        ProjectError::UnknownPipeline {
             name: name.to_owned(),
             suggestion: closest_name(name, self.pipelines.keys()),
         }
     }
 }
 
-pub(crate) fn validate_schema(path: &Path, schema: u32) -> Result<(), WorkspaceError> {
+pub(crate) fn validate_schema(path: &Path, schema: u32) -> Result<(), ProjectError> {
     if schema != crate::config::SUPPORTED_SCHEMA {
-        return Err(WorkspaceError::UnsupportedSchema {
+        return Err(ProjectError::UnsupportedSchema {
             path: path.to_path_buf(),
             found: schema,
             supported: crate::config::SUPPORTED_SCHEMA,
@@ -590,22 +589,22 @@ fn validate_task_config(
     root: &Path,
     task_name: &str,
     task: &TaskConfig,
-) -> Result<(), WorkspaceError> {
+) -> Result<(), ProjectError> {
     validate_identifier(manifest_path, "task name", task_name)?;
     if task_name.contains(['[', ']', '=', ',']) {
-        return Err(WorkspaceError::InvalidTaskName {
+        return Err(ProjectError::InvalidTaskName {
             task: task_name.to_owned(),
         });
     }
     if task.command.is_empty() || task.command[0].is_empty() {
-        return Err(WorkspaceError::InvalidTask {
+        return Err(ProjectError::InvalidTask {
             task: task_name.to_owned(),
             message: "command must contain an executable".to_owned(),
         });
     }
     for (index, argument) in task.command.iter().enumerate() {
         validate_process_value(argument, &format!("command argument {index}")).map_err(
-            |message| WorkspaceError::InvalidTask {
+            |message| ProjectError::InvalidTask {
                 task: task_name.to_owned(),
                 message,
             },
@@ -614,7 +613,7 @@ fn validate_task_config(
     for (key, value) in &task.env {
         validate_process_value(key, "environment key")
             .and_then(|_| validate_process_value(value, "environment value"))
-            .map_err(|message| WorkspaceError::InvalidTask {
+            .map_err(|message| ProjectError::InvalidTask {
                 task: task_name.to_owned(),
                 message,
             })?;
@@ -622,26 +621,32 @@ fn validate_task_config(
     if task.cache
         && (task.inputs.is_empty() || !task.inputs.iter().any(|pattern| !pattern.starts_with('!')))
     {
-        return Err(WorkspaceError::InvalidTask {
+        return Err(ProjectError::InvalidTask {
             task: task_name.to_owned(),
             message: "cacheable tasks must declare at least one positive input pattern".to_owned(),
         });
     }
+    if task.cache && task.stdin == StdinMode::Inherit {
+        return Err(ProjectError::InvalidTask {
+            task: task_name.to_owned(),
+            message: "cacheable tasks cannot inherit standard input".to_owned(),
+        });
+    }
     if !task.outputs.is_empty() && !task.outputs.iter().any(|pattern| !pattern.starts_with('!')) {
-        return Err(WorkspaceError::InvalidTask {
+        return Err(ProjectError::InvalidTask {
             task: task_name.to_owned(),
             message: "outputs must declare at least one positive pattern".to_owned(),
         });
     }
     for pattern in task.inputs.iter().chain(&task.outputs) {
-        validate_cache_pattern(pattern).map_err(|message| WorkspaceError::InvalidTask {
+        validate_cache_pattern(pattern).map_err(|message| ProjectError::InvalidTask {
             task: task_name.to_owned(),
             message,
         })?;
     }
     for variable in &task.cache_env {
         if variable.is_empty() || variable.contains('=') || variable.contains('\0') {
-            return Err(WorkspaceError::InvalidTask {
+            return Err(ProjectError::InvalidTask {
                 task: task_name.to_owned(),
                 message: "cache_env names must be non-empty and cannot contain '=' or NUL"
                     .to_owned(),
@@ -649,46 +654,49 @@ fn validate_task_config(
         }
     }
     if task.timeout_seconds == 0 {
-        return Err(WorkspaceError::InvalidTask {
+        return Err(ProjectError::InvalidTask {
             task: task_name.to_owned(),
             message: "timeout_seconds must be greater than zero".to_owned(),
         });
     }
     if task.max_output_bytes == 0 || usize::try_from(task.max_output_bytes).is_err() {
-        return Err(WorkspaceError::InvalidTask {
+        return Err(ProjectError::InvalidTask {
             task: task_name.to_owned(),
             message: "max_output_bytes must be positive and fit in platform usize".to_owned(),
         });
     }
     if task.retries > 0 && task.retry_backoff_seconds > 86_400 {
-        return Err(WorkspaceError::InvalidTask {
+        return Err(ProjectError::InvalidTask {
             task: task_name.to_owned(),
             message: "retry_backoff_seconds must not exceed 86400".to_owned(),
         });
     }
     if let Some(group) = &task.resource_group
-        && (group.is_empty() || group.contains(':') || group.contains('\0'))
+        && (group.is_empty()
+            || group.contains(':')
+            || group.contains('\0')
+            || group.chars().any(char::is_control))
     {
-        return Err(WorkspaceError::InvalidTask {
+        return Err(ProjectError::InvalidTask {
             task: task_name.to_owned(),
-            message: "resource_group must be non-empty and cannot contain ':' or NUL".to_owned(),
+            message: "resource_group must be non-empty and cannot contain ':', NUL, or control characters".to_owned(),
         });
     }
     if let Some(cwd) = &task.cwd {
         if !valid_relative_path(cwd) {
-            return Err(WorkspaceError::InvalidTask {
+            return Err(ProjectError::InvalidTask {
                 task: task_name.to_owned(),
                 message: "cwd must be an existing relative directory without '..'".to_owned(),
             });
         }
         if !cwd.contains("${") {
             let cwd_path = root.join(cwd);
-            let canonical = fs::canonicalize(&cwd_path).map_err(|source| WorkspaceError::Io {
+            let canonical = fs::canonicalize(&cwd_path).map_err(|source| ProjectError::Io {
                 path: cwd_path.clone(),
                 source,
             })?;
             if !canonical.starts_with(root) || !canonical.is_dir() {
-                return Err(WorkspaceError::InvalidTask {
+                return Err(ProjectError::InvalidTask {
                     task: task_name.to_owned(),
                     message: "cwd must resolve to a directory inside the project root".to_owned(),
                 });
@@ -698,7 +706,7 @@ fn validate_task_config(
     for (dimension, values) in &task.matrix {
         validate_identifier(manifest_path, "matrix dimension", dimension)?;
         if values.is_empty() {
-            return Err(WorkspaceError::InvalidTask {
+            return Err(ProjectError::InvalidTask {
                 task: task_name.to_owned(),
                 message: format!("matrix dimension '{dimension}' must have at least one value"),
             });
@@ -709,16 +717,18 @@ fn validate_task_config(
                 .and_then(|_| {
                     if value.contains(['[', ']', '=', ',']) {
                         Err("matrix values cannot contain '[', ']', '=', or ','".to_owned())
+                    } else if value.chars().any(char::is_control) {
+                        Err("matrix values cannot contain control characters".to_owned())
                     } else {
                         Ok(())
                     }
                 })
-                .map_err(|message| WorkspaceError::InvalidTask {
+                .map_err(|message| ProjectError::InvalidTask {
                     task: task_name.to_owned(),
                     message,
                 })?;
             if !seen.insert(value) {
-                return Err(WorkspaceError::InvalidTask {
+                return Err(ProjectError::InvalidTask {
                     task: task_name.to_owned(),
                     message: format!(
                         "matrix dimension '{dimension}' contains duplicate value '{value}'"
@@ -731,12 +741,12 @@ fn validate_task_config(
         .matrix
         .values()
         .try_fold(1usize, |size, values| size.checked_mul(values.len()))
-        .ok_or_else(|| WorkspaceError::InvalidTask {
+        .ok_or_else(|| ProjectError::InvalidTask {
             task: task_name.to_owned(),
             message: "matrix has too many instances".to_owned(),
         })?;
     if matrix_size > 1024 {
-        return Err(WorkspaceError::InvalidTask {
+        return Err(ProjectError::InvalidTask {
             task: task_name.to_owned(),
             message: "matrix cannot expand to more than 1024 instances".to_owned(),
         });
@@ -744,19 +754,24 @@ fn validate_task_config(
     Ok(())
 }
 
-fn validate_identifier(path: &Path, label: &str, value: &str) -> Result<(), WorkspaceError> {
-    if value.is_empty() || value.contains('\0') {
-        return Err(WorkspaceError::InvalidManifest {
+fn validate_identifier(path: &Path, label: &str, value: &str) -> Result<(), ProjectError> {
+    if value.is_empty() || value.contains('\0') || value.chars().any(char::is_control) {
+        return Err(ProjectError::InvalidManifest {
             path: path.to_path_buf(),
-            message: format!("{label} must be non-empty and cannot contain NUL"),
+            message: format!(
+                "{label} must be non-empty and cannot contain NUL or control characters"
+            ),
         });
     }
     Ok(())
 }
 
 fn validate_task_reference(reference: &str) -> Result<(), String> {
-    if reference.is_empty() || reference.contains('\0') {
-        Err("task reference must be non-empty and cannot contain NUL".to_owned())
+    if reference.is_empty() || reference.contains('\0') || reference.chars().any(char::is_control) {
+        Err(
+            "task reference must be non-empty and cannot contain NUL or control characters"
+                .to_owned(),
+        )
     } else {
         Ok(())
     }
@@ -949,7 +964,7 @@ enum VisitState {
 }
 
 #[derive(Debug)]
-pub enum WorkspaceError {
+pub enum ProjectError {
     Io {
         path: PathBuf,
         source: std::io::Error,
@@ -997,7 +1012,7 @@ pub enum WorkspaceError {
     },
 }
 
-impl fmt::Display for WorkspaceError {
+impl fmt::Display for ProjectError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Io { path, source } => write!(f, "could not read {}: {source}", path.display()),
@@ -1053,7 +1068,7 @@ impl fmt::Display for WorkspaceError {
     }
 }
 
-impl StdError for WorkspaceError {
+impl StdError for ProjectError {
     fn source(&self) -> Option<&(dyn StdError + 'static)> {
         match self {
             Self::Io { source, .. } => Some(source),

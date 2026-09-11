@@ -12,8 +12,8 @@ use std::time::Instant;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::project::PlannedTask;
 use crate::runner::{CapturedOutput, TaskResult};
-use crate::workspace::PlannedTask;
 
 const CACHE_FORMAT_VERSION: u32 = 3;
 const CACHE_GITIGNORE: &str = "*\n!.gitignore\n";
@@ -34,7 +34,7 @@ pub(crate) struct CacheStore {
 
 /// Immutable cache state shared by every task in one execution.
 ///
-/// Manifests and cache-directory setup are workspace state, not task state. Keeping
+/// Manifests and cache-directory setup are project state, not task state. Keeping
 /// them here prevents every cacheable task from repeating the same filesystem work.
 #[derive(Debug, Clone)]
 pub(crate) struct CacheSession {
@@ -57,19 +57,19 @@ struct CachedOutput {
 }
 
 impl CacheStore {
-    pub(crate) fn new(workspace_root: &Path) -> Self {
+    pub(crate) fn new(project_root: &Path) -> Self {
         Self {
-            root: workspace_root.join(".mono").join("cache"),
+            root: project_root.join(".mono").join("cache"),
         }
     }
 
     pub(crate) fn prepare(
         &self,
-        workspace_root: &Path,
+        project_root: &Path,
         _plan: &[PlannedTask],
     ) -> Result<CacheSession, CacheError> {
         self.ensure_gitignore()?;
-        let project_manifest = read_file(&workspace_root.join("mono.toml"))?;
+        let project_manifest = read_file(&project_root.join("mono.toml"))?;
         Ok(CacheSession { project_manifest })
     }
 
@@ -77,18 +77,18 @@ impl CacheStore {
     #[cfg(test)]
     pub(crate) fn task_key(
         &self,
-        workspace_root: &Path,
+        project_root: &Path,
         task: &PlannedTask,
         dependency_keys: &[String],
     ) -> Result<String, CacheError> {
-        let session = self.prepare(workspace_root, std::slice::from_ref(task))?;
-        self.task_key_with_session(&session, workspace_root, task, dependency_keys)
+        let session = self.prepare(project_root, std::slice::from_ref(task))?;
+        self.task_key_with_session(&session, project_root, task, dependency_keys)
     }
 
     pub(crate) fn task_key_with_session(
         &self,
         session: &CacheSession,
-        _workspace_root: &Path,
+        _project_root: &Path,
         task: &PlannedTask,
         dependency_keys: &[String],
     ) -> Result<String, CacheError> {
@@ -813,33 +813,33 @@ impl StdError for CacheError {
 mod tests {
     use super::*;
     use crate::config::config_path;
+    use crate::project::Project;
     use crate::runner::Runner;
     use crate::testing::TempDir;
-    use crate::workspace::Workspace;
     use std::fs;
 
-    fn workspace_with_task(temp: &TempDir) -> Workspace {
+    fn project_with_task(temp: &TempDir) -> Project {
         fs::write(
             config_path(temp.path()),
             "[project]\nname = \"fixture\"\n\n[pipelines.ci]\ntasks = [\"build\"]\n\n[tasks.build]\ncommand = [\"sh\", \"-c\", \"cat input.txt > output.txt\"]\ncache = true\ninputs = [\"input.txt\"]\noutputs = [\"output.txt\"]\n",
         )
         .expect("write root manifest");
         fs::write(temp.path().join("input.txt"), "input").expect("write input");
-        Workspace::load(temp.path()).expect("project loads")
+        Project::load(temp.path()).expect("project loads")
     }
 
     #[cfg(unix)]
     #[test]
     fn stores_and_restores_a_successful_task() {
         let temp = TempDir::new();
-        let workspace = workspace_with_task(&temp);
-        let task = workspace.plan(None, &[]).expect("plan succeeds").remove(0);
-        let store = CacheStore::new(&workspace.root);
+        let project = project_with_task(&temp);
+        let task = project.plan(None, &[]).expect("plan succeeds").remove(0);
+        let store = CacheStore::new(&project.root);
         let key = store
-            .task_key(&workspace.root, &task, &[])
+            .task_key(&project.root, &task, &[])
             .expect("key succeeds");
         let result = Runner::new()
-            .run(&workspace.root, &task)
+            .run(&project.root, &task)
             .expect("task succeeds");
         store.store(&task, &key, &result).expect("store succeeds");
         fs::remove_file(task.root().join("output.txt")).expect("remove output");
@@ -858,16 +858,16 @@ mod tests {
     #[test]
     fn creates_a_gitignore_for_cache_storage() {
         let temp = TempDir::new();
-        let workspace = workspace_with_task(&temp);
-        let task = workspace.plan(None, &[]).expect("plan succeeds").remove(0);
-        let store = CacheStore::new(&workspace.root);
+        let project = project_with_task(&temp);
+        let task = project.plan(None, &[]).expect("plan succeeds").remove(0);
+        let store = CacheStore::new(&project.root);
 
         store
-            .task_key(&workspace.root, &task, &[])
+            .task_key(&project.root, &task, &[])
             .expect("key succeeds");
 
         assert_eq!(
-            fs::read_to_string(workspace.root.join(".mono/.gitignore"))
+            fs::read_to_string(project.root.join(".mono/.gitignore"))
                 .expect("gitignore is created"),
             "*\n!.gitignore\n"
         );
@@ -876,52 +876,52 @@ mod tests {
     #[test]
     fn changing_an_input_changes_the_key() {
         let temp = TempDir::new();
-        let workspace = workspace_with_task(&temp);
-        let task = workspace.plan(None, &[]).expect("plan succeeds").remove(0);
-        let store = CacheStore::new(&workspace.root);
+        let project = project_with_task(&temp);
+        let task = project.plan(None, &[]).expect("plan succeeds").remove(0);
+        let store = CacheStore::new(&project.root);
         let first = store
-            .task_key(&workspace.root, &task, &[])
+            .task_key(&project.root, &task, &[])
             .expect("key succeeds");
         fs::write(task.root().join("input.txt"), "changed").expect("change input");
         let second = store
-            .task_key(&workspace.root, &task, &[])
+            .task_key(&project.root, &task, &[])
             .expect("key succeeds");
         assert_ne!(first, second);
     }
 
-    fn workspace_with_manifest(temp: &TempDir, manifest: &str) -> Workspace {
+    fn project_with_manifest(temp: &TempDir, manifest: &str) -> Project {
         let task_manifest = manifest.replacen("[project]\nname = \"app\"\n\n", "", 1);
         let contents = format!(
             "[project]\nname = \"fixture\"\n\n[pipelines.ci]\ntasks = [\"build\"]\n\n{task_manifest}"
         );
         fs::write(config_path(temp.path()), contents).expect("write project manifest");
-        Workspace::load(temp.path()).expect("project loads")
+        Project::load(temp.path()).expect("project loads")
     }
 
-    fn only_task(workspace: &Workspace) -> PlannedTask {
-        workspace.plan(None, &[]).expect("plan succeeds").remove(0)
+    fn only_task(project: &Project) -> PlannedTask {
+        project.plan(None, &[]).expect("plan succeeds").remove(0)
     }
 
     #[test]
     fn changing_the_output_limit_changes_the_key() {
         let temp = TempDir::new();
-        let mut workspace = workspace_with_task(&temp);
-        let task = only_task(&workspace);
-        let store = CacheStore::new(&workspace.root);
+        let mut project = project_with_task(&temp);
+        let task = only_task(&project);
+        let store = CacheStore::new(&project.root);
         let session = store
-            .prepare(&workspace.root, std::slice::from_ref(&task))
+            .prepare(&project.root, std::slice::from_ref(&task))
             .expect("cache session prepares");
         let first = store
-            .task_key_with_session(&session, &workspace.root, &task, &[])
+            .task_key_with_session(&session, &project.root, &task, &[])
             .expect("key succeeds");
-        workspace
+        project
             .tasks
             .get_mut("build")
             .expect("fixture task exists")
             .max_output_bytes += 1;
-        let changed_task = only_task(&workspace);
+        let changed_task = only_task(&project);
         let second = store
-            .task_key_with_session(&session, &workspace.root, &changed_task, &[])
+            .task_key_with_session(&session, &project.root, &changed_task, &[])
             .expect("key succeeds");
         assert_ne!(first, second);
     }
@@ -929,27 +929,27 @@ mod tests {
     #[test]
     fn ignores_files_outside_the_input_patterns() {
         let temp = TempDir::new();
-        let workspace = workspace_with_manifest(
+        let project = project_with_manifest(
             &temp,
             "[project]\nname = \"app\"\n\n[tasks.build]\ncommand = [\"echo\", \"app\"]\ncache = true\ninputs = [\"src/**\"]\noutputs = [\"dist/**\"]\n",
         );
-        let task = only_task(&workspace);
-        let project = task.root().to_path_buf();
-        fs::create_dir_all(project.join("src")).expect("create src");
-        fs::create_dir_all(project.join("dist")).expect("create dist");
-        fs::create_dir_all(project.join("target/build")).expect("create unrelated tree");
-        fs::write(project.join("src/input.txt"), "input").expect("write input");
-        fs::write(project.join("dist/output.txt"), "output").expect("write output");
-        let store = CacheStore::new(&workspace.root);
+        let task = only_task(&project);
+        let project_root = task.root().to_path_buf();
+        fs::create_dir_all(project_root.join("src")).expect("create src");
+        fs::create_dir_all(project_root.join("dist")).expect("create dist");
+        fs::create_dir_all(project_root.join("target/build")).expect("create unrelated tree");
+        fs::write(project_root.join("src/input.txt"), "input").expect("write input");
+        fs::write(project_root.join("dist/output.txt"), "output").expect("write output");
+        let store = CacheStore::new(&project.root);
         let first = store
-            .task_key(&workspace.root, &task, &[])
+            .task_key(&project.root, &task, &[])
             .expect("key succeeds");
 
-        fs::write(project.join("target/build/object.o"), "unrelated")
+        fs::write(project_root.join("target/build/object.o"), "unrelated")
             .expect("write unrelated file");
 
         let second = store
-            .task_key(&workspace.root, &task, &[])
+            .task_key(&project.root, &task, &[])
             .expect("key succeeds");
         assert_eq!(first, second);
     }
@@ -957,25 +957,25 @@ mod tests {
     #[test]
     fn honours_negated_input_patterns() {
         let temp = TempDir::new();
-        let workspace = workspace_with_manifest(
+        let project = project_with_manifest(
             &temp,
             "[project]\nname = \"app\"\n\n[tasks.build]\ncommand = [\"echo\", \"app\"]\ncache = true\ninputs = [\"src/**\", \"!src/skip.txt\"]\noutputs = [\"dist/**\"]\n",
         );
-        let task = only_task(&workspace);
-        let project = task.root().to_path_buf();
-        fs::create_dir_all(project.join("src")).expect("create src");
-        fs::create_dir_all(project.join("dist")).expect("create dist");
-        fs::write(project.join("src/kept.txt"), "kept").expect("write input");
-        fs::write(project.join("src/skip.txt"), "first").expect("write excluded input");
-        let store = CacheStore::new(&workspace.root);
+        let task = only_task(&project);
+        let project_root = task.root().to_path_buf();
+        fs::create_dir_all(project_root.join("src")).expect("create src");
+        fs::create_dir_all(project_root.join("dist")).expect("create dist");
+        fs::write(project_root.join("src/kept.txt"), "kept").expect("write input");
+        fs::write(project_root.join("src/skip.txt"), "first").expect("write excluded input");
+        let store = CacheStore::new(&project.root);
         let first = store
-            .task_key(&workspace.root, &task, &[])
+            .task_key(&project.root, &task, &[])
             .expect("key succeeds");
 
-        fs::write(project.join("src/skip.txt"), "second").expect("change excluded input");
+        fs::write(project_root.join("src/skip.txt"), "second").expect("change excluded input");
 
         let second = store
-            .task_key(&workspace.root, &task, &[])
+            .task_key(&project.root, &task, &[])
             .expect("key succeeds");
         assert_eq!(first, second);
     }
@@ -983,25 +983,25 @@ mod tests {
     #[test]
     fn excludes_outputs_from_the_input_fingerprint() {
         let temp = TempDir::new();
-        let workspace = workspace_with_manifest(
+        let project = project_with_manifest(
             &temp,
             "[project]\nname = \"app\"\n\n[tasks.build]\ncommand = [\"echo\", \"app\"]\ncache = true\ninputs = [\"**\"]\noutputs = [\"dist/**\"]\n",
         );
-        let task = only_task(&workspace);
-        let project = task.root().to_path_buf();
-        fs::create_dir_all(project.join("src")).expect("create src");
-        fs::create_dir_all(project.join("dist")).expect("create dist");
-        fs::write(project.join("src/input.txt"), "input").expect("write input");
-        fs::write(project.join("dist/output.txt"), "first").expect("write output");
-        let store = CacheStore::new(&workspace.root);
+        let task = only_task(&project);
+        let project_root = task.root().to_path_buf();
+        fs::create_dir_all(project_root.join("src")).expect("create src");
+        fs::create_dir_all(project_root.join("dist")).expect("create dist");
+        fs::write(project_root.join("src/input.txt"), "input").expect("write input");
+        fs::write(project_root.join("dist/output.txt"), "first").expect("write output");
+        let store = CacheStore::new(&project.root);
         let first = store
-            .task_key(&workspace.root, &task, &[])
+            .task_key(&project.root, &task, &[])
             .expect("key succeeds");
 
-        fs::write(project.join("dist/output.txt"), "second").expect("rewrite output");
+        fs::write(project_root.join("dist/output.txt"), "second").expect("rewrite output");
 
         let second = store
-            .task_key(&workspace.root, &task, &[])
+            .task_key(&project.root, &task, &[])
             .expect("key succeeds");
         assert_eq!(first, second);
     }
@@ -1009,19 +1009,19 @@ mod tests {
     #[test]
     fn reports_an_input_pattern_that_matches_no_files() {
         let temp = TempDir::new();
-        let workspace = workspace_with_manifest(
+        let project = project_with_manifest(
             &temp,
             "[project]\nname = \"app\"\n\n[tasks.build]\ncommand = [\"echo\", \"app\"]\ncache = true\ninputs = [\"src/**\", \"missing/**\"]\noutputs = [\"dist/**\"]\n",
         );
-        let task = only_task(&workspace);
-        let project = task.root().to_path_buf();
-        fs::create_dir_all(project.join("src")).expect("create src");
-        fs::create_dir_all(project.join("dist")).expect("create dist");
-        fs::write(project.join("src/input.txt"), "input").expect("write input");
-        let store = CacheStore::new(&workspace.root);
+        let task = only_task(&project);
+        let project_root = task.root().to_path_buf();
+        fs::create_dir_all(project_root.join("src")).expect("create src");
+        fs::create_dir_all(project_root.join("dist")).expect("create dist");
+        fs::write(project_root.join("src/input.txt"), "input").expect("write input");
+        let store = CacheStore::new(&project.root);
 
         let error = store
-            .task_key(&workspace.root, &task, &[])
+            .task_key(&project.root, &task, &[])
             .expect_err("an unmatched pattern must fail");
         assert!(error.to_string().contains("missing/**"));
     }
@@ -1030,21 +1030,21 @@ mod tests {
     #[test]
     fn rejects_a_symlink_input_match() {
         let temp = TempDir::new();
-        let workspace = workspace_with_manifest(
+        let project = project_with_manifest(
             &temp,
             "[project]\nname = \"app\"\n\n[tasks.build]\ncommand = [\"echo\", \"app\"]\ncache = true\ninputs = [\"src/**\"]\noutputs = [\"dist/**\"]\n",
         );
-        let task = only_task(&workspace);
-        let project = task.root().to_path_buf();
-        fs::create_dir_all(project.join("src")).expect("create src");
-        fs::create_dir_all(project.join("dist")).expect("create dist");
-        fs::write(project.join("src/input.txt"), "input").expect("write input");
-        std::os::unix::fs::symlink("input.txt", project.join("src/link.txt"))
+        let task = only_task(&project);
+        let project_root = task.root().to_path_buf();
+        fs::create_dir_all(project_root.join("src")).expect("create src");
+        fs::create_dir_all(project_root.join("dist")).expect("create dist");
+        fs::write(project_root.join("src/input.txt"), "input").expect("write input");
+        std::os::unix::fs::symlink("input.txt", project_root.join("src/link.txt"))
             .expect("create symlink");
-        let store = CacheStore::new(&workspace.root);
+        let store = CacheStore::new(&project.root);
 
         let error = store
-            .task_key(&workspace.root, &task, &[])
+            .task_key(&project.root, &task, &[])
             .expect_err("symlinks cannot be fingerprinted");
         assert!(error.to_string().contains("unsupported symlink"));
     }
@@ -1053,23 +1053,23 @@ mod tests {
     #[test]
     fn stores_and_restores_nested_outputs() {
         let temp = TempDir::new();
-        let workspace = workspace_with_manifest(
+        let project = project_with_manifest(
             &temp,
             "[project]\nname = \"app\"\n\n[tasks.build]\ncommand = [\"sh\", \"-c\", \"mkdir -p dist/nested && cp src/input.txt dist/nested/artifact.txt\"]\ncache = true\ninputs = [\"src/**\"]\noutputs = [\"dist/**\"]\n",
         );
-        let task = only_task(&workspace);
-        let project = task.root().to_path_buf();
-        fs::create_dir_all(project.join("src")).expect("create src");
-        fs::write(project.join("src/input.txt"), "nested").expect("write input");
-        let store = CacheStore::new(&workspace.root);
+        let task = only_task(&project);
+        let project_root = task.root().to_path_buf();
+        fs::create_dir_all(project_root.join("src")).expect("create src");
+        fs::write(project_root.join("src/input.txt"), "nested").expect("write input");
+        let store = CacheStore::new(&project.root);
         let key = store
-            .task_key(&workspace.root, &task, &[])
+            .task_key(&project.root, &task, &[])
             .expect("key succeeds");
         let result = Runner::new()
-            .run(&workspace.root, &task)
+            .run(&project.root, &task)
             .expect("task succeeds");
         store.store(&task, &key, &result).expect("store succeeds");
-        fs::remove_dir_all(project.join("dist")).expect("remove outputs");
+        fs::remove_dir_all(project_root.join("dist")).expect("remove outputs");
 
         store
             .lookup(&task, &key)
@@ -1077,7 +1077,7 @@ mod tests {
             .expect("cache hit");
 
         assert_eq!(
-            fs::read_to_string(project.join("dist/nested/artifact.txt")).expect("read output"),
+            fs::read_to_string(project_root.join("dist/nested/artifact.txt")).expect("read output"),
             "nested"
         );
     }
@@ -1086,23 +1086,23 @@ mod tests {
     #[test]
     fn refuses_to_restore_through_a_destination_symlink() {
         let temp = TempDir::new();
-        let workspace = workspace_with_task(&temp);
-        let task = only_task(&workspace);
-        let project = task.root().to_path_buf();
-        let store = CacheStore::new(&workspace.root);
+        let project = project_with_task(&temp);
+        let task = only_task(&project);
+        let project_root = task.root().to_path_buf();
+        let store = CacheStore::new(&project.root);
 
         let key = store
-            .task_key(&workspace.root, &task, &[])
+            .task_key(&project.root, &task, &[])
             .expect("key succeeds");
         let result = Runner::new()
-            .run(&workspace.root, &task)
+            .run(&project.root, &task)
             .expect("task succeeds");
         store.store(&task, &key, &result).expect("store succeeds");
 
-        fs::remove_file(project.join("output.txt")).expect("remove generated output");
-        fs::write(project.join("outside.txt"), "must remain unchanged")
+        fs::remove_file(project_root.join("output.txt")).expect("remove generated output");
+        fs::write(project_root.join("outside.txt"), "must remain unchanged")
             .expect("write outside target");
-        std::os::unix::fs::symlink("outside.txt", project.join("output.txt"))
+        std::os::unix::fs::symlink("outside.txt", project_root.join("output.txt"))
             .expect("create destination symlink");
 
         let error = store
@@ -1111,7 +1111,7 @@ mod tests {
 
         assert!(error.to_string().contains("symlink"));
         assert_eq!(
-            fs::read_to_string(project.join("outside.txt")).unwrap(),
+            fs::read_to_string(project_root.join("outside.txt")).unwrap(),
             "must remain unchanged"
         );
     }
@@ -1120,21 +1120,21 @@ mod tests {
     #[test]
     fn refuses_to_restore_through_a_symlinked_output_parent() {
         let temp = TempDir::new();
-        let workspace = workspace_with_manifest(
+        let project = project_with_manifest(
             &temp,
             "[project]\nname = \"app\"\n\n[tasks.build]\ncommand = [\"sh\", \"-c\", \"mkdir -p dist/nested && cp src/input.txt dist/nested/artifact.txt\"]\ncache = true\ninputs = [\"src/**\"]\noutputs = [\"dist/**\"]\n",
         );
-        let task = only_task(&workspace);
-        let project = task.root().to_path_buf();
-        let store = CacheStore::new(&workspace.root);
+        let task = only_task(&project);
+        let project_root = task.root().to_path_buf();
+        let store = CacheStore::new(&project.root);
 
-        fs::create_dir_all(project.join("src")).expect("create source directory");
-        fs::write(project.join("src/input.txt"), "cached").expect("write source");
+        fs::create_dir_all(project_root.join("src")).expect("create source directory");
+        fs::write(project_root.join("src/input.txt"), "cached").expect("write source");
         let key = store
-            .task_key(&workspace.root, &task, &[])
+            .task_key(&project.root, &task, &[])
             .expect("key succeeds");
         let result = Runner::new()
-            .run(&workspace.root, &task)
+            .run(&project.root, &task)
             .expect("task succeeds");
         store.store(&task, &key, &result).expect("store succeeds");
 
@@ -1142,8 +1142,8 @@ mod tests {
         fs::create_dir_all(&outside).expect("create outside directory");
         fs::write(outside.join("artifact.txt"), "must remain unchanged")
             .expect("write outside sentinel");
-        fs::remove_dir_all(project.join("dist")).expect("remove real output directory");
-        std::os::unix::fs::symlink(&outside, project.join("dist"))
+        fs::remove_dir_all(project_root.join("dist")).expect("remove real output directory");
+        std::os::unix::fs::symlink(&outside, project_root.join("dist"))
             .expect("create symlinked output parent");
 
         let error = store
@@ -1161,21 +1161,21 @@ mod tests {
     #[test]
     fn preflight_validates_all_outputs_before_copying_any() {
         let temp = TempDir::new();
-        let workspace = workspace_with_manifest(
+        let project = project_with_manifest(
             &temp,
             "[project]\nname = \"app\"\n\n[tasks.build]\ncommand = [\"sh\", \"-c\", \"mkdir -p deep && echo first > output1.txt && echo second > deep/output2.txt\"]\ncache = true\ninputs = [\"input.txt\"]\noutputs = [\"output1.txt\", \"deep/output2.txt\"]\n",
         );
-        let task = only_task(&workspace);
-        let project = task.root().to_path_buf();
-        let store = CacheStore::new(&workspace.root);
+        let task = only_task(&project);
+        let project_root = task.root().to_path_buf();
+        let store = CacheStore::new(&project.root);
 
-        fs::write(project.join("input.txt"), "input").expect("write input");
+        fs::write(project_root.join("input.txt"), "input").expect("write input");
 
         let key = store
-            .task_key(&workspace.root, &task, &[])
+            .task_key(&project.root, &task, &[])
             .expect("key succeeds");
         let result = Runner::new()
-            .run(&workspace.root, &task)
+            .run(&project.root, &task)
             .expect("task succeeds");
         store.store(&task, &key, &result).expect("store succeeds");
 
@@ -1186,14 +1186,20 @@ mod tests {
 
         // First output: replace with a regular file so we can verify it was
         // NOT overwritten by a partial restore.
-        fs::write(project.join("output1.txt"), "old content before restore")
-            .expect("write sentinel to first output");
+        fs::write(
+            project_root.join("output1.txt"),
+            "old content before restore",
+        )
+        .expect("write sentinel to first output");
 
         // Second output: replace the real directory tree with a symlink.
-        fs::remove_dir_all(project.join("deep")).expect("remove deep directory");
-        fs::create_dir_all(project.join("deep")).expect("recreate deep directory");
-        std::os::unix::fs::symlink("../outside/sentinel.txt", project.join("deep/output2.txt"))
-            .expect("create symlink for later output");
+        fs::remove_dir_all(project_root.join("deep")).expect("remove deep directory");
+        fs::create_dir_all(project_root.join("deep")).expect("recreate deep directory");
+        std::os::unix::fs::symlink(
+            "../outside/sentinel.txt",
+            project_root.join("deep/output2.txt"),
+        )
+        .expect("create symlink for later output");
 
         let error = store
             .lookup(&task, &key)
@@ -1204,7 +1210,7 @@ mod tests {
         // The first output was NOT restored because the preflight caught the
         // symlink before any copy started.
         assert_eq!(
-            fs::read_to_string(project.join("output1.txt")).unwrap(),
+            fs::read_to_string(project_root.join("output1.txt")).unwrap(),
             "old content before restore"
         );
         assert_eq!(

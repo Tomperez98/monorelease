@@ -3,17 +3,19 @@
 use std::error::Error as StdError;
 use std::fmt;
 use std::path::Path;
+use std::sync::Arc;
 
 use crate::cache::CacheMode;
 use crate::output::{OutputMode, OutputSink};
-use crate::runner::{Runner, format_command};
+use crate::project::{PlannedTask, Project, ProjectError, TaskNode};
+use crate::runner::{CancellationToken, Runner, format_command};
 use crate::scheduler::{ExecutionSummary, SchedulerError, execute_plan};
-use crate::workspace::{PlannedTask, TaskNode, Workspace, WorkspaceError};
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct PipelineExecution {
     pub cache: CacheMode,
     pub output: OutputMode,
+    pub cancellation: CancellationToken,
 }
 
 impl Default for PipelineExecution {
@@ -21,6 +23,7 @@ impl Default for PipelineExecution {
         Self {
             cache: CacheMode::ReadWrite,
             output: OutputMode::Terminal,
+            cancellation: CancellationToken::new(),
         }
     }
 }
@@ -36,15 +39,27 @@ pub fn run_pipeline_with_mode(
     if jobs == 0 {
         return Err(CiError::InvalidJobs);
     }
-    let project = Workspace::load(path)?;
+    let project = Project::load(path)?;
     let plan = project.plan(pipeline, requested_tasks)?;
     if dry_run {
-        return Ok(format_plan(&project, &plan));
+        return if execution.output == OutputMode::Json {
+            plan_with_output(path, pipeline, requested_tasks, OutputMode::Json)
+        } else {
+            Ok(format_plan(&project, &plan))
+        };
     }
 
     let runner = Runner::new();
-    let output = OutputSink::new(execution.output);
-    let summary = execute_plan(&project, &plan, jobs, &runner, &output, execution.cache)?;
+    let output = Arc::new(OutputSink::new(execution.output));
+    let summary = execute_plan(
+        &project,
+        &plan,
+        jobs,
+        &runner,
+        &output,
+        execution.cache,
+        &execution.cancellation,
+    )?;
     if execution.output == OutputMode::Json {
         Ok(String::new())
     } else {
@@ -66,7 +81,7 @@ pub fn plan_with_output(
     requested_tasks: &[String],
     output_mode: OutputMode,
 ) -> Result<String, CiError> {
-    let project = Workspace::load(path)?;
+    let project = Project::load(path)?;
     let plan = project.plan(pipeline, requested_tasks)?;
     if output_mode == OutputMode::Json {
         return serde_json::to_string(&PlanDocument::from((&project, plan.as_slice())))
@@ -76,14 +91,14 @@ pub fn plan_with_output(
 }
 
 pub fn clean_cache(path: &Path) -> Result<String, CiError> {
-    let project = Workspace::load(path)?;
+    let project = Project::load(path)?;
     let cache_path = project.root.join(".mono").join("cache");
     match std::fs::remove_dir_all(&cache_path) {
         Ok(()) => Ok(format!("removed cache {}", cache_path.display())),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             Ok(format!("cache is already empty {}", cache_path.display()))
         }
-        Err(source) => Err(CiError::Workspace(WorkspaceError::Io {
+        Err(source) => Err(CiError::Project(ProjectError::Io {
             path: cache_path,
             source,
         })),
@@ -104,7 +119,7 @@ pub fn graph_with_output(
     requested_tasks: &[String],
     output_mode: OutputMode,
 ) -> Result<String, CiError> {
-    let project = Workspace::load(path)?;
+    let project = Project::load(path)?;
     let edges = project.graph(pipeline, requested_tasks)?;
     if output_mode == OutputMode::Json {
         return serde_json::to_string(&GraphDocument {
@@ -127,7 +142,7 @@ pub fn graph_with_output(
     }
     let mut output = format!(
         "{} {} ({})",
-        project.scope_label(),
+        "project",
         project.name,
         project.root.display()
     );
@@ -162,6 +177,7 @@ struct PlanTask {
     id: String,
     command: Vec<String>,
     cwd: String,
+    stdin: &'static str,
     cache: bool,
     inputs: Vec<String>,
     outputs: Vec<String>,
@@ -176,8 +192,8 @@ struct PlanTask {
     env: Vec<String>,
 }
 
-impl<'a> From<(&'a Workspace, &'a [PlannedTask])> for PlanDocument {
-    fn from((project, plan): (&'a Workspace, &'a [PlannedTask])) -> Self {
+impl<'a> From<(&'a Project, &'a [PlannedTask])> for PlanDocument {
+    fn from((project, plan): (&'a Project, &'a [PlannedTask])) -> Self {
         Self {
             schema: crate::events::EXECUTION_EVENT_SCHEMA,
             kind: "plan",
@@ -189,6 +205,7 @@ impl<'a> From<(&'a Workspace, &'a [PlannedTask])> for PlanDocument {
                     id: task.id().to_owned(),
                     command: task.command().to_vec(),
                     cwd: task.cwd().display().to_string(),
+                    stdin: task.stdin().as_str(),
                     cache: task.cache(),
                     inputs: task.inputs().to_vec(),
                     outputs: task.outputs().to_vec(),
@@ -226,10 +243,10 @@ struct GraphEdge {
     depends_on: Vec<String>,
 }
 
-fn format_plan(project: &Workspace, plan: &[PlannedTask]) -> String {
+fn format_plan(project: &Project, plan: &[PlannedTask]) -> String {
     let mut output = format!(
         "{} {} ({})",
-        project.scope_label(),
+        "project",
         project.name,
         project.root.display()
     );
@@ -273,15 +290,15 @@ fn format_plan(project: &Workspace, plan: &[PlannedTask]) -> String {
 
 fn format_summary(summary: &ExecutionSummary) -> String {
     format!(
-        "summary: {} completed, {} cached, {} failed, {} blocked",
-        summary.completed, summary.cached, summary.failed, summary.blocked
+        "summary: {} completed, {} cached, {} failed, {} cancelled, {} blocked",
+        summary.completed, summary.cached, summary.failed, summary.cancelled, summary.blocked
     )
 }
 
 #[derive(Debug)]
 pub enum CiError {
     InvalidJobs,
-    Workspace(WorkspaceError),
+    Project(ProjectError),
     Scheduler(Box<SchedulerError>),
     Json { source: serde_json::Error },
 }
@@ -290,7 +307,7 @@ impl fmt::Display for CiError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidJobs => write!(f, "--jobs must be greater than zero"),
-            Self::Workspace(error) => error.fmt(f),
+            Self::Project(error) => error.fmt(f),
             Self::Scheduler(error) => error.fmt(f),
             Self::Json { source } => write!(f, "could not serialize JSON output: {source}"),
         }
@@ -300,7 +317,7 @@ impl fmt::Display for CiError {
 impl StdError for CiError {
     fn source(&self) -> Option<&(dyn StdError + 'static)> {
         match self {
-            Self::Workspace(error) => Some(error),
+            Self::Project(error) => Some(error),
             Self::Scheduler(error) => Some(error),
             Self::Json { source } => Some(source),
             Self::InvalidJobs => None,
@@ -308,9 +325,9 @@ impl StdError for CiError {
     }
 }
 
-impl From<WorkspaceError> for CiError {
-    fn from(error: WorkspaceError) -> Self {
-        Self::Workspace(error)
+impl From<ProjectError> for CiError {
+    fn from(error: ProjectError) -> Self {
+        Self::Project(error)
     }
 }
 
@@ -360,6 +377,7 @@ mod tests {
             PipelineExecution {
                 cache: CacheMode::NoCache,
                 output: OutputMode::Terminal,
+                ..PipelineExecution::default()
             },
         )
         .unwrap();
@@ -382,6 +400,7 @@ mod tests {
             PipelineExecution {
                 cache: CacheMode::NoCache,
                 output: OutputMode::Terminal,
+                ..PipelineExecution::default()
             },
         )
         .unwrap_err();
@@ -405,6 +424,7 @@ mod tests {
             PipelineExecution {
                 cache: CacheMode::NoCache,
                 output: OutputMode::Terminal,
+                ..PipelineExecution::default()
             },
         )
         .unwrap_err();
