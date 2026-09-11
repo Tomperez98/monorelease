@@ -1,4 +1,4 @@
-//! `monore doctor` — validate the complete workspace manifest graph.
+//! `monorelease doctor` — validate the complete workspace manifest graph.
 
 use std::error::Error as StdError;
 use std::fmt;

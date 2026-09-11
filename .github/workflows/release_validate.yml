@@ -6,14 +6,19 @@ on:
     workflows: [Release]
     types: [completed]
   schedule:
+    # Weekly, so upstream drift (runners, hashing tools, the release page) is
+    # caught without waiting for the next release.
     - cron: '0 6 * * 1'
 
 permissions:
   contents: read
 
 concurrency:
-  group: release-validation
+  group: release
   cancel-in-progress: false
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   validate:
@@ -36,7 +41,15 @@ jobs:
             echo 'No release exists yet; validation is complete.'
           fi
 
-      - name: Download latest release assets
+      # The released source, not `main`: the published binary is checked against
+      # the tag it claims to come from.
+      - name: Check out the released source
+        if: steps.release.outputs.exists == 'true'
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ steps.release.outputs.tag }}
+
+      - name: Download release assets
         if: steps.release.outputs.exists == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
@@ -48,18 +61,98 @@ jobs:
             --pattern 'monorelease-*' \
             --dir dist \
             --clobber
+          if gh release view "${{ steps.release.outputs.tag }}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --json assets \
+            --jq 'any(.assets[]; .name == "BUILD-METADATA.json")' | grep -qx true; then
+            gh release download "${{ steps.release.outputs.tag }}" \
+              --repo "$GITHUB_REPOSITORY" \
+              --pattern 'BUILD-METADATA.json' \
+              --dir dist \
+              --clobber
+          else
+            echo 'No BUILD-METADATA.json asset; validating this legacy release without source metadata.'
+          fi
 
-      - name: Verify checksums
+      - name: Extract the Linux artifact
         if: steps.release.outputs.exists == 'true'
-        working-directory: dist
-        run: sha256sum -c SHA256SUMS
-
-      - name: Smoke-test Linux artifact
-        if: steps.release.outputs.exists == 'true'
-        working-directory: dist
         run: |
-          archive="$(find . -name '*x86_64-unknown-linux-gnu.tar.gz' -print -quit)"
+          archive="$(find dist -name '*x86_64-unknown-linux-gnu.tar.gz' -print -quit)"
           test -n "$archive"
-          mkdir extracted
-          tar -xzf "$archive" -C extracted
-          ./extracted/monorelease --version
+          mkdir -p dist/extracted
+          tar -xzf "$archive" -C dist/extracted
+
+      - name: Verify release metadata
+        if: ${{ steps.release.outputs.exists == 'true' && hashFiles('dist/BUILD-METADATA.json') != '' }}
+        env:
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          expected_commit="$(git rev-parse HEAD)"
+          actual_commit="$(jq -r .source_commit dist/BUILD-METADATA.json)"
+          test "$actual_commit" = "$expected_commit" || {
+            echo "metadata source commit $actual_commit does not match released source $expected_commit" >&2
+            exit 1
+          }
+          test "$(jq -r .repository dist/BUILD-METADATA.json)" = "$GITHUB_REPOSITORY"
+          test "$(jq -r .release_tag dist/BUILD-METADATA.json)" = "$RELEASE_TAG"
+          if [[ "$(git cat-file -t "$RELEASE_TAG")" == tag ]]; then
+            test "$(jq -r .tag_object dist/BUILD-METADATA.json)" = "$(git rev-parse "$RELEASE_TAG^{tag}")"
+          fi
+
+      # `xtask` runs the release pipeline; the released binary orchestrates it.
+      - name: Install Rust toolchain
+        if: ${{ steps.release.outputs.exists == 'true' && hashFiles('xtask/Cargo.toml') != '' }}
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # pinned action
+        with:
+          toolchain: 1.85.1
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Cache Cargo dependencies
+        if: ${{ steps.release.outputs.exists == 'true' && hashFiles('xtask/Cargo.toml') != '' }}
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Rebuild released Linux binary
+        if: ${{ steps.release.outputs.exists == 'true' && hashFiles('xtask/Cargo.toml') != '' }}
+        run: cargo build --locked --release --target x86_64-unknown-linux-gnu
+
+      - name: Compare released Linux binary
+        if: ${{ steps.release.outputs.exists == 'true' && hashFiles('xtask/Cargo.toml') != '' }}
+        shell: bash
+        run: |
+          cmp target/x86_64-unknown-linux-gnu/release/monorelease dist/extracted/monorelease || {
+            echo 'the released Linux binary differs from a rebuild of its tagged source' >&2
+            sha256sum target/x86_64-unknown-linux-gnu/release/monorelease dist/extracted/monorelease
+            exit 1
+          }
+
+      - name: Verify Linux artifact provenance
+        if: ${{ steps.release.outputs.exists == 'true' && hashFiles('dist/BUILD-METADATA.json') != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          archive="$(find dist -maxdepth 1 -type f -name '*x86_64-unknown-linux-gnu.tar.gz' -print -quit)"
+          test -n "$archive"
+          gh attestation verify "$archive" --repo "$GITHUB_REPOSITORY"
+
+      - name: Run the release pipeline with the published binary
+        if: ${{ steps.release.outputs.exists == 'true' && hashFiles('xtask/Cargo.toml') != '' }}
+        env:
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+          MONORELEASE_BIN: dist/extracted/monorelease
+          RELEASE_ASSETS: dist
+        run: '"$MONORELEASE_BIN" run release --output github-actions'
+
+      # Releases cut before the pipeline existed: not much to check, but check it.
+      - name: Verify checksums and version
+        if: ${{ steps.release.outputs.exists == 'true' && hashFiles('xtask/Cargo.toml') == '' }}
+        run: |
+          ( cd dist && sha256sum -c SHA256SUMS )
+          ./dist/extracted/monorelease --version

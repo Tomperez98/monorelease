@@ -1,4 +1,4 @@
-//! `monore` — language agnostic project and monorepo tooling.
+//! `monorelease` — language agnostic project and monorepo tooling.
 //!
 //! This is the transport edge: it parses the command line, calls into
 //! [`monorelease`], and maps the single error vocabulary onto stdout, stderr,
@@ -12,10 +12,10 @@ use monorelease::{CacheMode, Error, OutputMode, PipelineExecution};
 
 #[derive(Parser)]
 #[command(
-    name = "monore",
+    name = "monorelease",
     version = env!("CARGO_PKG_VERSION"),
     about = "Language agnostic project and monorepo tooling",
-    after_help = "Run `monore help <command>` for command details."
+    after_help = "Run `monorelease help <command>` for command details."
 )]
 struct Cli {
     /// Project or monorepo directory.
@@ -78,7 +78,7 @@ enum Commands {
     Run {
         #[arg(value_name = "PIPELINE")]
         pipeline: Option<String>,
-        /// Compatibility spelling for task selection; prefer `monore task`.
+        /// Compatibility spelling for task selection; prefer `monorelease task`.
         #[arg(long = "task", hide = true)]
         tasks: Vec<String>,
         #[command(flatten)]
@@ -143,7 +143,7 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(error) => {
-            eprintln!("monore: {error}");
+            eprintln!("monorelease: {error}");
             ExitCode::FAILURE
         }
     }

@@ -1,4 +1,4 @@
-//! Core logic for `monore`.
+//! Core logic for `monorelease`.
 //!
 //! Each subcommand lives in its own module under [`commands`], owns its own
 //! error vocabulary, and is re-exported at the crate root. Everything here
@@ -35,7 +35,7 @@ pub use config::{
 pub use output::OutputMode;
 pub use workspace::{Package, PlannedTask, TaskNode, Workspace, WorkspaceError};
 
-/// Every expected failure a `monore` command can report.
+/// Every expected failure a `monorelease` command can report.
 ///
 /// The signature of a command documents its whole failure space; this union
 /// is what a caller has to handle, and nothing else.

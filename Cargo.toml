@@ -5,6 +5,11 @@ edition = "2024"
 description = "Manifest-driven project and monorepo orchestration"
 license = "Apache-2.0"
 repository = "https://github.com/Tomperez98/monorelease"
+# Repository automation, not part of the published crate.
+exclude = ["/xtask"]
+
+[workspace]
+members = ["xtask"]
 
 [dependencies]
 clap = { version = "4.6.6", features = ["derive"] }

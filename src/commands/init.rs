@@ -1,4 +1,4 @@
-//! `monore init` — scaffold a fresh repository.
+//! `monorelease init` — scaffold a fresh repository.
 
 use std::error::Error as StdError;
 use std::fmt;

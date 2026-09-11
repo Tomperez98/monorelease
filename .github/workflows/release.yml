@@ -3,9 +3,17 @@ name: Release
 on:
   push:
     tags: ['v*']
+  # Resuming a release that failed halfway through: point this at the tag that
+  # already exists instead of moving it.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag to release
+        required: true
+        type: string
 
-permissions:
-  contents: read
+# Start from no permissions; every job grants exactly what it needs.
+permissions: {}
 
 concurrency:
   group: release
@@ -14,6 +22,10 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  # The tag being released. On a push this is the tag; on a manual run it is the
+  # input, so a failed release can be resumed without touching the tag.
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
 
 jobs:
   validate:
@@ -22,13 +34,53 @@ jobs:
     timeout-minutes: 15
     permissions:
       contents: read
+    outputs:
+      source_commit: ${{ steps.source-identity.outputs.source_commit }}
+      tag_object: ${{ steps.source-identity.outputs.tag_object }}
+    env:
+      # The release gates smoke-test this binary against the examples.
+      MONORELEASE_BIN: target/debug/monorelease
     steps:
       - name: Check out repository
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: Capture release source identity
+        id: source-identity
+        shell: bash
+        run: |
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+            echo "RELEASE_TAG must match v<major>.<minor>.<patch>, got '$RELEASE_TAG'" >&2
+            exit 1
+          }
+
+          checkout_commit="$(git rev-parse HEAD)"
+          tag_commit="$(git rev-parse "$RELEASE_TAG^{commit}")"
+          test "$checkout_commit" = "$tag_commit" || {
+            echo "checked out $checkout_commit, but $RELEASE_TAG resolves to $tag_commit" >&2
+            exit 1
+          }
+
+          tag_object=''
+          if [[ "$(git cat-file -t "$RELEASE_TAG")" == tag ]]; then
+            tag_object="$(git rev-parse "$RELEASE_TAG^{tag}")"
+          fi
+
+          echo "source_commit=$checkout_commit" >> "$GITHUB_OUTPUT"
+          echo "tag_object=$tag_object" >> "$GITHUB_OUTPUT"
+          echo "release tag: $RELEASE_TAG"
+          echo "source commit: $checkout_commit"
+          if [[ -n "$tag_object" ]]; then
+            echo "annotated tag object: $tag_object"
+          else
+            echo "tag type: lightweight"
+          fi
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable as of 2026-09-10
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # pinned action
         with:
+          toolchain: 1.85.1
           components: rustfmt, clippy
 
       - name: Cache Cargo dependencies
@@ -42,10 +94,9 @@ jobs:
             ${{ runner.os }}-cargo-
 
       - name: Check tag matches Cargo package version
-        if: github.event_name == 'push'
         shell: bash
         run: |
-          tag_version="${GITHUB_REF_NAME#v}"
+          tag_version="${RELEASE_TAG#v}"
           package_version="$(cargo metadata --locked --no-deps --format-version 1 | jq -r '.packages[0].version')"
           test "$tag_version" = "$package_version" || {
             echo "tag v$tag_version does not match Cargo.toml version $package_version" >&2
@@ -54,6 +105,17 @@ jobs:
 
       - name: Run project CI pipeline
         run: cargo run --locked -- ci --no-cache --output github-actions
+
+      - name: Run release gates
+        run: cargo run --locked -- run release --no-cache --output github-actions
+
+      - name: Upload release notes
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        with:
+          name: release-notes
+          path: RELEASE_NOTES.md
+          if-no-files-found: error
+          retention-days: 7
 
       - name: Verify distributable package
         run: cargo package --locked
@@ -81,13 +143,18 @@ jobs:
     timeout-minutes: 20
     permissions:
       contents: read
+      id-token: write
+      attestations: write
     steps:
       - name: Check out repository
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ env.RELEASE_TAG }}
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable as of 2026-09-10
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # pinned action
         with:
+          toolchain: 1.85.1
           targets: ${{ matrix.target }}
 
       - name: Cache Cargo
@@ -98,12 +165,27 @@ jobs:
       - name: Build release binary
         run: cargo build --locked --release --target ${{ matrix.target }}
 
+      # The artifact must identify itself as the release being cut, not as
+      # whatever the source happened to carry.
+      - name: Assert artifact identity
+        shell: bash
+        run: |
+          version="${RELEASE_TAG#v}"
+          binary="target/${{ matrix.target }}/release/monorelease"
+          if [[ "${{ matrix.archive }}" == "zip" ]]; then binary="$binary.exe"; fi
+          reported="$("$binary" --version)"
+          echo "$reported"
+          test "$reported" = "monorelease $version" || {
+            echo "$binary reports '$reported', expected 'monorelease $version'" >&2
+            exit 1
+          }
+
       - name: Package Unix artifact
         if: matrix.archive == 'tar.gz'
         shell: bash
         run: |
           mkdir -p dist
-          tar -czf "dist/monorelease-${GITHUB_REF_NAME}-${{ matrix.target }}.tar.gz" \
+          tar -czf "dist/monorelease-${RELEASE_TAG}-${{ matrix.target }}.tar.gz" \
             -C "target/${{ matrix.target }}/release" monorelease \
             -C "$GITHUB_WORKSPACE" LICENSE README.md
 
@@ -119,42 +201,140 @@ jobs:
           Copy-Item README.md "$staging/README.md"
           Compress-Archive `
             -Path "$staging/*" `
-            -DestinationPath "dist/monorelease-$env:GITHUB_REF_NAME-${{ matrix.target }}.zip"
+            -DestinationPath "dist/monorelease-$env:RELEASE_TAG-${{ matrix.target }}.zip"
           Remove-Item -Recurse -Force $staging
+
+      - name: Generate build provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: dist/monorelease-*
 
       - name: Upload release artifact
         uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
         with:
-          name: release-${{ matrix.target }}
+          name: artifact-${{ matrix.target }}
           path: dist/*
           if-no-files-found: error
           retention-days: 7
 
   publish:
     name: Publish GitHub Release
-    needs: build
+    needs: [validate, build]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
       contents: write
+    environment: release
+    env:
+      RELEASE_COMMIT: ${{ needs.validate.outputs.source_commit }}
+      RELEASE_TAG_OBJECT: ${{ needs.validate.outputs.tag_object }}
     steps:
       - name: Download release artifacts
         uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
         with:
-          pattern: release-*
+          pattern: artifact-*
           path: dist
           merge-multiple: true
+
+      - name: Download release notes
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: release-notes
+          path: notes
+
+      - name: Write release metadata
+        run: |
+          jq -n \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --arg release_tag "$RELEASE_TAG" \
+            --arg source_commit "$RELEASE_COMMIT" \
+            --arg tag_object "$RELEASE_TAG_OBJECT" \
+            --arg workflow_run "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            '{repository: $repository, release_tag: $release_tag, source_commit: $source_commit, tag_object: (if $tag_object == "" then null else $tag_object end), workflow_run: $workflow_run}' \
+            > dist/BUILD-METADATA.json
 
       - name: Generate checksums
         working-directory: dist
         run: sha256sum monorelease-* > SHA256SUMS
 
-      - name: Create GitHub Release
+      - name: Verify release asset inventory
+        working-directory: dist
+        shell: bash
+        run: |
+          expected_file="$(mktemp)"
+          actual_file="$(mktemp)"
+          archive_expected_file="$(mktemp)"
+          checksum_file="$(mktemp)"
+          trap 'rm -f "$expected_file" "$actual_file" "$archive_expected_file" "$checksum_file"' EXIT
+
+          cat > "$expected_file" <<EOF
+          BUILD-METADATA.json
+          SHA256SUMS
+          monorelease-${RELEASE_TAG}-x86_64-unknown-linux-gnu.tar.gz
+          monorelease-${RELEASE_TAG}-aarch64-apple-darwin.tar.gz
+          monorelease-${RELEASE_TAG}-x86_64-apple-darwin.tar.gz
+          monorelease-${RELEASE_TAG}-x86_64-pc-windows-msvc.zip
+          EOF
+
+          for path in ./*; do
+            [[ -f "$path" ]] && basename "$path"
+          done | sort > "$actual_file"
+          sort -o "$expected_file" "$expected_file"
+          diff -u "$expected_file" "$actual_file"
+
+          grep -v -E '^(BUILD-METADATA.json|SHA256SUMS)$' "$expected_file" > "$archive_expected_file"
+          awk 'NF { print $2 }' SHA256SUMS | sort > "$checksum_file"
+          diff -u "$archive_expected_file" "$checksum_file"
+          sha256sum -c SHA256SUMS
+
+      # Publishing is idempotent: a run that failed after pushing some assets is
+      # resumed against the same draft tag, and an already published tag is
+      # never overwritten.
+      - name: Create or reuse draft release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" dist/* \
+          state="$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+            --json isDraft --jq .isDraft 2>/dev/null || true)"
+          if [[ "$state" == "false" ]]; then
+            echo "::error::$RELEASE_TAG is already published; refusing to overwrite it."
+            exit 1
+          fi
+          if [[ -z "$state" ]]; then
+            gh release create "$RELEASE_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --verify-tag \
+              --draft \
+              --title "$RELEASE_TAG" \
+              --notes-file notes/RELEASE_NOTES.md
+          else
+            echo "$RELEASE_TAG is an existing draft; reusing it."
+          fi
+
+      - name: Upload assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$RELEASE_TAG" dist/* --repo "$GITHUB_REPOSITORY" --clobber
+
+      # The release only becomes the latest release once every asset is in place.
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release edit "$RELEASE_TAG" \
             --repo "$GITHUB_REPOSITORY" \
-            --verify-tag \
-            --title "$GITHUB_REF_NAME" \
-            --generate-notes
+            --title "$RELEASE_TAG" \
+            --notes-file notes/RELEASE_NOTES.md \
+            --draft=false \
+            --latest
+
+  alert_failure:
+    name: Alert on failure
+    needs: [validate, build, publish]
+    if: ${{ always() && contains(needs.*.result, 'failure') }}
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Annotate the failed run
+        run: |
+          echo "::error::$RELEASE_TAG failed. See $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
