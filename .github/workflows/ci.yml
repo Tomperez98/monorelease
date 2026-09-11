@@ -50,7 +50,7 @@ jobs:
             ${{ runner.os }}-cargo-
 
       - name: Validate manifests and run project CI pipeline
-        run: cargo run --locked -- ci --no-cache --output github-actions
+        run: cargo run --locked -- ci --no-cache --output text --ui stream
 
       - name: Verify distributable package
         run: cargo package --locked
