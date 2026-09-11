@@ -195,7 +195,7 @@ impl ProcessLauncher for ProductionLauncher {
             })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        let child = ManagedChild::spawn(&mut command)?;
+        let child = ManagedChild::spawn(command)?;
         Ok(Box::new(child))
     }
 }
@@ -866,6 +866,7 @@ mod tests {
     use std::fs;
     use std::sync::Mutex;
 
+    #[cfg(unix)]
     fn project_with_task(command: &str, timeout_seconds: Option<u64>) -> (TempDir, Project) {
         let temp = TempDir::new();
         let timeout = timeout_seconds
@@ -1037,9 +1038,7 @@ mod tests {
 
         fs::write(
             config_path(temp.path()),
-            format!(
-                "[project]\nname = \"app\"\n\n[pipelines.ci]\ntasks = [\"build\"]\n\n[tasks.build]\ncommand = [\"cmd\", \"/c\", \"spawn_and_exit.bat\"]\n"
-            ),
+            "[project]\nname = \"app\"\n\n[pipelines.ci]\ntasks = [\"build\"]\n\n[tasks.build]\ncommand = [\"cmd\", \"/c\", \"spawn_and_exit.bat\"]\n",
         )
         .expect("write manifest");
 

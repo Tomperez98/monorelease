@@ -27,6 +27,8 @@ Notable changes per release, newest first.
 
 ### Internals
 
+- Delegate cross-platform process-group and Job Object lifecycle management to
+  `process-wrap`, keeping platform-specific process code out of Mono.
 - Add platform-aware cache keys, output digests, and concurrent cache publication.
 - Validate process-tree behavior across the supported operating systems in CI.
 - Harden Git release-source validation and publish release metadata through temporary files with atomic replacement where supported.

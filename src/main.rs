@@ -15,6 +15,8 @@
 //! | `2`  | the command line was wrong; emitted by `clap` while parsing  |
 //! | `3`  | `mono` or its environment failed                      |
 
+#![allow(clippy::result_large_err)]
+
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;

@@ -484,6 +484,7 @@ mod tests {
     use super::*;
     use crate::config::config_path;
     use crate::project::Project;
+    #[cfg(unix)]
     use crate::runner::Runner;
     use crate::testing::TempDir;
     use std::fs;

@@ -2,7 +2,9 @@
 
 use std::fs;
 use std::path::Path;
-use std::process::{Command, Output};
+#[cfg(unix)]
+use std::process::Command;
+use std::process::Output;
 
 mod support;
 
