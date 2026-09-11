@@ -1,4 +1,4 @@
-//! `monore list` — describe the available execution targets.
+//! `monorelease list` — describe the available execution targets.
 
 use std::error::Error as StdError;
 use std::fmt;

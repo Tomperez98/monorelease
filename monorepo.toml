@@ -4,21 +4,46 @@ name = "monorelease"
 [pipelines.ci]
 tasks = ["fmt", "check", "test", "clippy"]
 
+# Release gates. `.github/workflows/release.yml` runs this pipeline before it
+# builds anything, and `release_validate.yml` runs it again with the published
+# binary against the released tag.
+[pipelines.release]
+tasks = ["release-verify"]
+
 [tasks.fmt]
 command = ["cargo", "fmt", "--check"]
 timeout_seconds = 30
 
 [tasks.check]
-command = ["cargo", "check", "--all-targets", "--all-features"]
+command = ["cargo", "check", "--workspace", "--all-targets", "--all-features"]
 depends_on = ["fmt"]
 timeout_seconds = 120
 
 [tasks.test]
-command = ["cargo", "test", "--all-targets", "--all-features"]
+command = ["cargo", "test", "--workspace", "--all-targets", "--all-features"]
 depends_on = ["check"]
 timeout_seconds = 120
 
 [tasks.clippy]
-command = ["cargo", "clippy", "--all-targets", "--all-features", "--", "-D", "warnings"]
+command = ["cargo", "clippy", "--workspace", "--all-targets", "--all-features", "--", "-D", "warnings"]
 depends_on = ["test"]
 timeout_seconds = 120
+
+# Turn CHANGELOG.md into RELEASE_NOTES.md for the tag in RELEASE_TAG. The
+# workflow uploads the file and publishes it with `gh release create`.
+[tasks.release-notes]
+command = ["cargo", "run", "--locked", "--quiet", "-p", "xtask", "--", "notes"]
+timeout_seconds = 60
+
+# Preparation, run by hand before a release:
+#   VERSION=0.1.2 monorelease task changelog
+[tasks.changelog]
+command = ["cargo", "run", "--locked", "--quiet", "-p", "xtask", "--", "changelog", "scaffold"]
+timeout_seconds = 60
+
+# The release gate: the binary must report the version it claims, accept this
+# repository's manifests, and behave on the examples.
+[tasks.release-verify]
+command = ["cargo", "run", "--locked", "--quiet", "-p", "xtask", "--", "verify"]
+depends_on = ["release-notes"]
+timeout_seconds = 300

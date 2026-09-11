@@ -274,12 +274,34 @@ The project dogfoods itself: `.github/workflows/ci.yml` runs the pipeline define
 cargo run --locked -- ci --no-cache --output github-actions
 ```
 
-To cut a release, bump `Cargo.toml`, commit, and push a matching tag. The `Release` workflow checks that the tag equals the package version, builds the four targets, generates `SHA256SUMS`, and publishes a GitHub Release; `Release (validate)` re-downloads a published release, verifies the checksums, and smoke-tests the Linux binary.
+Releasing is a pipeline too, and it is the only place release knowledge lives:
 
 ```bash
-git tag v0.1.1
-git push origin v0.1.1
+RELEASE_TAG=v0.1.2 cargo run --locked -- run release
 ```
+
+The tasks call [`xtask/`](xtask), a Rust helper that is deliberately *not* part of the published binary: `monorelease` stays generic and knows nothing about changelogs, release notes, or where a release is published — the same separation [`examples/release-gate`](examples/release-gate/README.md) describes. Run it directly with `cargo run -p xtask -- --help`.
+
+`release-notes` turns `CHANGELOG.md` into `RELEASE_NOTES.md`, and `release-verify` asserts that the binary reports the version it claims, that this repository's own manifests still validate, that the published `SHA256SUMS` still match when they are available, and that the examples still run. The version of a release is the newest `## ` entry of [`CHANGELOG.md`](CHANGELOG.md), so the notes a reviewer approves are the notes users read. Name that entry `## (unreleased)` to fold a skipped release into the next one.
+
+To cut a release, scaffold the newest changelog entry from the pull requests merged since the last tag, set the same version in `Cargo.toml`, merge, then push the tag:
+
+```bash
+VERSION=0.1.2 cargo run --locked -- task changelog   # edit the result
+# CHANGELOG.md: ## 0.1.2  |  Cargo.toml: version = "0.1.2"
+git tag v0.1.2
+git push origin v0.1.2
+```
+
+The `Release` workflow refuses a tag that matches neither `Cargo.toml` nor the newest changelog entry, verifies that the tag resolves to the checked-out commit, runs the project's `ci` pipeline and release gates, builds the four targets, asserts each binary reports the release version, and generates GitHub Actions provenance for each archive. Before publication it requires exactly the four expected archives, `SHA256SUMS`, and `BUILD-METADATA.json`. The draft only becomes the latest release once every asset is uploaded. Re-running is safe: an existing draft is reused, `--clobber` refreshes its assets, and an already published tag is never overwritten. If a run fails halfway, resume it from the tag instead of moving it:
+
+```bash
+gh workflow run Release --field tag=v0.1.2
+```
+
+`Release (validate)` runs weekly and after every successful release, sharing the `release` concurrency group so it cannot race publication. It checks out the released tag, verifies `BUILD-METADATA.json`, downloads the published assets, rebuilds the Linux binary from the tag, compares it with the published binary, verifies its GitHub Actions provenance, and runs the release pipeline with the published binary — checksums, identity, manifests, and examples. Tags cut before metadata and provenance existed fall back to the legacy checksum/version checks.
+
+The publishing job uses the protected GitHub `release` environment. Repository administrators must create that environment and may configure required reviewers before a release can become public. Published releases are immutable: retry drafts, but supersede a bad published release with a new fix-forward version rather than moving tags or replacing assets.
 
 ## License
 

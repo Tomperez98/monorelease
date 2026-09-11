@@ -28,12 +28,12 @@ impl Drop for TempDir {
     }
 }
 
-fn monore(args: &[&str], cwd: &Path) -> Output {
+fn monorelease(args: &[&str], cwd: &Path) -> Output {
     Command::new(env!("CARGO_BIN_EXE_monorelease"))
         .args(args)
         .current_dir(cwd)
         .output()
-        .expect("run the monore binary")
+        .expect("run the monorelease binary")
 }
 
 fn stdout(output: &Output) -> String {
@@ -48,7 +48,7 @@ fn stderr(output: &Output) -> String {
 fn init_succeeds_with_exit_code_zero() {
     let temp = TempDir::new("init");
 
-    let output = monore(&["init"], temp.path());
+    let output = monorelease(&["init"], temp.path());
 
     assert!(output.status.success(), "stderr: {}", stderr(&output));
     assert!(temp.path().join("monorepo.toml").is_file());
@@ -59,7 +59,7 @@ fn init_succeeds_with_exit_code_zero() {
 fn standalone_init_creates_a_valid_single_package_project() {
     let temp = TempDir::new("standalone-init");
 
-    let output = monore(
+    let output = monorelease(
         &[
             "init",
             "--standalone",
@@ -79,7 +79,7 @@ fn standalone_init_creates_a_valid_single_package_project() {
     assert!(!temp.path().join("apps").exists());
     assert!(!temp.path().join("packages").exists());
 
-    let doctor = monore(&["doctor"], temp.path());
+    let doctor = monorelease(&["doctor"], temp.path());
     assert!(doctor.status.success(), "stderr: {}", stderr(&doctor));
 }
 
@@ -87,7 +87,7 @@ fn standalone_init_creates_a_valid_single_package_project() {
 fn standalone_init_requires_a_command() {
     let temp = TempDir::new("standalone-init-missing-command");
 
-    let output = monore(&["init", "--standalone"], temp.path());
+    let output = monorelease(&["init", "--standalone"], temp.path());
 
     assert_eq!(output.status.code(), Some(1));
     assert!(stderr(&output).contains("requires a non-empty --command"));
@@ -97,12 +97,12 @@ fn standalone_init_requires_a_command() {
 #[test]
 fn cache_clean_removes_local_entries_without_removing_the_workspace() {
     let temp = TempDir::new("cache-clean");
-    assert!(monore(&["init"], temp.path()).status.success());
+    assert!(monorelease(&["init"], temp.path()).status.success());
     let cache_entry = temp.path().join(".monorelease").join("cache").join("entry");
     fs::create_dir_all(&cache_entry).expect("create cache entry");
     fs::write(cache_entry.join("metadata.json"), "cache").expect("write cache metadata");
 
-    let output = monore(&["cache", "clean"], temp.path());
+    let output = monorelease(&["cache", "clean"], temp.path());
 
     assert!(output.status.success(), "stderr: {}", stderr(&output));
     assert!(!temp.path().join(".monorelease/cache").exists());
@@ -112,9 +112,9 @@ fn cache_clean_removes_local_entries_without_removing_the_workspace() {
 #[test]
 fn reinitializing_fails_with_a_nonzero_exit_code() {
     let temp = TempDir::new("reinit");
-    assert!(monore(&["init"], temp.path()).status.success());
+    assert!(monorelease(&["init"], temp.path()).status.success());
 
-    let output = monore(&["init"], temp.path());
+    let output = monorelease(&["init"], temp.path());
 
     assert_eq!(output.status.code(), Some(1));
     assert!(stderr(&output).contains("refusing to overwrite"));
@@ -124,7 +124,7 @@ fn reinitializing_fails_with_a_nonzero_exit_code() {
 fn doctor_fails_with_a_nonzero_exit_code_without_a_root_manifest() {
     let temp = TempDir::new("doctor-missing-root");
 
-    let output = monore(&["doctor"], temp.path());
+    let output = monorelease(&["doctor"], temp.path());
 
     assert_eq!(output.status.code(), Some(1));
     assert!(stderr(&output).contains("could not find a root monorepo.toml"));
@@ -133,9 +133,9 @@ fn doctor_fails_with_a_nonzero_exit_code_without_a_root_manifest() {
 #[test]
 fn doctor_accepts_the_manifest_created_by_init() {
     let temp = TempDir::new("doctor-valid");
-    assert!(monore(&["init"], temp.path()).status.success());
+    assert!(monorelease(&["init"], temp.path()).status.success());
 
-    let output = monore(&["doctor"], temp.path());
+    let output = monorelease(&["doctor"], temp.path());
 
     assert!(output.status.success(), "stderr: {}", stderr(&output));
     assert!(stdout(&output).contains("checked"));
@@ -150,7 +150,7 @@ fn default_command_runs_the_default_pipeline() {
     )
     .expect("write standalone manifest");
 
-    let output = monore(&[], temp.path());
+    let output = monorelease(&[], temp.path());
 
     assert!(output.status.success(), "stderr: {}", stderr(&output));
     assert!(stdout(&output).contains("summary: 1 completed"));
@@ -165,7 +165,7 @@ fn list_describes_available_tasks_and_pipelines() {
     )
     .expect("write standalone manifest");
 
-    let output = monore(&["list"], temp.path());
+    let output = monorelease(&["list"], temp.path());
 
     assert!(output.status.success(), "stderr: {}", stderr(&output));
     let listing = stdout(&output);
@@ -183,7 +183,7 @@ fn unknown_task_suggests_the_closest_task_name() {
     )
     .expect("write standalone manifest");
 
-    let output = monore(&["task", "tests"], temp.path());
+    let output = monorelease(&["task", "tests"], temp.path());
 
     assert_eq!(output.status.code(), Some(1));
     assert!(stderr(&output).contains("Did you mean 'test'?"));
@@ -199,14 +199,14 @@ fn standalone_project_runs_without_workspace_members() {
     )
     .expect("write standalone manifest");
 
-    let plan = monore(&["plan"], &temp.path().join("src"));
+    let plan = monorelease(&["plan"], &temp.path().join("src"));
 
     assert!(plan.status.success(), "stderr: {}", stderr(&plan));
     let plan_output = stdout(&plan);
     assert!(plan_output.find("app:build").unwrap() < plan_output.find("app:test").unwrap());
     assert!(!plan_output.contains("workspace:build"));
 
-    let run = monore(&["ci"], temp.path());
+    let run = monorelease(&["ci"], temp.path());
     assert!(run.status.success(), "stderr: {}", stderr(&run));
     assert!(stdout(&run).contains("summary: 2 completed"));
 }
@@ -214,7 +214,7 @@ fn standalone_project_runs_without_workspace_members() {
 #[test]
 fn ci_dry_run_discovers_a_package_manifest() {
     let temp = TempDir::new("ci-dry-run");
-    assert!(monore(&["init"], temp.path()).status.success());
+    assert!(monorelease(&["init"], temp.path()).status.success());
 
     let package = temp.path().join("packages").join("api");
     fs::create_dir_all(&package).expect("create package directory");
@@ -224,7 +224,7 @@ fn ci_dry_run_discovers_a_package_manifest() {
     )
     .expect("write package manifest");
 
-    let output = monore(&["ci", "--dry-run"], temp.path());
+    let output = monorelease(&["ci", "--dry-run"], temp.path());
 
     assert!(output.status.success(), "stderr: {}", stderr(&output));
     assert!(stdout(&output).contains("would run api:build"));
@@ -249,9 +249,9 @@ fn ci_reuses_cached_outputs_and_supports_cache_bypass_flags() {
     .expect("write package manifest");
     fs::write(package.join("seed"), "hello").expect("write input");
 
-    let first = monore(&["ci"], temp.path());
+    let first = monorelease(&["ci"], temp.path());
     assert!(first.status.success(), "stderr: {}", stderr(&first));
-    let second = monore(&["ci"], temp.path());
+    let second = monorelease(&["ci"], temp.path());
     assert!(second.status.success(), "stderr: {}", stderr(&second));
     assert!(stderr(&second).contains("cache hit"));
     assert_eq!(
@@ -259,14 +259,14 @@ fn ci_reuses_cached_outputs_and_supports_cache_bypass_flags() {
         "1\n"
     );
 
-    let forced = monore(&["ci", "--force"], temp.path());
+    let forced = monorelease(&["ci", "--force"], temp.path());
     assert!(forced.status.success(), "stderr: {}", stderr(&forced));
     assert_eq!(
         fs::read_to_string(package.join("count")).expect("read count"),
         "2\n"
     );
 
-    let without_cache = monore(&["ci", "--no-cache"], temp.path());
+    let without_cache = monorelease(&["ci", "--no-cache"], temp.path());
     assert!(
         without_cache.status.success(),
         "stderr: {}",
@@ -279,7 +279,7 @@ fn ci_reuses_cached_outputs_and_supports_cache_bypass_flags() {
     );
 
     fs::remove_file(package.join("artifact")).expect("remove output");
-    let restored = monore(&["ci"], temp.path());
+    let restored = monorelease(&["ci"], temp.path());
     assert!(restored.status.success(), "stderr: {}", stderr(&restored));
     assert!(stderr(&restored).contains("cache hit"));
     assert_eq!(
@@ -304,7 +304,7 @@ fn plan_includes_a_workspace_task_after_package_dependencies() {
     )
     .expect("write package manifest");
 
-    let output = monore(&["plan"], temp.path());
+    let output = monorelease(&["plan"], temp.path());
 
     assert!(output.status.success(), "stderr: {}", stderr(&output));
     let output = stdout(&output);
@@ -314,7 +314,7 @@ fn plan_includes_a_workspace_task_after_package_dependencies() {
 #[test]
 fn doctor_rejects_a_missing_task_working_directory() {
     let temp = TempDir::new("doctor-missing-cwd");
-    assert!(monore(&["init"], temp.path()).status.success());
+    assert!(monorelease(&["init"], temp.path()).status.success());
 
     let package = temp.path().join("packages").join("api");
     fs::create_dir_all(&package).expect("create package directory");
@@ -324,7 +324,7 @@ fn doctor_rejects_a_missing_task_working_directory() {
     )
     .expect("write package manifest");
 
-    let output = monore(&["doctor"], temp.path());
+    let output = monorelease(&["doctor"], temp.path());
 
     assert_eq!(output.status.code(), Some(1));
     assert!(stderr(&output).contains("missing"));
@@ -334,7 +334,7 @@ fn doctor_rejects_a_missing_task_working_directory() {
 #[test]
 fn ci_keeps_task_output_and_status_lines_separate() {
     let temp = TempDir::new("ci-output-boundaries");
-    assert!(monore(&["init"], temp.path()).status.success());
+    assert!(monorelease(&["init"], temp.path()).status.success());
 
     let package = temp.path().join("packages").join("api");
     fs::create_dir_all(&package).expect("create package directory");
@@ -344,7 +344,7 @@ fn ci_keeps_task_output_and_status_lines_separate() {
     )
     .expect("write package manifest");
 
-    let output = monore(&["ci", "--task", "build"], temp.path());
+    let output = monorelease(&["ci", "--task", "build"], temp.path());
 
     assert!(output.status.success(), "stderr: {}", stderr(&output));
     assert!(
@@ -365,7 +365,7 @@ fn github_actions_output_is_explicit() {
     )
     .expect("write standalone manifest");
 
-    let output = monore(&["ci", "--output", "github-actions"], temp.path());
+    let output = monorelease(&["ci", "--output", "github-actions"], temp.path());
 
     assert!(output.status.success(), "stderr: {}", stderr(&output));
     assert!(stdout(&output).contains("::group::app:build"));
@@ -377,7 +377,7 @@ fn github_actions_output_is_explicit() {
 #[test]
 fn ci_reports_failed_task_output_and_context() {
     let temp = TempDir::new("ci-failure");
-    assert!(monore(&["init"], temp.path()).status.success());
+    assert!(monorelease(&["init"], temp.path()).status.success());
 
     let package = temp.path().join("packages").join("api");
     fs::create_dir_all(&package).expect("create package directory");
@@ -390,7 +390,7 @@ fn ci_reports_failed_task_output_and_context() {
     // `--jobs 1` keeps this test about failure blocking: with the default
     // worker count the independent `api:test` is dispatched before `api:build`
     // reports its failure, so it would not be counted as blocked.
-    let output = monore(&["ci", "--jobs", "1"], temp.path());
+    let output = monorelease(&["ci", "--jobs", "1"], temp.path());
 
     assert_eq!(output.status.code(), Some(1));
     assert!(stderr(&output).contains("boom"));
@@ -421,7 +421,7 @@ fn ci_reports_task_start_progress() {
         .expect("write package manifest");
     }
 
-    let output = monore(&["ci", "--jobs", "2"], temp.path());
+    let output = monorelease(&["ci", "--jobs", "2"], temp.path());
 
     assert!(output.status.success(), "stderr: {}", stderr(&output));
     assert!(stderr(&output).contains("▶ a:build"));
@@ -435,7 +435,7 @@ fn ci_reports_task_start_progress() {
 fn jobs_defaults_to_machine_parallelism() {
     let temp = TempDir::new("jobs-default");
 
-    let output = monore(&["run", "--help"], temp.path());
+    let output = monorelease(&["run", "--help"], temp.path());
 
     let expected = std::thread::available_parallelism()
         .map(|count| count.get())
@@ -463,7 +463,7 @@ fn plan_redacts_task_environment_values() {
     )
     .expect("write package manifest");
 
-    let output = monore(&["plan"], temp.path());
+    let output = monorelease(&["plan"], temp.path());
     let output = stdout(&output);
 
     assert!(output.contains("[inputs=input.txt]"));
@@ -477,7 +477,7 @@ fn plan_redacts_task_environment_values() {
 #[test]
 fn plan_and_graph_commands_expose_task_dependencies() {
     let temp = TempDir::new("plan-graph");
-    assert!(monore(&["init"], temp.path()).status.success());
+    assert!(monorelease(&["init"], temp.path()).status.success());
 
     for (name, dependency) in [("shared", ""), ("web", "depends_on = [\"shared:build\"]\n")] {
         let package = temp.path().join("packages").join(name);
@@ -491,11 +491,11 @@ fn plan_and_graph_commands_expose_task_dependencies() {
         .expect("write package manifest");
     }
 
-    let plan = monore(&["plan"], temp.path());
+    let plan = monorelease(&["plan"], temp.path());
     assert!(plan.status.success(), "stderr: {}", stderr(&plan));
     assert!(stdout(&plan).find("shared:build").unwrap() < stdout(&plan).find("web:build").unwrap());
 
-    let graph = monore(&["graph"], temp.path());
+    let graph = monorelease(&["graph"], temp.path());
     assert!(graph.status.success(), "stderr: {}", stderr(&graph));
     assert!(stdout(&graph).contains("web:build <- shared:build"));
 }
