@@ -1755,27 +1755,27 @@ Add to the `mod tests` in `src/release.rs`:
     #[test]
     fn a_matching_checkout_tag_and_commit_verify() {
         let mut answers = vec!["abc123".to_owned(), "abc123".to_owned()];
-        let git = move |args: &[&str]| -> Result<String, ReleaseError> {
+        let mut git = move |args: &[&str]| -> Result<String, ReleaseError> {
             if args[0] == "check-ref-format" {
                 return Ok(String::new());
             }
             Ok(answers.remove(0))
         };
 
-        assert!(verify_source_with(&git, "v1.0.0", "abc123").is_ok());
+        assert!(verify_source_with(&mut git, "v1.0.0", "abc123").is_ok());
     }
 
     #[test]
     fn a_checkout_that_does_not_match_the_tag_is_rejected() {
         let mut answers = vec!["abc123".to_owned(), "def456".to_owned()];
-        let git = move |args: &[&str]| -> Result<String, ReleaseError> {
+        let mut git = move |args: &[&str]| -> Result<String, ReleaseError> {
             if args[0] == "check-ref-format" {
                 return Ok(String::new());
             }
             Ok(answers.remove(0))
         };
 
-        let error = verify_source_with(&git, "v1.0.0", "abc123").unwrap_err();
+        let error = verify_source_with(&mut git, "v1.0.0", "abc123").unwrap_err();
 
         assert!(error.to_string().contains("does not match"), "{error}");
     }
@@ -1783,35 +1783,35 @@ Add to the `mod tests` in `src/release.rs`:
     #[test]
     fn a_checkout_that_does_not_match_the_expected_commit_is_rejected() {
         let mut answers = vec!["abc123".to_owned(), "abc123".to_owned()];
-        let git = move |args: &[&str]| -> Result<String, ReleaseError> {
+        let mut git = move |args: &[&str]| -> Result<String, ReleaseError> {
             if args[0] == "check-ref-format" {
                 return Ok(String::new());
             }
             Ok(answers.remove(0))
         };
 
-        let error = verify_source_with(&git, "v1.0.0", "other").unwrap_err();
+        let error = verify_source_with(&mut git, "v1.0.0", "other").unwrap_err();
 
         assert!(error.to_string().contains("does not match"), "{error}");
     }
 
     #[test]
     fn a_git_failure_propagates_as_a_command_error() {
-        let git = |args: &[&str]| -> Result<String, ReleaseError> {
+        let mut git = |args: &[&str]| -> Result<String, ReleaseError> {
             if args[0] == "check-ref-format" {
                 return Ok(String::new());
             }
             Err(ReleaseError::Command("git exploded".to_owned()))
         };
 
-        let error = verify_source_with(&git, "v1.0.0", "abc123").unwrap_err();
+        let error = verify_source_with(&mut git, "v1.0.0", "abc123").unwrap_err();
 
         assert!(matches!(error, ReleaseError::Command(_)), "{error}");
     }
 
     #[test]
     fn an_empty_or_unsafe_identity_is_rejected_before_running_git() {
-        let git = |args: &[&str]| -> Result<String, ReleaseError> {
+        let mut git = |args: &[&str]| -> Result<String, ReleaseError> {
             panic!("git must not run: {args:?}")
         };
 
@@ -1822,7 +1822,7 @@ Add to the `mod tests` in `src/release.rs`:
             ("v1 0 0", "abc123"),
             ("v1.0.0", "abc 123"),
         ] {
-            let error = verify_source_with(&git, tag, commit).unwrap_err();
+            let error = verify_source_with(&mut git, tag, commit).unwrap_err();
             assert!(matches!(error, ReleaseError::Invalid(_)), "{tag}/{commit}: {error}");
         }
     }
@@ -1844,7 +1844,8 @@ pub fn verify_source(
     tag: &str,
     expected_commit: &str,
 ) -> Result<(), ReleaseError> {
-    verify_source_with(&|args: &[&str]| git(repository, args), tag, expected_commit)
+    let mut run = |args: &[&str]| git(repository, args);
+    verify_source_with(&mut run, tag, expected_commit)
 }
 
 /// The verification workflow, with `run_git` as the only side effect.
@@ -1852,8 +1853,14 @@ pub fn verify_source(
 /// `run_git` receives the argument vector after `git` — for example
 /// `["rev-parse", "HEAD"]` — so a test can script the answers without a
 /// repository and without spawning a process.
+///
+/// It is `&mut dyn FnMut`, NOT `&dyn Fn`: the scripted stubs consume a queue of
+/// answers, which makes them `FnMut`, and `&dyn Fn` rejects them with `E0525`
+/// ("expected a closure that implements the `Fn` trait, but this closure only
+/// implements `FnMut`"). Mutating closures also need a `mut` binding so the
+/// reborrow as `&mut` is legal.
 fn verify_source_with(
-    run_git: &dyn Fn(&[&str]) -> Result<String, ReleaseError>,
+    run_git: &mut dyn FnMut(&[&str]) -> Result<String, ReleaseError>,
     tag: &str,
     expected_commit: &str,
 ) -> Result<(), ReleaseError> {
@@ -1894,6 +1901,13 @@ Expected: all PASS (13 tests in the module).
 
 Run: `cargo test --workspace --all-targets --all-features`
 Expected: PASS, including `tests/release_cli.rs`.
+
+**As-built note.** Two things execution added beyond the snippets above, both kept:
+
+1. **`&mut dyn FnMut`, not `&dyn Fn` (required).** The scripted stubs consume a queue of answers, so they implement `FnMut`; `&dyn Fn` rejects them with `E0525`. The stubs also need `mut` bindings so `&mut git` is a legal reborrow. Both were reproduced with a standalone `rustc` check before this task ran. See Step 3.
+2. **The doc comment on `verify_source` was wrong and is now fixed.** It read `/// Verify metadata, checksums, and the exact regular-file inventory.` — a description of `verify_manifest`, not of source verification. It now reads `/// Verify that \`repository\` is checked out at exactly \`tag\` and \`expected_commit\`.`. This is a pre-existing documentation defect, not a behavior change, but it is worth knowing that it was there.
+
+**Residual gap, deliberately not closed:** the seam tests `verify_source`'s workflow logic against scripted `git` answers. It does not test `git()` itself, so nothing in the suite proves the real subprocess call still works end to end. `git()` is 15 lines and untouched by this task; closing the gap would need a `git init` fixture and a machine with `git` installed, which is a separate decision.
 
 - [ ] **Step 5: Commit**
 
