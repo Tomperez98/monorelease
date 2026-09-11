@@ -3,9 +3,8 @@
 use std::error::Error as StdError;
 use std::fmt;
 use std::fs;
-use std::io::{self, Write};
+use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::changelog::{Changelog, Request, today};
 
@@ -87,61 +86,15 @@ fn read(path: &Path) -> Result<String, ChangelogError> {
 }
 
 fn write(path: &Path, contents: &str) -> Result<(), ChangelogError> {
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let temporary = path.with_file_name(format!(
-        ".{}.{}.{}.tmp",
-        path.file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("changelog"),
-        std::process::id(),
-        COUNTER.fetch_add(1, Ordering::Relaxed),
-    ));
-
-    let result = (|| {
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temporary)
-            .map_err(|source| ChangelogError::Write {
-                path: path.to_path_buf(),
-                source,
-            })?;
-        file.write_all(contents.as_bytes())
-            .and_then(|_| file.sync_all())
-            .map_err(|source| ChangelogError::Write {
-                path: path.to_path_buf(),
-                source,
-            })?;
-        drop(file);
-        replace_file(&temporary, path).map_err(|source| ChangelogError::Write {
-            path: path.to_path_buf(),
-            source,
-        })
-    })();
-
-    if result.is_err() {
-        let _ = fs::remove_file(&temporary);
-    }
-    result
-}
-
-fn replace_file(temporary: &Path, destination: &Path) -> io::Result<()> {
-    #[cfg(unix)]
-    {
-        fs::rename(temporary, destination)
-    }
-
-    #[cfg(not(unix))]
-    {
-        match fs::rename(temporary, destination) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                fs::remove_file(destination)?;
-                fs::rename(temporary, destination)
-            }
-            Err(error) => Err(error),
-        }
-    }
+    crate::atomic_file::write(
+        path,
+        contents.as_bytes(),
+        crate::atomic_file::WriteMode::Replace,
+    )
+    .map_err(|source| ChangelogError::Write {
+        path: path.to_path_buf(),
+        source,
+    })
 }
 
 #[derive(Debug)]

@@ -10,10 +10,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error as StdError;
 use std::fmt;
 use std::fs;
-use std::io::{self, Write};
+use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 pub const METADATA_FILE_NAME: &str = "BUILD-METADATA.json";
 pub const CHECKSUMS_FILE_NAME: &str = "SHA256SUMS";
@@ -607,62 +606,15 @@ fn read_to_string(path: &Path) -> Result<String, ReleaseError> {
 /// an existing destination before renaming; callers still get crash-safe
 /// temporary-file cleanup, but not an atomic replacement guarantee on Windows.
 fn write_file(path: &Path, contents: &str) -> Result<(), ReleaseError> {
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let temporary = path.with_file_name(format!(
-        ".{}.{}.{}.tmp",
-        path.file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("release"),
-        std::process::id(),
-        COUNTER.fetch_add(1, Ordering::Relaxed),
-    ));
-
-    let result = (|| {
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temporary)
-            .map_err(|source| ReleaseError::Write {
-                path: path.to_path_buf(),
-                source,
-            })?;
-        file.write_all(contents.as_bytes())
-            .and_then(|_| file.sync_all())
-            .map_err(|source| ReleaseError::Write {
-                path: path.to_path_buf(),
-                source,
-            })?;
-        drop(file);
-
-        replace_file(&temporary, path).map_err(|source| ReleaseError::Write {
-            path: path.to_path_buf(),
-            source,
-        })
-    })();
-
-    if result.is_err() {
-        let _ = fs::remove_file(&temporary);
-    }
-    result
-}
-
-fn replace_file(temporary: &Path, destination: &Path) -> io::Result<()> {
-    #[cfg(unix)]
-    {
-        fs::rename(temporary, destination)
-    }
-
-    #[cfg(not(unix))]
-    {
-        match fs::rename(temporary, destination) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                fs::remove_file(destination)?;
-                fs::rename(temporary, destination)
-            }
-            Err(error) => Err(error),
-        }
-    }
+    crate::atomic_file::write(
+        path,
+        contents.as_bytes(),
+        crate::atomic_file::WriteMode::Replace,
+    )
+    .map_err(|source| ReleaseError::Write {
+        path: path.to_path_buf(),
+        source,
+    })
 }
 
 #[cfg(test)]

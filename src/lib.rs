@@ -6,6 +6,7 @@
 //! invariant; nothing knows about `clap`, stdout, or exit codes — that
 //! translation happens once, in `main.rs`.
 
+mod atomic_file;
 mod cache;
 mod changelog;
 mod commands;
