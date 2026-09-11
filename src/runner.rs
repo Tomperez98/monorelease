@@ -66,7 +66,10 @@ impl Runner {
     }
 
     /// Execute one planned task and return its output and timing.
-    #[allow(dead_code)]
+    ///
+    /// A convenience for tests and for callers that want one task without a
+    /// plan; the scheduler always uses [`run_with_options`](Self::run_with_options).
+    #[cfg(test)]
     pub fn run(
         &self,
         project_root: &Path,

@@ -73,12 +73,6 @@ impl ManagedChild {
         self.child.wait()
     }
 
-    /// Borrow the inner [`Child`] for stdout/stderr pipe access.
-    #[allow(dead_code)]
-    pub(crate) fn child(&mut self) -> &mut Child {
-        &mut self.child
-    }
-
     /// Take the stdout pipe reader.
     pub(crate) fn take_stdout(&mut self) -> Option<Box<dyn std::io::Read + Send>> {
         self.child
