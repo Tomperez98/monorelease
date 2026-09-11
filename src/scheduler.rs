@@ -59,10 +59,28 @@ pub(crate) fn execute_plan(
         .collect::<BTreeSet<_>>();
     let root = Arc::new(project.root.clone());
     let cache = CacheStore::new(&root);
+    // Read the ambient environment once, at the edge of the run. The cache
+    // hasher receives it as data, so a cache key never depends on process
+    // state it cannot be told about.
+    //
+    // `vars_os` plus a lossy conversion, not `vars`: `vars` panics when any
+    // ambient variable is not valid Unicode, which would abort the entire run
+    // because of an unrelated environment variable. A non-Unicode value is an
+    // expected condition, not a broken invariant, so it must not panic.
     let cache_session =
         if !matches!(cache_mode, CacheMode::NoCache) && plan.iter().any(PlannedTask::cache) {
+            let environment = std::env::vars_os()
+                .map(|(key, value)| {
+                    (
+                        key.to_string_lossy().into_owned(),
+                        value.to_string_lossy().into_owned(),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>();
             Some(Arc::new(
-                cache.prepare(&root, plan).map_err(SchedulerError::Cache)?,
+                cache
+                    .prepare(&root, environment)
+                    .map_err(SchedulerError::Cache)?,
             ))
         } else {
             None
@@ -473,7 +491,7 @@ fn execute_task(job: WorkerJob) -> WorkerReport {
     let mut key = None;
     if can_cache {
         let session = cache_session.expect("cacheable tasks require a prepared cache session");
-        match cache.task_key_with_session(session.as_ref(), &root, &task, &dependency_keys) {
+        match cache.task_key_with_session(session.as_ref(), &task, &dependency_keys) {
             Ok(computed) => key = Some(computed),
             Err(error) => return WorkerReport::CacheFailed(error),
         }

@@ -12,6 +12,7 @@ use std::time::Instant;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::config::config_path;
 use crate::project::PlannedTask;
 use crate::runner::{CapturedOutput, TaskResult};
 
@@ -34,11 +35,13 @@ pub(crate) struct CacheStore {
 
 /// Immutable cache state shared by every task in one execution.
 ///
-/// Manifests and cache-directory setup are project state, not task state. Keeping
-/// them here prevents every cacheable task from repeating the same filesystem work.
+/// Manifests, the ambient environment, and cache-directory setup are project
+/// state, not task state. Keeping them here prevents every cacheable task from
+/// repeating the same filesystem work and keeps `std::env` out of the hasher.
 #[derive(Debug, Clone)]
 pub(crate) struct CacheSession {
     project_manifest: Vec<u8>,
+    environment: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -66,11 +69,14 @@ impl CacheStore {
     pub(crate) fn prepare(
         &self,
         project_root: &Path,
-        _plan: &[PlannedTask],
+        environment: BTreeMap<String, String>,
     ) -> Result<CacheSession, CacheError> {
         self.ensure_gitignore()?;
-        let project_manifest = read_file(&project_root.join("mono.toml"))?;
-        Ok(CacheSession { project_manifest })
+        let project_manifest = read_file(&config_path(project_root))?;
+        Ok(CacheSession {
+            project_manifest,
+            environment,
+        })
     }
 
     /// Compatibility helper for tests and callers that key one task outside a run.
@@ -81,14 +87,13 @@ impl CacheStore {
         task: &PlannedTask,
         dependency_keys: &[String],
     ) -> Result<String, CacheError> {
-        let session = self.prepare(project_root, std::slice::from_ref(task))?;
-        self.task_key_with_session(&session, project_root, task, dependency_keys)
+        let session = self.prepare(project_root, BTreeMap::new())?;
+        self.task_key_with_session(&session, task, dependency_keys)
     }
 
     pub(crate) fn task_key_with_session(
         &self,
         session: &CacheSession,
-        _project_root: &Path,
         task: &PlannedTask,
         dependency_keys: &[String],
     ) -> Result<String, CacheError> {
@@ -126,7 +131,7 @@ impl CacheStore {
 
         let mut environment = BTreeMap::new();
         if task.cache_env().iter().any(|variable| variable == "*") {
-            environment.extend(std::env::vars());
+            environment.clone_from(&session.environment);
             environment.extend(task.env().clone());
         } else {
             for variable in task.cache_env() {
@@ -135,7 +140,7 @@ impl CacheStore {
                     task.env()
                         .get(variable)
                         .cloned()
-                        .or_else(|| std::env::var(variable).ok())
+                        .or_else(|| session.environment.get(variable).cloned())
                         .unwrap_or_else(|| "<unset>".to_owned()),
                 );
             }
@@ -909,10 +914,10 @@ mod tests {
         let task = only_task(&project);
         let store = CacheStore::new(&project.root);
         let session = store
-            .prepare(&project.root, std::slice::from_ref(&task))
+            .prepare(&project.root, BTreeMap::new())
             .expect("cache session prepares");
         let first = store
-            .task_key_with_session(&session, &project.root, &task, &[])
+            .task_key_with_session(&session, &task, &[])
             .expect("key succeeds");
         project
             .tasks
@@ -921,9 +926,120 @@ mod tests {
             .max_output_bytes += 1;
         let changed_task = only_task(&project);
         let second = store
-            .task_key_with_session(&session, &project.root, &changed_task, &[])
+            .task_key_with_session(&session, &changed_task, &[])
             .expect("key succeeds");
         assert_ne!(first, second);
+    }
+
+    fn project_with_cache_env(temp: &TempDir, cache_env: &str, task_env: &str) -> Project {
+        fs::write(
+            config_path(temp.path()),
+            format!(
+                "[project]\nname = \"fixture\"\n\n[pipelines.ci]\ntasks = [\"build\"]\n\n[tasks.build]\ncommand = [\"sh\", \"-c\", \"cat input.txt > output.txt\"]\ncache = true\ninputs = [\"input.txt\"]\noutputs = [\"output.txt\"]\ncache_env = [{cache_env}]\n{task_env}"
+            ),
+        )
+        .expect("write root manifest");
+        fs::write(temp.path().join("input.txt"), "input").expect("write input");
+        Project::load(temp.path()).expect("project loads")
+    }
+
+    fn key_with_environment(
+        store: &CacheStore,
+        project: &Project,
+        task: &PlannedTask,
+        environment: BTreeMap<String, String>,
+    ) -> String {
+        let session = store
+            .prepare(&project.root, environment)
+            .expect("cache session prepares");
+        store
+            .task_key_with_session(&session, task, &[])
+            .expect("key succeeds")
+    }
+
+    #[test]
+    fn a_declared_cache_environment_variable_changes_the_key() {
+        let temp = TempDir::new();
+        let project = project_with_cache_env(&temp, "\"MODE\"", "");
+        let task = only_task(&project);
+        let store = CacheStore::new(&project.root);
+
+        let debug = key_with_environment(
+            &store,
+            &project,
+            &task,
+            BTreeMap::from([("MODE".to_owned(), "debug".to_owned())]),
+        );
+        let release = key_with_environment(
+            &store,
+            &project,
+            &task,
+            BTreeMap::from([("MODE".to_owned(), "release".to_owned())]),
+        );
+
+        assert_ne!(debug, release);
+    }
+
+    #[test]
+    fn an_unset_cache_environment_variable_hashes_as_unset() {
+        let temp = TempDir::new();
+        let project = project_with_cache_env(&temp, "\"MODE\"", "");
+        let task = only_task(&project);
+        let store = CacheStore::new(&project.root);
+
+        let first = key_with_environment(&store, &project, &task, BTreeMap::new());
+        let second = key_with_environment(&store, &project, &task, BTreeMap::new());
+
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn a_task_environment_value_overrides_the_process_environment() {
+        let temp = TempDir::new();
+        let project = project_with_cache_env(&temp, "\"MODE\"", "env = { MODE = \"check\" }\n");
+        let task = only_task(&project);
+        let store = CacheStore::new(&project.root);
+
+        let from_task = key_with_environment(
+            &store,
+            &project,
+            &task,
+            BTreeMap::from([("MODE".to_owned(), "debug".to_owned())]),
+        );
+        let from_task_again = key_with_environment(
+            &store,
+            &project,
+            &task,
+            BTreeMap::from([("MODE".to_owned(), "release".to_owned())]),
+        );
+
+        assert_eq!(
+            from_task, from_task_again,
+            "the task's own env must win over the ambient environment"
+        );
+    }
+
+    #[test]
+    fn a_wildcard_cache_environment_includes_every_variable() {
+        let temp = TempDir::new();
+        let project = project_with_cache_env(&temp, "\"*\"", "");
+        let task = only_task(&project);
+        let store = CacheStore::new(&project.root);
+
+        let one = key_with_environment(
+            &store,
+            &project,
+            &task,
+            BTreeMap::from([("UNRELATED".to_owned(), "one".to_owned())]),
+        );
+        let two = key_with_environment(
+            &store,
+            &project,
+            &task,
+            BTreeMap::from([("UNRELATED".to_owned(), "two".to_owned())]),
+        );
+
+        assert_ne!(one, two);
     }
 
     #[test]
