@@ -4,7 +4,7 @@
 //! [`mono`], and maps the single error vocabulary onto stdout, stderr,
 //! and an exit code — in exactly one place.
 //!
-//! Every argument is validated while parsing, so [`run`] only ever sees
+//! Every argument is validated while parsing, so [`dispatch`] only ever sees
 //! well-formed commands and its failure space is exactly the library's. The
 //! exit code this edge publishes is:
 //!
@@ -346,7 +346,7 @@ fn main() -> ExitCode {
         return ExitCode::from(EXIT_TOOL);
     }
 
-    let code = match run(root, output, command, cancellation) {
+    let code = match dispatch(root, output, command, cancellation) {
         Ok(summary) => emit_summary(&mut io::stdout().lock(), &summary),
         Err(error) if output == OutputMode::Json => {
             emit_error(&mut io::stdout().lock(), &error, output)
@@ -387,15 +387,7 @@ fn emit_summary(sink: &mut impl Write, summary: &str) -> u8 {
 fn emit_error(sink: &mut impl Write, error: &Error, output: OutputMode) -> u8 {
     let code = exit_code(error);
     if output == OutputMode::Json {
-        let _ = sink.write_all(
-            serialize(&ErrorDocument {
-                schema: mono::JSON_OUTPUT_SCHEMA,
-                kind: "error",
-                code,
-                message: &error.to_string(),
-            })
-            .as_bytes(),
-        );
+        let _ = sink.write_all(error_document(error).as_bytes());
         let _ = sink.write_all(b"\n");
     } else {
         let _ = writeln!(sink, "mono: {error}");
@@ -522,7 +514,7 @@ const NO_TASK_FILTER: &[String] = &[];
 ///
 /// Each subcommand owns a small helper below, so this match reads as a dispatch
 /// table and each helper documents the failure space it can surface.
-fn run(
+fn dispatch(
     root: PathBuf,
     output: OutputMode,
     command: Option<Commands>,
@@ -735,6 +727,15 @@ struct ErrorDocument<'a> {
 /// Serialize a document that contains only serializable fields.
 fn serialize(document: &impl serde::Serialize) -> String {
     serde_json::to_string(document).expect("output documents contain only serializable fields")
+}
+
+fn error_document(error: &Error) -> String {
+    serialize(&ErrorDocument {
+        schema: mono::JSON_OUTPUT_SCHEMA,
+        kind: "error",
+        code: exit_code(error),
+        message: &error.to_string(),
+    })
 }
 
 fn success_document(output: OutputMode, kind: &'static str, message: String) -> String {
@@ -987,7 +988,19 @@ mod tests {
     }
 
     #[test]
-    fn error_documents_have_the_documented_shape() {
+    fn error_document_is_json_ready_without_writing_to_a_stream() {
+        let error = Error::Ci(CiError::InvalidJobs);
+        let value: serde_json::Value =
+            serde_json::from_str(&error_document(&error)).expect("valid JSON");
+
+        assert_eq!(value["schema"], mono::JSON_OUTPUT_SCHEMA);
+        assert_eq!(value["kind"], "error");
+        assert_eq!(value["code"], EXIT_USAGE);
+        assert!(value["message"].as_str().unwrap().contains("--jobs"));
+    }
+
+    #[test]
+    fn error_documents_have_the_documented_shape_on_the_json_transport() {
         let error = Error::Ci(CiError::InvalidJobs);
         let mut sink = Vec::new();
 
@@ -998,6 +1011,26 @@ mod tests {
         assert_eq!(value["kind"], "error");
         assert_eq!(value["code"], EXIT_USAGE);
         assert!(value["message"].as_str().unwrap().contains("--jobs"));
+    }
+
+    #[test]
+    fn dispatch_rejects_invalid_jobs_before_loading_a_project() {
+        let error = dispatch(
+            PathBuf::from("does-not-exist"),
+            OutputMode::Terminal,
+            Some(Commands::Run {
+                pipeline: None,
+                tasks: Vec::new(),
+                options: ExecutionOptions {
+                    jobs: 0,
+                    ..ExecutionOptions::default()
+                },
+            }),
+            CancellationToken::new(),
+        )
+        .expect_err("zero workers must fail");
+
+        assert!(matches!(error, Error::Ci(CiError::InvalidJobs)));
     }
 
     #[test]

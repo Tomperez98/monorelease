@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::error::Error as StdError;
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -53,39 +53,21 @@ pub(crate) struct SchedulerServices {
     pub(crate) environment: BTreeMap<String, String>,
 }
 
-struct SchedulerOptions<'a> {
-    jobs: usize,
-    cache_mode: CacheMode,
-    cancellation: &'a CancellationToken,
-    services: &'a SchedulerServices,
+pub(crate) struct SchedulerOptions<'a> {
+    pub(crate) jobs: usize,
+    pub(crate) cache_mode: CacheMode,
+    pub(crate) cancellation: &'a CancellationToken,
+    pub(crate) services: &'a SchedulerServices,
 }
 
-/// Execute a validated plan through the production services.
-///
-/// Convenience wrapper: creates the ambient environment, cache storage, and
-/// thread sleeper, then delegates to [`execute_plan_with_services`].
-pub(crate) fn execute_plan(
-    project: &Project,
-    plan: &[PlannedTask],
-    jobs: usize,
-    runner: Arc<dyn TaskExecutor>,
-    output: &Arc<OutputSink>,
-    cache_mode: CacheMode,
-    cancellation: &CancellationToken,
-) -> Result<ExecutionSummary, SchedulerError> {
-    let root = Arc::new(project.root.clone());
-    let services = SchedulerServices {
+/// Create the production scheduler services for one project.
+pub(crate) fn production_services(project_root: &Path) -> SchedulerServices {
+    let root = Arc::new(project_root.to_path_buf());
+    SchedulerServices {
         cache: Arc::new(CacheStore::new(&root)),
         sleeper: Arc::new(ThreadSleeper),
         environment: ambient_environment(),
-    };
-    let options = SchedulerOptions {
-        jobs,
-        cache_mode,
-        cancellation,
-        services: &services,
-    };
-    execute_plan_with_services(project, plan, runner, output, &options)
+    }
 }
 
 /// Execute a validated plan with explicit cache, sleeper, and environment.
@@ -94,7 +76,17 @@ pub(crate) fn execute_plan(
 /// environment reads — flow through the supplied services so that the
 /// scheduling loop can be driven deterministically in tests without a real
 /// filesystem, process tree, or wall clock.
-fn execute_plan_with_services(
+pub(crate) fn execute_plan_with_services(
+    project: &Project,
+    plan: &[PlannedTask],
+    runner: Arc<dyn TaskExecutor>,
+    output: &Arc<OutputSink>,
+    options: &SchedulerOptions<'_>,
+) -> Result<ExecutionSummary, SchedulerError> {
+    execute_plan_with_options(project, plan, runner, output, options)
+}
+
+fn execute_plan_with_options(
     project: &Project,
     plan: &[PlannedTask],
     runner: Arc<dyn TaskExecutor>,
@@ -1414,14 +1406,19 @@ mod tests {
     ) -> Result<ExecutionSummary, SchedulerError> {
         let (_temp, project, plan) = project_and_plan(manifest);
         // The temp project must outlive the call, so keep `_temp` in scope.
-        execute_plan(
-            &project,
-            &plan,
+        let services = production_services(&project.root);
+        let options = SchedulerOptions {
             jobs,
-            Arc::clone(executor) as Arc<dyn TaskExecutor>,
-            output,
             cache_mode,
             cancellation,
+            services: &services,
+        };
+        execute_plan_with_services(
+            &project,
+            &plan,
+            Arc::clone(executor) as Arc<dyn TaskExecutor>,
+            output,
+            &options,
         )
     }
 

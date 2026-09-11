@@ -98,10 +98,15 @@ mod tests {
     #[test]
     fn a_second_init_refuses_to_overwrite() {
         let temp = TempDir::new();
-        init(temp.path()).expect("first init succeeds");
+        let written = init(temp.path()).expect("first init succeeds");
+        let original = fs::read(&written).expect("read original manifest");
 
         let error = init(temp.path()).expect_err("second init refuses");
 
+        assert_eq!(
+            fs::read(&written).expect("read preserved manifest"),
+            original
+        );
         assert!(
             matches!(error, InitError::AlreadyInitialized(ref path) if path == &config_path(temp.path())),
             "{error}"

@@ -197,6 +197,23 @@ mod tests {
     }
 
     #[test]
+    fn notes_rejects_an_empty_entry_without_writing_the_output_file() {
+        let temp = TempDir::new();
+        let changelog = temp.path().join(DEFAULT_PATH);
+        let notes_path = temp.path().join(DEFAULT_NOTES_PATH);
+        fs::write(&changelog, "# Changelog\n\n## (unreleased)\n").unwrap();
+
+        let error = notes(&changelog, "unreleased", &notes_path).expect_err("empty entry fails");
+
+        assert!(
+            error
+                .to_string()
+                .contains("entry `## (unreleased)` is empty")
+        );
+        assert!(!notes_path.exists());
+    }
+
+    #[test]
     fn scaffold_on_writes_the_supplied_date() {
         let temp = TempDir::new();
         let path = temp.path().join(DEFAULT_PATH);

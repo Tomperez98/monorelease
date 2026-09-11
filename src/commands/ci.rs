@@ -9,7 +9,26 @@ use crate::cache::CacheMode;
 use crate::output::{OutputMode, OutputSink};
 use crate::project::{PlannedTask, Project, ProjectError, TaskNode};
 use crate::runner::{CancellationToken, Runner, TaskExecutor, format_command};
-use crate::scheduler::{ExecutionSummary, SchedulerError, execute_plan};
+use crate::scheduler::{
+    ExecutionSummary, SchedulerError, SchedulerOptions, SchedulerServices,
+    execute_plan_with_services, production_services,
+};
+
+pub(crate) struct PipelineServices {
+    runner: Arc<dyn TaskExecutor>,
+    output: Arc<OutputSink>,
+    scheduler: SchedulerServices,
+}
+
+impl PipelineServices {
+    fn production(project: &Project, output: OutputMode) -> Self {
+        Self {
+            runner: Arc::new(Runner::new()),
+            output: Arc::new(OutputSink::new(output)),
+            scheduler: production_services(&project.root),
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct PipelineExecution {
@@ -43,28 +62,46 @@ pub fn run_pipeline_with_mode(
     let plan = project.plan(pipeline, requested_tasks)?;
     if dry_run {
         return if execution.output == OutputMode::Json {
-            plan_with_output(path, pipeline, requested_tasks, OutputMode::Json)
+            serde_json::to_string(&PlanDocument::from((&project, plan.as_slice())))
+                .map_err(|source| CiError::Json { source })
         } else {
             Ok(format_plan(&project, &plan))
         };
     }
 
-    let runner: Arc<dyn TaskExecutor> = Arc::new(Runner::new());
-    let output = Arc::new(OutputSink::new(execution.output));
-    let summary = execute_plan(
-        &project,
-        &plan,
-        jobs,
-        runner,
-        &output,
-        execution.cache,
-        &execution.cancellation,
-    )?;
+    let services = PipelineServices::production(&project, execution.output);
+    let summary = execute_loaded_pipeline(&project, &plan, jobs, &execution, &services)?;
     if execution.output == OutputMode::Json {
         Ok(String::new())
     } else {
         Ok(format_summary(&summary))
     }
+}
+
+pub(crate) fn execute_loaded_pipeline(
+    project: &Project,
+    plan: &[PlannedTask],
+    jobs: usize,
+    execution: &PipelineExecution,
+    services: &PipelineServices,
+) -> Result<ExecutionSummary, CiError> {
+    if jobs == 0 {
+        return Err(CiError::InvalidJobs);
+    }
+    let options = SchedulerOptions {
+        jobs,
+        cache_mode: execution.cache,
+        cancellation: &execution.cancellation,
+        services: &services.scheduler,
+    };
+    execute_plan_with_services(
+        project,
+        plan,
+        Arc::clone(&services.runner),
+        &services.output,
+        &options,
+    )
+    .map_err(Into::into)
 }
 
 pub fn plan(
@@ -340,9 +377,267 @@ impl From<SchedulerError> for CiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cache::{CacheBackend, CacheError, CacheSession};
     use crate::config::config_path;
+    use crate::runner::{CapturedOutput, RunnerError, TaskResult};
+    use crate::scheduler::{RetrySleeper, SchedulerServices};
     use crate::testing::TempDir;
+    use std::collections::BTreeMap;
     use std::fs;
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct RecordingExecutor {
+        calls: Mutex<Vec<String>>,
+    }
+
+    impl RecordingExecutor {
+        fn calls(&self) -> Vec<String> {
+            self.calls
+                .lock()
+                .expect("executor calls are not poisoned")
+                .clone()
+        }
+    }
+
+    impl TaskExecutor for RecordingExecutor {
+        fn execute(
+            &self,
+            _project_root: &Path,
+            task: &PlannedTask,
+            _cancellation: Option<&CancellationToken>,
+            _output: Option<crate::runner::OutputCallback>,
+        ) -> Result<TaskResult, RunnerError> {
+            self.calls
+                .lock()
+                .expect("executor calls are not poisoned")
+                .push(task.id().to_owned());
+            Ok(TaskResult {
+                output: CapturedOutput::default(),
+                elapsed: std::time::Duration::ZERO,
+                cached: false,
+            })
+        }
+    }
+
+    struct NoopSleeper;
+
+    impl RetrySleeper for NoopSleeper {
+        fn sleep(&self, _duration: std::time::Duration) {}
+    }
+
+    struct HitCache {
+        result: TaskResult,
+    }
+
+    impl CacheBackend for HitCache {
+        fn prepare(
+            &self,
+            _project_root: &Path,
+            _environment: BTreeMap<String, String>,
+        ) -> Result<CacheSession, CacheError> {
+            Ok(CacheSession::for_test())
+        }
+
+        fn task_key(
+            &self,
+            _session: &CacheSession,
+            _task: &PlannedTask,
+            _dependency_keys: &[String],
+        ) -> Result<String, CacheError> {
+            Ok("scripted-key".to_owned())
+        }
+
+        fn lookup(
+            &self,
+            _task: &PlannedTask,
+            _key: &str,
+        ) -> Result<Option<TaskResult>, CacheError> {
+            Ok(Some(self.result.clone()))
+        }
+
+        fn store(
+            &self,
+            _task: &PlannedTask,
+            _key: &str,
+            _result: &TaskResult,
+        ) -> Result<(), CacheError> {
+            Ok(())
+        }
+    }
+
+    fn injected_services(
+        runner: Arc<dyn TaskExecutor>,
+        cache: Arc<dyn CacheBackend>,
+    ) -> PipelineServices {
+        PipelineServices {
+            runner,
+            output: Arc::new(OutputSink::test_sink(
+                OutputMode::Terminal,
+                1,
+                Box::new(Vec::new()),
+                Box::new(Vec::new()),
+            )),
+            scheduler: SchedulerServices {
+                cache,
+                sleeper: Arc::new(NoopSleeper),
+                environment: BTreeMap::new(),
+            },
+        }
+    }
+
+    fn load_project(temp: &TempDir, manifest: &str) -> (Project, Vec<PlannedTask>) {
+        fs::write(config_path(temp.path()), manifest).expect("write project manifest");
+        let project = Project::load(temp.path()).expect("project loads");
+        let plan = project.plan(None, &[]).expect("plan succeeds");
+        (project, plan)
+    }
+
+    #[test]
+    fn loaded_pipeline_uses_the_injected_executor_and_returns_summary() {
+        let temp = TempDir::new();
+        let (project, plan) = load_project(
+            &temp,
+            "[project]\nname = \"fixture\"\n\n[pipelines.ci]\ntasks = [\"app\"]\n\n[tasks.base]\ncommand = [\"echo\", \"base\"]\n\n[tasks.app]\ncommand = [\"echo\", \"app\"]\ndepends_on = [\"base\"]\n",
+        );
+        let executor = Arc::new(RecordingExecutor::default());
+        let services = injected_services(
+            Arc::clone(&executor) as Arc<dyn TaskExecutor>,
+            Arc::new(HitCache {
+                result: TaskResult {
+                    output: CapturedOutput::default(),
+                    elapsed: std::time::Duration::ZERO,
+                    cached: true,
+                },
+            }),
+        );
+        let execution = PipelineExecution {
+            cache: CacheMode::NoCache,
+            output: OutputMode::Terminal,
+            ..PipelineExecution::default()
+        };
+
+        let summary = execute_loaded_pipeline(&project, &plan, 1, &execution, &services)
+            .expect("injected pipeline succeeds");
+
+        assert_eq!(executor.calls(), vec!["base".to_owned(), "app".to_owned()]);
+        assert_eq!(summary.completed, 2);
+        assert_eq!(summary.cached, 0);
+    }
+
+    #[test]
+    fn loaded_pipeline_does_not_invoke_the_executor_when_the_injected_cache_hits() {
+        let temp = TempDir::new();
+        fs::create_dir(temp.path().join("src")).expect("create input directory");
+        fs::write(temp.path().join("src/input.txt"), "input").expect("write input");
+        let (project, plan) = load_project(
+            &temp,
+            "[project]\nname = \"fixture\"\n\n[pipelines.ci]\ntasks = [\"build\"]\n\n[tasks.build]\ncommand = [\"echo\", \"build\"]\ncache = true\ninputs = [\"src/**\"]\noutputs = [\"dist/**\"]\n",
+        );
+        let executor = Arc::new(RecordingExecutor::default());
+        let services = injected_services(
+            Arc::clone(&executor) as Arc<dyn TaskExecutor>,
+            Arc::new(HitCache {
+                result: TaskResult {
+                    output: CapturedOutput::default(),
+                    elapsed: std::time::Duration::ZERO,
+                    cached: true,
+                },
+            }),
+        );
+        let execution = PipelineExecution::default();
+
+        let summary = execute_loaded_pipeline(&project, &plan, 1, &execution, &services)
+            .expect("cached pipeline succeeds");
+
+        assert!(executor.calls().is_empty());
+        assert_eq!(summary.cached, 1);
+        assert_eq!(summary.completed, 0);
+    }
+
+    #[test]
+    fn loaded_pipeline_rejects_zero_jobs_before_dispatching() {
+        let temp = TempDir::new();
+        let (project, plan) = load_project(
+            &temp,
+            "[project]\nname = \"fixture\"\n\n[pipelines.ci]\ntasks = [\"build\"]\n\n[tasks.build]\ncommand = [\"echo\", \"build\"]\n",
+        );
+        let executor = Arc::new(RecordingExecutor::default());
+        let services = injected_services(
+            Arc::clone(&executor) as Arc<dyn TaskExecutor>,
+            Arc::new(HitCache {
+                result: TaskResult {
+                    output: CapturedOutput::default(),
+                    elapsed: std::time::Duration::ZERO,
+                    cached: true,
+                },
+            }),
+        );
+
+        let error =
+            execute_loaded_pipeline(&project, &plan, 0, &PipelineExecution::default(), &services)
+                .expect_err("zero workers must fail");
+
+        assert!(matches!(error, CiError::InvalidJobs));
+        assert!(executor.calls().is_empty());
+    }
+
+    #[test]
+    fn plan_json_contains_stable_task_metadata_without_environment_values() {
+        let temp = TempDir::new();
+        fs::write(
+            config_path(temp.path()),
+            "[project]\nname = \"fixture\"\n\n[pipelines.ci]\ntasks = [\"app\"]\n\n[tasks.base]\ncommand = [\"echo\", \"base\"]\n\n[tasks.app]\ncommand = [\"echo\", \"app\"]\ndepends_on = [\"base\"]\nenv = { TOKEN = \"secret\" }\n",
+        )
+        .expect("write project manifest");
+
+        let document =
+            plan_with_output(temp.path(), None, &[], OutputMode::Json).expect("JSON plan succeeds");
+        let value: serde_json::Value = serde_json::from_str(&document).expect("valid JSON");
+
+        assert_eq!(value["schema"], crate::events::EXECUTION_EVENT_SCHEMA);
+        assert_eq!(value["kind"], "plan");
+        assert_eq!(value["tasks"][0]["id"], "base");
+        assert_eq!(value["tasks"][1]["id"], "app");
+        assert_eq!(value["tasks"][1]["env"][0], "TOKEN");
+        assert!(!document.contains("secret"));
+    }
+
+    #[test]
+    fn graph_json_contains_one_dependency_edge_per_planned_task() {
+        let temp = TempDir::new();
+        fs::write(
+            config_path(temp.path()),
+            "[project]\nname = \"fixture\"\n\n[pipelines.ci]\ntasks = [\"app\"]\n\n[tasks.base]\ncommand = [\"echo\", \"base\"]\n\n[tasks.app]\ncommand = [\"echo\", \"app\"]\ndepends_on = [\"base\"]\n",
+        )
+        .expect("write project manifest");
+
+        let document = graph_with_output(temp.path(), None, &[], OutputMode::Json)
+            .expect("JSON graph succeeds");
+        let value: serde_json::Value = serde_json::from_str(&document).expect("valid JSON");
+
+        assert_eq!(value["kind"], "graph");
+        assert_eq!(value["edges"].as_array().expect("edge array").len(), 2);
+        assert_eq!(value["edges"][1]["task"], "app");
+        assert_eq!(value["edges"][1]["depends_on"][0], "base");
+    }
+
+    #[test]
+    fn terminal_plan_redacts_environment_values() {
+        let temp = TempDir::new();
+        fs::write(
+            config_path(temp.path()),
+            "[project]\nname = \"fixture\"\n\n[pipelines.ci]\ntasks = [\"build\"]\n\n[tasks.build]\ncommand = [\"echo\", \"build\"]\nenv = { TOKEN = \"secret\", MODE = \"check\" }\n",
+        )
+        .expect("write project manifest");
+
+        let output = plan(temp.path(), None, &[]).expect("terminal plan succeeds");
+
+        assert!(output.contains("env TOKEN=<redacted>"));
+        assert!(output.contains("env MODE=<redacted>"));
+        assert!(!output.contains("secret"));
+        assert!(!output.contains("check"));
+    }
 
     #[test]
     fn dry_run_reports_dependency_order_and_commands() {

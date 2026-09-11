@@ -5,6 +5,7 @@
 
 use std::io;
 use std::process::{Child, Command, ExitStatus};
+use std::time::Duration;
 
 use crate::runner::{ChildProcess, ProcessExit};
 
@@ -210,7 +211,16 @@ impl ManagedChild {
     }
 
     fn terminate_tree_unix(child: &mut Child, platform: &UnixState) -> io::Result<()> {
-        let pgid = platform.pgid;
+        let mut sleep = std::thread::sleep;
+        Self::terminate_group_with(child, platform.pgid, Duration::from_millis(100), &mut sleep)
+    }
+
+    fn terminate_group_with(
+        child: &mut Child,
+        pgid: i32,
+        grace: Duration,
+        sleep: &mut dyn FnMut(Duration),
+    ) -> io::Result<()> {
         if pgid <= 0 {
             return Err(io::Error::other("invalid process group id"));
         }
@@ -221,8 +231,7 @@ impl ManagedChild {
         let _ = unsafe { libc::kill(-pgid, libc::SIGTERM) };
 
         // Give processes a moment to react to SIGTERM, then SIGKILL survivors.
-        // Use a short sleep so that well-behaved processes exit gracefully.
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        sleep(grace);
         let ret = unsafe { libc::kill(-pgid, libc::SIGKILL) };
         if ret == -1 {
             let err = io::Error::last_os_error();
@@ -387,6 +396,30 @@ impl ManagedChild {
         unsafe {
             CloseHandle(platform.job_handle);
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unix_termination_rejects_an_invalid_process_group_before_sleeping() {
+        let mut command = Command::new("true");
+        let mut child = ManagedChild::spawn(&mut command).expect("spawn child");
+        let mut slept = false;
+
+        let error = ManagedChild::terminate_group_with(
+            &mut child.child,
+            0,
+            Duration::from_millis(100),
+            &mut |_| slept = true,
+        )
+        .expect_err("an invalid process group must fail");
+        child.wait().expect("reap child");
+
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert!(!slept);
     }
 }
 

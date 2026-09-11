@@ -115,6 +115,34 @@ struct CachedOutput {
     mode: Option<u32>,
 }
 
+fn select_cache_environment(
+    task: &PlannedTask,
+    ambient: &BTreeMap<String, String>,
+) -> BTreeMap<String, String> {
+    if task.cache_env().iter().any(|variable| variable == "*") {
+        let mut environment = ambient.clone();
+        environment.extend(task.env().clone());
+        return environment;
+    }
+
+    task.cache_env()
+        .iter()
+        .map(|variable| {
+            let value = task
+                .env()
+                .get(variable)
+                .cloned()
+                .or_else(|| ambient.get(variable).cloned())
+                .unwrap_or_else(|| "<unset>".to_owned());
+            (variable.clone(), value)
+        })
+        .collect()
+}
+
+fn valid_metadata(metadata: &CacheMetadata, key: &str) -> bool {
+    metadata.version == CACHE_FORMAT_VERSION && metadata.key == key
+}
+
 impl CacheStore {
     pub(crate) fn new(project_root: &Path) -> Self {
         Self {
@@ -185,23 +213,7 @@ impl CacheStore {
 
         hash_bytes(&mut hasher, "project-manifest", &session.project_manifest);
 
-        let mut environment = BTreeMap::new();
-        if task.cache_env().iter().any(|variable| variable == "*") {
-            environment.clone_from(&session.environment);
-            environment.extend(task.env().clone());
-        } else {
-            for variable in task.cache_env() {
-                environment.insert(
-                    variable.clone(),
-                    task.env()
-                        .get(variable)
-                        .cloned()
-                        .or_else(|| session.environment.get(variable).cloned())
-                        .unwrap_or_else(|| "<unset>".to_owned()),
-                );
-            }
-        }
-        for (variable, value) in environment {
+        for (variable, value) in select_cache_environment(task, &session.environment) {
             hash_string(&mut hasher, &variable);
             hash_string(&mut hasher, &value);
         }
@@ -241,7 +253,7 @@ impl CacheStore {
             Ok(metadata) => metadata,
             Err(_) => return Ok(None),
         };
-        if metadata.version != CACHE_FORMAT_VERSION || metadata.key != key {
+        if !valid_metadata(&metadata, key) {
             return Ok(None);
         }
 
@@ -558,6 +570,164 @@ mod tests {
 
     fn only_task(project: &Project) -> PlannedTask {
         project.plan(None, &[]).expect("plan succeeds").remove(0)
+    }
+
+    fn write_cache_entry(
+        store: &CacheStore,
+        key: &str,
+        metadata: &CacheMetadata,
+        output: Option<(&str, &[u8])>,
+    ) {
+        let entry = store.entry_path(key);
+        fs::create_dir_all(entry.join("outputs")).expect("create cache entry");
+        fs::write(
+            entry.join("metadata.json"),
+            serde_json::to_vec(metadata).expect("serialize metadata"),
+        )
+        .expect("write metadata");
+        fs::write(entry.join("stdout"), b"stdout").expect("write stdout");
+        fs::write(entry.join("stderr"), b"stderr").expect("write stderr");
+        if let Some((path, contents)) = output {
+            fs::write(entry.join("outputs").join(path), contents).expect("write cached output");
+        }
+    }
+
+    #[test]
+    fn malformed_cache_metadata_is_a_cache_miss() {
+        let temp = TempDir::new();
+        let project = project_with_task(&temp);
+        let task = only_task(&project);
+        let store = CacheStore::new(&project.root);
+        let entry = store.entry_path("malformed");
+        fs::create_dir_all(&entry).expect("create cache entry");
+        fs::write(entry.join("metadata.json"), b"not json").expect("write metadata");
+
+        assert!(
+            store
+                .lookup(&task, "malformed")
+                .expect("lookup succeeds")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn cache_metadata_for_a_missing_output_is_a_cache_miss_without_restoring_files() {
+        let temp = TempDir::new();
+        let project = project_with_task(&temp);
+        let task = only_task(&project);
+        let store = CacheStore::new(&project.root);
+        let metadata = CacheMetadata {
+            version: CACHE_FORMAT_VERSION,
+            key: "missing-output".to_owned(),
+            outputs: vec![CachedOutput {
+                path: "output.txt".to_owned(),
+                sha256: hex_digest(&Sha256::digest(b"output")),
+                mode: None,
+            }],
+        };
+        write_cache_entry(&store, "missing-output", &metadata, None);
+
+        assert!(
+            store
+                .lookup(&task, "missing-output")
+                .expect("lookup succeeds")
+                .is_none()
+        );
+        assert!(!task.root().join("output.txt").exists());
+    }
+
+    #[test]
+    fn cache_metadata_with_a_wrong_output_digest_is_a_cache_miss() {
+        let temp = TempDir::new();
+        let project = project_with_task(&temp);
+        let task = only_task(&project);
+        let store = CacheStore::new(&project.root);
+        let metadata = CacheMetadata {
+            version: CACHE_FORMAT_VERSION,
+            key: "wrong-digest".to_owned(),
+            outputs: vec![CachedOutput {
+                path: "output.txt".to_owned(),
+                sha256: "wrong".to_owned(),
+                mode: None,
+            }],
+        };
+        write_cache_entry(
+            &store,
+            "wrong-digest",
+            &metadata,
+            Some(("output.txt", b"output")),
+        );
+
+        assert!(
+            store
+                .lookup(&task, "wrong-digest")
+                .expect("lookup succeeds")
+                .is_none()
+        );
+        assert!(!task.root().join("output.txt").exists());
+    }
+
+    #[test]
+    fn cache_environment_selection_preserves_override_and_unset_rules() {
+        let temp = TempDir::new();
+        let project = project_with_cache_env(
+            &temp,
+            "\"MODE\", \"MISSING\"",
+            "env = { MODE = \"task\" }\n",
+        );
+        let task = only_task(&project);
+        let ambient = BTreeMap::from([("MODE".to_owned(), "ambient".to_owned())]);
+
+        assert_eq!(
+            select_cache_environment(&task, &ambient),
+            BTreeMap::from([
+                ("MODE".to_owned(), "task".to_owned()),
+                ("MISSING".to_owned(), "<unset>".to_owned()),
+            ])
+        );
+    }
+
+    #[test]
+    fn wildcard_cache_environment_merges_ambient_values_and_task_overrides() {
+        let temp = TempDir::new();
+        let project = project_with_cache_env(&temp, "\"*\"", "env = { MODE = \"task\" }\n");
+        let task = only_task(&project);
+        let ambient = BTreeMap::from([
+            ("MODE".to_owned(), "ambient".to_owned()),
+            ("CI".to_owned(), "true".to_owned()),
+        ]);
+
+        assert_eq!(
+            select_cache_environment(&task, &ambient),
+            BTreeMap::from([
+                ("CI".to_owned(), "true".to_owned()),
+                ("MODE".to_owned(), "task".to_owned()),
+            ])
+        );
+    }
+
+    #[test]
+    fn cache_metadata_requires_the_current_version_and_requested_key() {
+        let valid = CacheMetadata {
+            version: CACHE_FORMAT_VERSION,
+            key: "key".to_owned(),
+            outputs: Vec::new(),
+        };
+        let wrong_version = CacheMetadata {
+            version: CACHE_FORMAT_VERSION + 1,
+            key: "key".to_owned(),
+            outputs: Vec::new(),
+        };
+        let wrong_key = CacheMetadata {
+            version: CACHE_FORMAT_VERSION,
+            key: "other".to_owned(),
+            outputs: Vec::new(),
+        };
+
+        assert!(valid_metadata(&valid, "key"));
+        assert!(!valid_metadata(&valid, "other"));
+        assert!(!valid_metadata(&wrong_version, "key"));
+        assert!(!valid_metadata(&wrong_key, "key"));
     }
 
     #[test]
