@@ -2,6 +2,22 @@
 
 Notable changes per release, newest first.
 
+
+## 0.1.5
+Released: 2026-09-12
+
+### Features
+
+-
+
+### Fixes
+
+-
+
+### Internals
+
+-
+
 ## 0.1.4
 Released: 2026-09-11
 
@@ -41,13 +57,16 @@ tag to be `v` + that heading, and the body under it becomes the GitHub release
 notes, so the changelog a reviewer approves is exactly what users read. Cutting a
 release is:
 
-1. add the `## <version>` entry and set the same version in `Cargo.toml`,
-2. merge it, then push the tag `v<version>`.
+1. run `mono changelog prepare` (or pass an explicit version),
+2. edit and review the entry with `mono changelog check`,
+3. merge it, then push the tag `v<version>`.
 
-If a release is skipped, name the entry `## (unreleased)` and fold it into the
+If a release is skipped, prepare the entry as `## (unreleased)` and fold it into the
 next version on the following release. Versions are monotonic but may skip
 numbers: shipping nothing is cheaper than shipping something broken. `Released:`
-is the date the entry was drafted; correct it if the release slips.
+is the date the entry was drafted; correct it if the release slips. Committed
+package manifests remain pinned placeholders and are stamped from the tag during
+release preparation.
 
 ## 0.1.3
 Released: 2026-09-11

@@ -87,27 +87,11 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
-      - name: Verify release source with Mono
-        run: |
-          cargo run --locked --quiet -- release source \
-            --tag "$RELEASE_TAG" \
-            --commit "$(git rev-parse HEAD)"
-
-      - name: Check tag matches Cargo package version
-        shell: bash
-        run: |
-          tag_version="${RELEASE_TAG#v}"
-          package_version="$(cargo metadata --locked --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "mono") | .version')"
-          test "$tag_version" = "$package_version" || {
-            echo "tag v$tag_version does not match Cargo.toml version $package_version" >&2
-            exit 1
-          }
-
-      - name: Run project CI pipeline
-        run: cargo run --locked -- ci --no-cache --output text --ui stream
-
-      - name: Run release gates
-        run: cargo run --locked -- run release --no-cache --output text --ui stream
+      # The coordinator validates the immutable source, stamps all release
+      # files, runs CI and release gates, packages the crate, writes notes, and
+      # restores the committed placeholders before returning.
+      - name: Prepare the release
+        run: cargo run --locked --quiet -p xtask -- release-prepare --tag "$RELEASE_TAG"
 
       - name: Upload release notes
         uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
@@ -116,9 +100,6 @@ jobs:
           path: RELEASE_NOTES.md
           if-no-files-found: error
           retention-days: 7
-
-      - name: Verify distributable package
-        run: cargo package --locked
 
   build:
     name: Build ${{ matrix.target }}
@@ -161,6 +142,12 @@ jobs:
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           key: ${{ matrix.target }}
+
+      # The stamped manifests are not committed: every job stamps its own
+      # checkout from the tag, and the committed placeholders stay pinned.
+      - name: Stamp pinned manifests with the release version
+        shell: bash
+        run: cargo run --locked --quiet -p xtask -- release-stamp --version "${RELEASE_TAG#v}"
 
       - name: Build release binary
         run: cargo build --locked --release --target ${{ matrix.target }}
@@ -224,6 +211,11 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: write
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
     env:
       RELEASE_COMMIT: ${{ needs.validate.outputs.source_commit }}
       RELEASE_TAG_OBJECT: ${{ needs.validate.outputs.tag_object }}
@@ -275,46 +267,47 @@ jobs:
           RELEASE_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: cargo run --locked --quiet -p xtask -- release-contract --directory dist
 
-      # Publishing is idempotent: a run that failed after pushing some assets is
-      # resumed against the same draft tag, and an already published tag is
-      # never overwritten.
-      - name: Create or reuse draft release
+      # Build the versioned documentation in the same release job as the
+      # binaries. The coordinator stamps and restores the release files around
+      # the build, so this checkout returns to its pinned state.
+      - name: Set up uv
+        uses: astral-sh/setup-uv@94527f2e458b27549849d47d273a16bec83a01e9 # v7
+        with:
+          enable-cache: true
+
+      - name: Build versioned documentation
+        run: cargo run --locked --quiet -p xtask -- release-docs --version "${RELEASE_TAG#v}"
+
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@983d7736d9b0ae728b81ab479565c72886d7745b # v5
+
+      - name: Upload documentation Pages artifact
+        uses: actions/upload-pages-artifact@7b1f4a764d45c48632c6b24a0339c27f5614fb0b # v4
+        with:
+          path: site
+
+      # The coordinator makes publication retry-safe: it refuses an already
+      # published tag, reuses an existing draft, and uploads the complete
+      # artifact directory.
+      - name: Create draft and upload release assets
         env:
           GH_TOKEN: ${{ github.token }}
-        run: |
-          state="$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
-            --json isDraft --jq .isDraft 2>/dev/null || true)"
-          if [[ "$state" == "false" ]]; then
-            echo "::error::$RELEASE_TAG is already published; refusing to overwrite it."
-            exit 1
-          fi
-          if [[ -z "$state" ]]; then
-            gh release create "$RELEASE_TAG" \
-              --repo "$GITHUB_REPOSITORY" \
-              --verify-tag \
-              --draft \
-              --title "$RELEASE_TAG" \
-              --notes-file notes/RELEASE_NOTES.md
-          else
-            echo "$RELEASE_TAG is an existing draft; reusing it."
-          fi
+          RELEASE_TAG: ${{ env.RELEASE_TAG }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: cargo run --locked --quiet -p xtask -- release-publish --directory dist --notes notes/RELEASE_NOTES.md
 
-      - name: Upload assets
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh release upload "$RELEASE_TAG" dist/* --repo "$GITHUB_REPOSITORY" --clobber
+      - name: Deploy documentation to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4
 
-      # The release only becomes the latest release once every asset is in place.
+      # The release only becomes the latest release once every binary asset and
+      # the versioned documentation site are in place.
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: |
-          gh release edit "$RELEASE_TAG" \
-            --repo "$GITHUB_REPOSITORY" \
-            --title "$RELEASE_TAG" \
-            --notes-file notes/RELEASE_NOTES.md \
-            --draft=false \
-            --latest
+          RELEASE_TAG: ${{ env.RELEASE_TAG }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: cargo run --locked --quiet -p xtask -- release-publish --notes notes/RELEASE_NOTES.md --finalize
 
   alert_failure:
     name: Alert on failure

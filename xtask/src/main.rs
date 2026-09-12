@@ -6,7 +6,9 @@
 //! examples, and the release plan.
 
 mod process;
+mod release;
 mod release_contract;
+mod stamp;
 mod tag;
 mod verify;
 
@@ -27,7 +29,7 @@ const BINARY_DEFAULT: &str = "target/debug/mono";
     name = "xtask",
     version,
     about = "Repository-specific release automation for mono",
-    after_help = "Run `cargo run -p xtask -- verify` for the release gates, or `cargo run -p xtask -- tag --tag v0.1.3` to create and push a release tag."
+    after_help = "Run `cargo run -p xtask -- release-prepare --tag v0.1.3` for release preparation, or `cargo run -p xtask -- tag --tag v0.1.3` to create and push a release tag."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -53,12 +55,46 @@ enum Command {
         #[arg(long)]
         tag: String,
     },
+    /// Run the complete release preparation gates from one stamped checkout.
+    ReleasePrepare {
+        /// Version tag to validate, for example v0.1.5. Defaults to RELEASE_TAG.
+        #[arg(long)]
+        tag: Option<String>,
+    },
+    /// Build the versioned documentation for a release tag.
+    ReleaseDocs {
+        /// Version to stamp, for example 0.1.5 or v0.1.5. Defaults to RELEASE_TAG.
+        #[arg(long)]
+        version: Option<String>,
+    },
+    /// Create or finalize the GitHub release from the assembled artifacts.
+    ReleasePublish {
+        /// Release artifact directory.
+        #[arg(long, default_value = release_contract::default_directory())]
+        directory: PathBuf,
+        /// Release notes file.
+        #[arg(long, default_value = "RELEASE_NOTES.md")]
+        notes: PathBuf,
+        /// Publish an existing draft after every other release gate succeeds.
+        #[arg(long)]
+        finalize: bool,
+    },
+    /// Stamp the pinned manifests with a release version, or restore them.
+    ReleaseStamp {
+        /// Version to stamp, for example 0.1.5 or v0.1.5. Defaults to RELEASE_TAG.
+        #[arg(long)]
+        version: Option<String>,
+        /// Restore the pinned placeholders from their `.backup` files.
+        #[arg(long)]
+        restore: bool,
+    },
 }
 
 /// Every failure this project-specific gate can report.
 #[derive(Debug)]
 pub enum Error {
     Spawn { program: String, source: io::Error },
+    Io { path: PathBuf, source: io::Error },
     Invalid(String),
     Command(String),
 }
@@ -68,6 +104,9 @@ impl fmt::Display for Error {
         match self {
             Self::Spawn { program, source } => {
                 write!(formatter, "failed to run {program}: {source}")
+            }
+            Self::Io { path, source } => {
+                write!(formatter, "failed to access {}: {source}", path.display())
             }
             Self::Invalid(message) | Self::Command(message) => formatter.write_str(message),
         }
@@ -88,6 +127,21 @@ fn main() -> ExitCode {
             release_contract::run(&directory, verify_only),
         ),
         Command::Tag { tag } => (tag::COMPONENT, tag::run(&tag)),
+        Command::ReleasePrepare { tag } => {
+            (release::PREPARE_COMPONENT, release_prepare_command(tag))
+        }
+        Command::ReleaseDocs { version } => (release::COMPONENT, release_docs_command(version)),
+        Command::ReleasePublish {
+            directory,
+            notes,
+            finalize,
+        } => (
+            release::PUBLISH_COMPONENT,
+            release_publish_command(directory, notes, finalize),
+        ),
+        Command::ReleaseStamp { version, restore } => {
+            (stamp::COMPONENT, release_stamp_command(version, restore))
+        }
     };
 
     match result {
@@ -121,6 +175,60 @@ impl Tag {
 
 fn verify_command() -> Result<(), Error> {
     verify::run(&Tag::from_env()?, &binary_path())
+}
+
+fn release_prepare_command(tag: Option<String>) -> Result<(), Error> {
+    let tag = match tag {
+        Some(tag) => tag,
+        None => Tag::from_env()?.name,
+    };
+    let version = parse_version(&tag)?;
+    release::prepare(&stamp::repository_root(), &tag, version)
+}
+
+fn release_docs_command(version: Option<String>) -> Result<(), Error> {
+    let version = match version {
+        Some(version) => parse_version(&version)?,
+        None => Tag::from_env()?.version,
+    };
+    release::docs(&stamp::repository_root(), version)
+}
+
+fn release_publish_command(
+    directory: PathBuf,
+    notes: PathBuf,
+    finalize: bool,
+) -> Result<(), Error> {
+    let tag = Tag::from_env()?;
+    release::publish(&tag.name, &directory, &notes, finalize)
+}
+
+fn release_stamp_command(version: Option<String>, restore: bool) -> Result<(), Error> {
+    if restore {
+        if version.is_some() {
+            return Err(Error::Invalid(
+                "`release-stamp --restore` does not take `--version`".to_owned(),
+            ));
+        }
+        return stamp::restore(&stamp::repository_root());
+    }
+
+    let version = match version {
+        Some(version) => parse_version(&version)?,
+        None => Tag::from_env()?.version,
+    };
+    stamp::apply(&stamp::repository_root(), version)
+}
+
+/// Accept `X.Y.Z` or `vX.Y.Z`, so the same value works as a tag, a workflow
+/// expression, and an xtask argument.
+fn parse_version(text: &str) -> Result<Version, Error> {
+    let version = text.strip_prefix('v').unwrap_or(text);
+    Version::parse(version).ok_or_else(|| {
+        Error::Invalid(format!(
+            "`{text}` is not a release version; expected `<major>.<minor>.<patch>` or `v<major>.<minor>.<patch>`"
+        ))
+    })
 }
 
 fn binary_path() -> PathBuf {

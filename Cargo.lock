@@ -456,7 +456,7 @@ dependencies = [
 
 [[package]]
 name = "mono"
-version = "0.1.4"
+version = "0.0.0"
 dependencies = [
  "clap",
  "crossterm",

@@ -30,6 +30,14 @@ impl Version {
             patch,
         })
     }
+
+    fn next_patch(self) -> Option<Self> {
+        Some(Self {
+            major: self.major,
+            minor: self.minor,
+            patch: self.patch.checked_add(1)?,
+        })
+    }
 }
 
 fn parse_component(text: &str) -> Option<u64> {
@@ -219,6 +227,22 @@ impl Changelog {
         self.entries.len()
     }
 
+    /// Return the next patch version after the newest versioned entry.
+    ///
+    /// A top `(unreleased)` entry must be promoted explicitly because the
+    /// version it represents is a product decision, not a mechanical patch
+    /// increment.
+    pub fn next_version(&self) -> Result<Version, String> {
+        match self.top().heading {
+            Heading::Version(version) => version
+                .next_patch()
+                .ok_or_else(|| format!("cannot increment release version `{version}`")),
+            Heading::Unreleased => Err(
+                "the newest entry is `(unreleased)`; provide a version to promote it".to_owned(),
+            ),
+        }
+    }
+
     pub fn entry(&self, heading: Heading) -> Option<&Entry> {
         self.entries.iter().find(|entry| entry.heading == heading)
     }
@@ -238,6 +262,12 @@ impl Changelog {
         date: &str,
         bullets: &[String],
     ) -> Result<Action, String> {
+        if !is_valid_date(date) {
+            return Err(format!(
+                "invalid release date `{date}`, expected `<yyyy-mm-dd>`"
+            ));
+        }
+
         let heading = request.heading();
         if self.entries.iter().any(|entry| entry.heading == heading) {
             return Err(format!("`{}` already exists", heading.heading()));
@@ -274,10 +304,11 @@ fn valid_release_line(line: &str) -> bool {
     let Some(date) = line.strip_prefix("Released: ") else {
         return false;
     };
-    valid_date(date)
+    is_valid_date(date)
 }
 
-fn valid_date(date: &str) -> bool {
+/// Return whether `date` is a real ISO calendar date.
+pub fn is_valid_date(date: &str) -> bool {
     let bytes = date.as_bytes();
     if bytes.len() != 10
         || bytes[4] != b'-'
@@ -398,6 +429,32 @@ mod tests {
     }
 
     #[test]
+    fn infers_the_next_patch_version_from_the_top_entry() {
+        let changelog = Changelog::parse(
+            "# Changelog\n\n## 1.2.3\nReleased: 2026-01-01\n\n## 1.2.2\nReleased: 2025-12-01\n",
+        )
+        .unwrap();
+
+        assert_eq!(changelog.next_version().unwrap().to_string(), "1.2.4");
+    }
+
+    #[test]
+    fn does_not_infer_a_version_from_unreleased() {
+        let changelog = Changelog::parse("# Changelog\n\n## (unreleased)\n").unwrap();
+
+        assert!(changelog.next_version().is_err());
+    }
+
+    #[test]
+    fn rejects_patch_version_overflow() {
+        let changelog =
+            Changelog::parse("# Changelog\n\n## 1.2.18446744073709551615\nReleased: 2026-01-01\n")
+                .unwrap();
+
+        assert!(changelog.next_version().is_err());
+    }
+
+    #[test]
     fn versions_are_strict() {
         assert!(Version::parse("1.2.3").is_some());
         assert!(Version::parse("01.2.3").is_none());
@@ -407,11 +464,11 @@ mod tests {
 
     #[test]
     fn release_dates_are_real_iso_dates() {
-        assert!(valid_date("2026-09-11"));
-        assert!(valid_date("2024-02-29"));
-        assert!(!valid_date("2023-02-29"));
-        assert!(!valid_date("2026-04-31"));
-        assert!(!valid_date("2026-9-11"));
+        assert!(is_valid_date("2026-09-11"));
+        assert!(is_valid_date("2024-02-29"));
+        assert!(!is_valid_date("2023-02-29"));
+        assert!(!is_valid_date("2026-04-31"));
+        assert!(!is_valid_date("2026-9-11"));
     }
 
     #[test]
