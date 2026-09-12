@@ -36,6 +36,18 @@ pub fn mono(args: &[&str], cwd: &Path) -> Output {
     mono_with_env(args, cwd, &[])
 }
 
+/// A `command = [...]` array for a task that runs the shared test fixture.
+#[allow(dead_code)]
+pub fn fixture_command(args: &[&str]) -> String {
+    let parts = std::iter::once(env!("CARGO_BIN_EXE_mono-fixture").to_owned())
+        .chain(args.iter().map(|arg| (*arg).to_owned()));
+    let quoted = parts
+        .map(|part| format!("\"{}\"", part.replace('\\', "\\\\").replace('"', "\\\"")))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("[{quoted}]")
+}
+
 pub fn mono_with_env(args: &[&str], cwd: &Path, env: &[(&str, &str)]) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_mono"));
     command.args(args).current_dir(cwd);

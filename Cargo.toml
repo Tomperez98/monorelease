@@ -1,5 +1,8 @@
 [package]
 name = "mono"
+# `cargo run`/`cargo test` must keep selecting the CLI, not the test fixture in
+# `src/bin/mono-fixture.rs`; the pipeline tasks in mono.toml call bare `cargo run`.
+default-run = "mono"
 # Pinned placeholder. The release workflow rewrites this (and the matching
 # `Cargo.lock` entry) from the release tag with `xtask release-stamp`, so the
 # committed version never drifts. See README "Release conventions".
@@ -25,3 +28,5 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.145"
 sha2 = "0.10.9"
 toml = "1.1.5"
+tempfile = "3"
+dunce = "1"

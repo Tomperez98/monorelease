@@ -66,7 +66,7 @@ pub(crate) fn prepare(root: &Path, tag: &str, version: Version) -> Result<(), Er
         ],
     )?;
     stamp::with_stamped(root, version, || {
-        run_command_without_release_context(
+        run_command(
             root,
             "cargo",
             [
@@ -614,7 +614,7 @@ fn write_release_installers(root: &Path, tag: &str, directory: &Path) -> Result<
             source,
         }
     })?;
-    set_executable(&shell_path)?;
+    crate::platform::set_executable(&shell_path)?;
 
     let powershell_path = directory.join(POWERSHELL_INSTALLER_FILE);
     let powershell_source = read_installer(root, POWERSHELL_INSTALLER_FILE)?;
@@ -650,26 +650,6 @@ fn sha256_file(path: &Path) -> Result<String, Error> {
         source,
     })?;
     Ok(format!("{:x}", digest.finalize()))
-}
-
-#[allow(unused_variables)]
-fn set_executable(path: &Path) -> Result<(), Error> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut permissions = fs::metadata(path)
-            .map_err(|source| Error::Io {
-                path: path.to_path_buf(),
-                source,
-            })?
-            .permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(path, permissions).map_err(|source| Error::Io {
-            path: path.to_path_buf(),
-            source,
-        })?;
-    }
-    Ok(())
 }
 
 fn read_installer(root: &Path, name: &str) -> Result<String, Error> {
@@ -1098,39 +1078,14 @@ fn run_command_slice(root: &Path, program: &str, args: &[&str]) -> Result<(), Er
 }
 
 fn run_command<const N: usize>(root: &Path, program: &str, args: [&str; N]) -> Result<(), Error> {
-    run_command_with_policy(root, program, args, false)
-}
-
-fn run_command_without_release_context<const N: usize>(
-    root: &Path,
-    program: &str,
-    args: [&str; N],
-) -> Result<(), Error> {
-    run_command_with_policy(root, program, args, true)
-}
-
-fn run_command_with_policy<const N: usize>(
-    root: &Path,
-    program: &str,
-    args: [&str; N],
-    clear_release_context: bool,
-) -> Result<(), Error> {
-    let mut command = Command::new(program);
-    command.args(args).current_dir(root);
-    if clear_release_context {
-        for name in [
-            "RELEASE_TAG",
-            "RELEASE_TAG_OBJECT",
-            "RELEASE_COMMIT",
-            "RELEASE_RUN_URL",
-        ] {
-            command.env_remove(name);
-        }
-    }
-    let status = command.status().map_err(|source| Error::Spawn {
-        program: format!("{program} {}", args.join(" ")),
-        source,
-    })?;
+    let status = Command::new(program)
+        .args(args)
+        .current_dir(root)
+        .status()
+        .map_err(|source| Error::Spawn {
+            program: format!("{program} {}", args.join(" ")),
+            source,
+        })?;
     if status.success() {
         return Ok(());
     }

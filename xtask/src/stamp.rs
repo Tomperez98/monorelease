@@ -128,13 +128,11 @@ pub(crate) fn with_stamped<T>(
 }
 
 fn restore_file(backup: &Path, path: &Path) -> Result<(), Error> {
-    #[cfg(windows)]
-    if path.exists() {
-        fs::remove_file(path).map_err(|source| Error::Io {
-            path: path.to_path_buf(),
-            source,
-        })?;
-    }
+    // `fs::rename` replaces an existing destination on every platform this
+    // project builds for (`MoveFileEx` with `MOVEFILE_REPLACE_EXISTING` on
+    // Windows, `rename` everywhere else), so no platform branch is needed.
+    // Removing the destination first would only open a window where a failure
+    // leaves the pinned file gone and the backup unmoved.
     fs::rename(backup, path).map_err(|source| Error::Io {
         path: path.to_path_buf(),
         source,

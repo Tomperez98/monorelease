@@ -17,6 +17,7 @@ pub(crate) mod events;
 /// Version of Mono's machine-readable JSON output contracts.
 pub const JSON_OUTPUT_SCHEMA: u32 = 1;
 mod output;
+mod platform;
 pub(crate) mod process;
 mod project;
 mod release;

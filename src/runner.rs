@@ -927,29 +927,28 @@ mod tests {
     use super::*;
     use crate::config::config_path;
     use crate::project::Project;
-    use crate::testing::TempDir;
+    use crate::testing::{TempDir, fixture_command};
     use std::fs;
     use std::sync::Mutex;
 
-    #[cfg(unix)]
-    fn project_with_task(command: &str, timeout_seconds: Option<u64>) -> (TempDir, Project) {
+    fn project_with_task(args: &[&str], timeout_seconds: Option<u64>) -> (TempDir, Project) {
         let temp = TempDir::new();
         let timeout = timeout_seconds
             .map(|seconds| format!("timeout_seconds = {seconds}\n"))
             .unwrap_or_default();
+        let command = fixture_command(args);
         fs::write(
             config_path(temp.path()),
-            format!("[project]\nname = \"fixture\"\n\n[pipelines.ci]\ntasks = [\"build\"]\n\n[tasks.build]\ncommand = [\"sh\", \"-c\", \"{command}\"]\n{timeout}"),
+            format!("[project]\nname = \"fixture\"\n\n[pipelines.ci]\ntasks = [\"build\"]\n\n[tasks.build]\ncommand = {command}\n{timeout}"),
         )
         .expect("write project manifest");
         let project = Project::load(temp.path()).expect("project loads");
         (temp, project)
     }
 
-    #[cfg(unix)]
     #[test]
     fn runs_a_task_and_returns_captured_output_without_printing() {
-        let (_temp, project) = project_with_task("printf stdout; printf stderr >&2", None);
+        let (_temp, project) = project_with_task(&["streams", "stdout", "stderr"], None);
         let plan = project.plan(None, &[]).expect("plan succeeds");
         let result = Runner::new()
             .run(&project.root, &plan[0])
@@ -959,10 +958,9 @@ mod tests {
         assert_eq!(result.output.stderr, b"stderr");
     }
 
-    #[cfg(unix)]
     #[test]
     fn returns_failed_task_output_for_the_presenter() {
-        let (_temp, project) = project_with_task("printf failed >&2; exit 7", None);
+        let (_temp, project) = project_with_task(&["fail-with", "7", "failed"], None);
         let plan = project.plan(None, &[]).expect("plan succeeds");
         let error = Runner::new()
             .run(&project.root, &plan[0])
@@ -975,14 +973,12 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[test]
     fn timeout_terminates_descendants_before_their_delayed_write() {
         let temp = TempDir::new();
         let marker = temp.path().join("descendant-finished");
-        let marker_text = marker.to_string_lossy();
         let (_temp, project) = project_with_task(
-            &format!("(sleep 5; printf leaked > '{marker_text}') & wait"),
+            &["timeout-tree", "5000", marker.to_string_lossy().as_ref()],
             Some(1),
         );
         let plan = project.plan(None, &[]).expect("plan succeeds");
@@ -996,23 +992,16 @@ mod tests {
         assert!(!marker.exists(), "a timed-out descendant kept running");
     }
 
-    #[cfg(unix)]
     #[test]
     fn successful_exit_spares_a_detached_descendant() {
         let temp = TempDir::new();
         let marker = temp.path().join("descendant-finished");
-        let marker_text = marker.to_string_lossy();
-        // The direct child closes its own stdout/stderr first, so the output
-        // readers reach EOF while it sleeps; then it detaches a descendant
-        // whose stdout/stderr point at /dev/null and exits successfully.
-        // Because the descendant never held the pipes, output collection
-        // completes without touching it, and a normal successful exit must
-        // not terminate its tree.  Only timeout and output-limit paths
+        // The fixture detaches a descendant that never holds this task's
+        // stdout or stderr, then exits successfully. A normal successful exit
+        // must not terminate the tree; only the timeout and output-limit paths
         // terminate trees.
         let (_temp, project) = project_with_task(
-            &format!(
-                "exec 1>&- 2>&-; (sleep 3; printf leaked > '{marker_text}') </dev/null >/dev/null 2>&1 & sleep 0.5; exit 0"
-            ),
+            &["spawn-detached", "3000", marker.to_string_lossy().as_ref()],
             None,
         );
         let plan = project.plan(None, &[]).expect("plan succeeds");
@@ -1027,10 +1016,9 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[test]
     fn stops_and_reports_when_task_output_exceeds_the_limit() {
-        let (_temp, mut project) = project_with_task("printf 123456789", None);
+        let (_temp, mut project) = project_with_task(&["print", "123456789"], None);
         project
             .tasks
             .get_mut("build")
@@ -1049,45 +1037,6 @@ mod tests {
         assert_eq!(
             error.output().expect("partial output is retained").stdout,
             b"12345678"
-        );
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn successful_exit_spares_a_detached_descendant_on_windows() {
-        // Regression: a child that exits successfully must not kill its
-        // descendants via Job Object cleanup.  The kill-on-close flag
-        // must not be set (Finding 1 from the P0 review).
-        let temp = TempDir::new();
-        let marker = temp.path().join("descendant-finished");
-        let marker_text = marker.to_string_lossy();
-        let script = temp.path().join("spawn_and_exit.bat");
-
-        // Lift escaped paths into a batch variable to avoid quoting chaos.
-        fs::write(
-            &script,
-            format!(
-                "@echo off\r\nstart /b cmd /c ping -n 4 127.0.0.1 >nul && echo leaked > \"{marker_text}\"\r\nexit /b 0\r\n"
-            ),
-        )
-        .expect("write batch script");
-
-        fs::write(
-            config_path(temp.path()),
-            "[project]\nname = \"app\"\n\n[pipelines.ci]\ntasks = [\"build\"]\n\n[tasks.build]\ncommand = [\"cmd\", \"/c\", \"spawn_and_exit.bat\"]\n",
-        )
-        .expect("write manifest");
-
-        let project = Project::load(temp.path()).expect("project loads");
-        let plan = project.plan(None, &[]).expect("plan succeeds");
-        Runner::new()
-            .run(&project.root, &plan[0])
-            .expect("task succeeds");
-
-        std::thread::sleep(std::time::Duration::from_secs(6));
-        assert!(
-            marker.exists(),
-            "a successful task killed a detached descendant on Windows"
         );
     }
 

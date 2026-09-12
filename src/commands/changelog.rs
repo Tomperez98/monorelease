@@ -37,7 +37,7 @@ impl ReleaseNotesTarget {
             && version != release_tag
         {
             return Err(ChangelogError::Invalid(
-                "requested version does not match RELEASE_TAG".to_owned(),
+                "requested version does not match --release-tag".to_owned(),
             ));
         }
         Ok(Self {
@@ -591,7 +591,7 @@ mod tests {
     fn release_notes_target_rejects_disagreeing_inputs() {
         let error = ReleaseNotesTarget::parse(Some("1.0.0"), Some("v1.0.1")).unwrap_err();
 
-        assert!(error.to_string().contains("does not match RELEASE_TAG"));
+        assert!(error.to_string().contains("does not match --release-tag"));
     }
 
     #[test]

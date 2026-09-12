@@ -84,37 +84,15 @@ pub(super) fn hex_digest(digest: &[u8]) -> String {
     hex
 }
 
+/// The permission bits the platform stores for `path`, translated into the
+/// cache's error vocabulary. Windows stores none, so the key simply omits them.
 pub(super) fn file_mode(path: &Path) -> Result<Option<u32>, CacheError> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        Ok(Some(
-            fs::metadata(path)
-                .map_err(|source| CacheError::io(path.to_path_buf(), source))?
-                .permissions()
-                .mode(),
-        ))
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = path;
-        Ok(None)
-    }
+    crate::platform::file_mode(path).map_err(|source| CacheError::io(path.to_path_buf(), source))
 }
 
 pub(super) fn set_mode(path: &Path, mode: u32) -> Result<(), CacheError> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let permissions = fs::Permissions::from_mode(mode);
-        fs::set_permissions(path, permissions)
-            .map_err(|source| CacheError::io(path.to_path_buf(), source))?;
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = (path, mode);
-    }
-    Ok(())
+    crate::platform::set_mode(path, mode)
+        .map_err(|source| CacheError::io(path.to_path_buf(), source))
 }
 
 pub(super) fn validate_cached_path(path: &str) -> Result<PathBuf, CacheError> {

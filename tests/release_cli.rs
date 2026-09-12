@@ -208,10 +208,9 @@ fn release_notes_reject_a_tag_that_is_not_the_newest_entry() {
     )
     .unwrap();
 
-    let notes = mono_with_env(
-        &["changelog", "release-notes"],
+    let notes = mono(
+        &["changelog", "release-notes", "--release-tag", "v1.0.0"],
         temp.path(),
-        &[("RELEASE_TAG", "v1.0.0")],
     );
 
     assert_eq!(notes.status.code(), Some(1));
@@ -401,4 +400,98 @@ fn an_annotated_tag_object_round_trips_through_the_cli() {
         temp.path(),
     );
     assert!(verify.status.success(), "verify failed: {verify:?}");
+}
+
+#[test]
+fn changelog_prepare_ignores_version_env_when_explicit_version_given() {
+    let temp = TempDir::new("prepare-env-ignored");
+    fs::write(
+        temp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n## 1.0.0\nReleased: 2026-09-11\n\n- Shipped.\n",
+    )
+    .unwrap();
+
+    let output = mono_with_env(
+        &["changelog", "prepare", "1.1.0"],
+        temp.path(),
+        &[("VERSION", "9.9.9")],
+    );
+    assert!(output.status.success(), "prepare failed: {output:?}");
+
+    let changelog = fs::read_to_string(temp.path().join("CHANGELOG.md")).unwrap();
+    assert!(
+        changelog.contains("## 1.1.0"),
+        "changelog must contain the explicit version, not the env VERSION: {changelog}"
+    );
+    assert!(
+        !changelog.contains("## 9.9.9"),
+        "changelog must NOT contain the env VERSION value: {changelog}"
+    );
+}
+
+#[test]
+fn release_source_fails_with_env_only_configuration() {
+    let temp = TempDir::new("release-source-env-only");
+
+    // Set RELEASE_TAG and GITHUB_SHA in the environment but do NOT pass
+    // `--tag` or `--commit` explicitly. After the env-fallback removal this
+    // must fail with a Clap usage error (exit code 2).
+    let output = mono_with_env(
+        &["release", "source"],
+        temp.path(),
+        &[("RELEASE_TAG", "v1.0.0"), ("GITHUB_SHA", "abc123")],
+    );
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "release source with only env vars must return Clap usage error 2; stdout: {}, stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--tag"),
+        "error must mention --tag: {stderr}"
+    );
+    assert!(
+        stderr.contains("--commit"),
+        "error must mention --commit: {stderr}"
+    );
+}
+
+#[test]
+fn changelog_release_notes_ignores_release_tag_env() {
+    let temp = TempDir::new("notes-env-ignored");
+    fs::write(
+        temp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n## 1.1.0\nReleased: 2026-09-12\n\n- New.\n\n## 1.0.0\nReleased: 2026-09-11\n\n- Old.\n",
+    )
+    .unwrap();
+
+    // RELEASE_TAG environment variable is set but the CLI no longer reads it.
+    // With no explicit --release-tag, the command uses the newest changelog entry.
+    let output = mono_with_env(
+        &["changelog", "release-notes"],
+        temp.path(),
+        &[("RELEASE_TAG", "v1.0.0")],
+    );
+
+    // The env var is ignored so the newest entry (1.1.0) is used. It should
+    // succeed and write notes for 1.1.0.
+    assert!(
+        output.status.success(),
+        "release-notes must succeed when env RELEASE_TAG is set but ignored; stdout: {}, stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let notes = fs::read_to_string(temp.path().join("RELEASE_NOTES.md")).unwrap_or_default();
+    assert!(
+        notes.contains("- New."),
+        "notes must contain the content of the newest entry (1.1.0), not the env tag (v1.0.0): {notes}"
+    );
+    assert!(
+        !notes.contains("- Old."),
+        "notes must NOT contain the older entry (1.0.0): {notes}"
+    );
 }

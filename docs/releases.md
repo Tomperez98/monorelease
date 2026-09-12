@@ -2,6 +2,8 @@
 
 Mono's release commands use a provider-neutral release contract. Publishing remains an ordinary project task or CI step; Mono does not know registries or package managers.
 
+**Breaking change:** Release identity is now passed exclusively through command-line flags, never read from the environment. `VERSION`, `CHANGELOG_PR_URL`, `RELEASE_TAG`, `GITHUB_SHA`, `GITHUB_REPOSITORY`, `RELEASE_TAG_OBJECT`, and `GITHUB_RUN_URL` configure nothing in the Mono CLI or xtask. CI shells may still use these variables as runtime plumbing, but every value must be forwarded to the command as a flag. Installer scripts keep their own environment variables (`MONO_VERSION`, `MONO_INSTALL_DIR`) as before.
+
 ## Changelog contract
 
 - `CHANGELOG.md` is Markdown.
@@ -41,14 +43,15 @@ mono changelog release-notes
 reads the requested refs and atomically updates the changelog. Generated entries
 contain release metadata and harvested bullets, not empty category placeholders.
 A range with no merge commits produces a warning and leaves the entry for manual
-editing. Use `--pull-request-url` or `CHANGELOG_PR_URL` to link recognized PR
-merge commits. `scaffold`,
-`validate`, and `notes` remain compatibility aliases.
+editing. `--pull-request-url` is the only Mono CLI input for that URL; it
+links recognized PR merge commits. `scaffold`, `validate`, and `notes` remain
+compatibility aliases.
 
 The newest changelog entry is the release being prepared. Release-note
 extraction rejects an older version, requires substantive content beyond
-`Released:`, and requires `RELEASE_TAG` to match the newest entry when CI
-provides it.
+`Released:`, and requires the explicit version or `--release-tag` to match the
+newest entry. Release identity is passed on the command line, never read from
+the environment.
 
 ## Repository releases
 

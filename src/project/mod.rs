@@ -3,7 +3,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error as StdError;
 use std::fmt;
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -470,7 +469,7 @@ impl Project {
             })
         };
         let cwd = interpolate(task.cwd.as_deref().unwrap_or("."))?;
-        let cwd_path = fs::canonicalize(self.root.join(&cwd)).map_err(|source| {
+        let cwd_path = dunce::canonicalize(self.root.join(&cwd)).map_err(|source| {
             ProjectError::TaskDirectory {
                 task: node.id.clone(),
                 path: self.root.join(&cwd),

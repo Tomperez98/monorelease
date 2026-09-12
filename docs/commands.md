@@ -52,11 +52,27 @@ Bare `mono` runs the default pipeline but accepts the global flags only. Use `mo
 
 `--ui auto` uses the interactive task UI on a terminal and task-prefixed streaming output in pipes and CI. `--ui tui` currently resolves the same way, so the full-screen view is used only when a terminal is attached. Use `--ui stream` for predictable task-prefixed lines anywhere.
 
-`mono changelog prepare` creates the next patch entry by default. Pass `unreleased` to explicitly skip a release cycle, or pass a version for a major/minor release. The generated entry contains only its release metadata and harvested bullets; it does not add empty category placeholders. `--date` makes the entry date deterministic. `--from REF --to REF` adds editable bullets from first-parent merge commits without fetching or switching branches. If that range has no merge commits, preparation succeeds with a warning so you can add content manually. Add `--pull-request-url 'https://github.com/org/repo/pull/{number}'` (or set `CHANGELOG_PR_URL`) to turn recognized merge commits into links.
+`mono changelog prepare` creates the next patch entry by default. Pass `unreleased` to explicitly skip a release cycle, or pass a version for a major/minor release. The generated entry contains only its release metadata and harvested bullets; it does not add empty category placeholders. `--date` makes the entry date deterministic. `--from REF --to REF` adds editable bullets from first-parent merge commits without fetching or switching branches. If that range has no merge commits, preparation succeeds with a warning so you can add content manually. `--pull-request-url 'https://github.com/org/repo/pull/{number}'` is the only Mono CLI input for that URL; it turns recognized merge commits into links.
 
-`mono changelog release-notes` uses the newest entry by default. In CI, `RELEASE_TAG` is accepted as the version and must match that entry. It rejects entries containing only `Released:` without substantive release content. The old `scaffold`, `validate`, and `notes` spellings remain aliases.
+`mono changelog release-notes` uses the newest entry by default. Pass `VERSION` or `--release-tag` when you need to require a specific release; the value must match the newest entry. There is no environment fallback. It rejects entries containing only `Released:` without substantive release content. The old `scaffold`, `validate`, and `notes` spellings remain aliases.
 
 `mono release manifest` and `mono release verify` write and read a release directory: `--dist <PATH>` (default `dist`, below the root).
+
+## Explicit CLI configuration
+
+Release identity is passed on the command line, never read from the environment. `VERSION`, `CHANGELOG_PR_URL`, `RELEASE_TAG`, `GITHUB_SHA`, `GITHUB_REPOSITORY`, `RELEASE_TAG_OBJECT`, and `GITHUB_RUN_URL` configure nothing in the Mono CLI. CI shells may still use these variables as runtime plumbing, but every value must be forwarded to the command as a flag:
+
+```console
+mono changelog prepare 1.2.0 \
+  --pull-request-url 'https://github.com/org/repo/pull/{number}'
+
+mono changelog release-notes 1.2.0
+
+mono release source --tag v1.2.0 --commit "$commit"
+mono release manifest --dist dist --tag v1.2.0 --commit "$commit"
+```
+
+`--tag`, `--commit`, `--repository`, `--tag-object`, and `--workflow-run` are explicit CLI inputs whenever they appear. Installer scripts keep their own documented environment variables (`MONO_VERSION`, `MONO_INSTALL_DIR`), which are consumed by the installer shell script itself, not by the Mono binary.
 
 ## Machine-readable output
 

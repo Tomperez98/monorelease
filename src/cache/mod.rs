@@ -484,22 +484,21 @@ mod tests {
     use super::*;
     use crate::config::config_path;
     use crate::project::Project;
-    #[cfg(unix)]
     use crate::runner::Runner;
-    use crate::testing::TempDir;
+    use crate::testing::{TempDir, create_symlink_or_skip, fixture_command};
     use std::fs;
 
     fn project_with_task(temp: &TempDir) -> Project {
+        let build = fixture_command(&["copy", "input.txt", "output.txt"]);
         fs::write(
             config_path(temp.path()),
-            "[project]\nname = \"fixture\"\n\n[pipelines.ci]\ntasks = [\"build\"]\n\n[tasks.build]\ncommand = [\"sh\", \"-c\", \"cat input.txt > output.txt\"]\ncache = true\ninputs = [\"input.txt\"]\noutputs = [\"output.txt\"]\n",
+            format!("[project]\nname = \"fixture\"\n\n[pipelines.ci]\ntasks = [\"build\"]\n\n[tasks.build]\ncommand = {build}\ncache = true\ninputs = [\"input.txt\"]\noutputs = [\"output.txt\"]\n"),
         )
         .expect("write root manifest");
         fs::write(temp.path().join("input.txt"), "input").expect("write input");
         Project::load(temp.path()).expect("project loads")
     }
 
-    #[cfg(unix)]
     #[test]
     fn stores_and_restores_a_successful_task() {
         let temp = TempDir::new();
@@ -966,7 +965,6 @@ mod tests {
         assert!(error.to_string().contains("missing/**"));
     }
 
-    #[cfg(unix)]
     #[test]
     fn rejects_a_symlink_input_match() {
         let temp = TempDir::new();
@@ -979,8 +977,9 @@ mod tests {
         fs::create_dir_all(project_root.join("src")).expect("create src");
         fs::create_dir_all(project_root.join("dist")).expect("create dist");
         fs::write(project_root.join("src/input.txt"), "input").expect("write input");
-        std::os::unix::fs::symlink("input.txt", project_root.join("src/link.txt"))
-            .expect("create symlink");
+        if !create_symlink_or_skip(Path::new("input.txt"), &project_root.join("src/link.txt")) {
+            return;
+        }
         let store = CacheStore::new(&project.root);
 
         let error = store
@@ -989,13 +988,15 @@ mod tests {
         assert!(error.to_string().contains("unsupported symlink"));
     }
 
-    #[cfg(unix)]
     #[test]
     fn stores_and_restores_nested_outputs() {
         let temp = TempDir::new();
         let project = project_with_manifest(
             &temp,
-            "[project]\nname = \"app\"\n\n[tasks.build]\ncommand = [\"sh\", \"-c\", \"mkdir -p dist/nested && cp src/input.txt dist/nested/artifact.txt\"]\ncache = true\ninputs = [\"src/**\"]\noutputs = [\"dist/**\"]\n",
+            &format!(
+                "[project]\nname = \"app\"\n\n[tasks.build]\ncommand = {}\ncache = true\ninputs = [\"src/**\"]\noutputs = [\"dist/**\"]\n",
+                fixture_command(&["copy", "src/input.txt", "dist/nested/artifact.txt"]),
+            ),
         );
         let task = only_task(&project);
         let project_root = task.root().to_path_buf();
@@ -1022,7 +1023,6 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[test]
     fn refuses_to_restore_through_a_destination_symlink() {
         let temp = TempDir::new();
@@ -1042,8 +1042,9 @@ mod tests {
         fs::remove_file(project_root.join("output.txt")).expect("remove generated output");
         fs::write(project_root.join("outside.txt"), "must remain unchanged")
             .expect("write outside target");
-        std::os::unix::fs::symlink("outside.txt", project_root.join("output.txt"))
-            .expect("create destination symlink");
+        if !create_symlink_or_skip(Path::new("outside.txt"), &project_root.join("output.txt")) {
+            return;
+        }
 
         let error = store
             .lookup(&task, &key)
@@ -1056,13 +1057,15 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[test]
     fn refuses_to_restore_through_a_symlinked_output_parent() {
         let temp = TempDir::new();
         let project = project_with_manifest(
             &temp,
-            "[project]\nname = \"app\"\n\n[tasks.build]\ncommand = [\"sh\", \"-c\", \"mkdir -p dist/nested && cp src/input.txt dist/nested/artifact.txt\"]\ncache = true\ninputs = [\"src/**\"]\noutputs = [\"dist/**\"]\n",
+            &format!(
+                "[project]\nname = \"app\"\n\n[tasks.build]\ncommand = {}\ncache = true\ninputs = [\"src/**\"]\noutputs = [\"dist/**\"]\n",
+                fixture_command(&["copy", "src/input.txt", "dist/nested/artifact.txt"]),
+            ),
         );
         let task = only_task(&project);
         let project_root = task.root().to_path_buf();
@@ -1083,8 +1086,9 @@ mod tests {
         fs::write(outside.join("artifact.txt"), "must remain unchanged")
             .expect("write outside sentinel");
         fs::remove_dir_all(project_root.join("dist")).expect("remove real output directory");
-        std::os::unix::fs::symlink(&outside, project_root.join("dist"))
-            .expect("create symlinked output parent");
+        if !create_symlink_or_skip(&outside, &project_root.join("dist")) {
+            return;
+        }
 
         let error = store
             .lookup(&task, &key)
@@ -1097,13 +1101,21 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[test]
     fn preflight_validates_all_outputs_before_copying_any() {
         let temp = TempDir::new();
         let project = project_with_manifest(
             &temp,
-            "[project]\nname = \"app\"\n\n[tasks.build]\ncommand = [\"sh\", \"-c\", \"mkdir -p deep && echo first > output1.txt && echo second > deep/output2.txt\"]\ncache = true\ninputs = [\"input.txt\"]\noutputs = [\"output1.txt\", \"deep/output2.txt\"]\n",
+            &format!(
+                "[project]\nname = \"app\"\n\n[tasks.build]\ncommand = {}\ncache = true\ninputs = [\"input.txt\"]\noutputs = [\"output1.txt\", \"deep/output2.txt\"]\n",
+                fixture_command(&[
+                    "write-many",
+                    "output1.txt",
+                    "first",
+                    "deep/output2.txt",
+                    "second",
+                ]),
+            ),
         );
         let task = only_task(&project);
         let project_root = task.root().to_path_buf();
@@ -1135,11 +1147,12 @@ mod tests {
         // Second output: replace the real directory tree with a symlink.
         fs::remove_dir_all(project_root.join("deep")).expect("remove deep directory");
         fs::create_dir_all(project_root.join("deep")).expect("recreate deep directory");
-        std::os::unix::fs::symlink(
-            "../outside/sentinel.txt",
-            project_root.join("deep/output2.txt"),
-        )
-        .expect("create symlink for later output");
+        if !create_symlink_or_skip(
+            Path::new("../outside/sentinel.txt"),
+            &project_root.join("deep/output2.txt"),
+        ) {
+            return;
+        }
 
         let error = store
             .lookup(&task, &key)

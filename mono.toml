@@ -6,7 +6,7 @@ default_pipeline = "ci"
 tasks = ["changelog-check", "fmt", "check", "test", "clippy"]
 
 [pipelines.release]
-tasks = ["release-verify"]
+tasks = ["release-contract-check"]
 
 # Validate the pinned checkout before creating a release tag. The tagged
 # workflow runs the separate `release` pipeline after stamping manifests.
@@ -52,11 +52,6 @@ timeout_seconds = 60
 [tasks.changelog]
 command = ["cargo", "run", "--locked", "--quiet", "--", "changelog", "prepare"]
 timeout_seconds = 60
-
-[tasks.release-verify]
-command = ["cargo", "run", "--locked", "--quiet", "-p", "xtask", "--", "verify"]
-depends_on = ["release-notes"]
-timeout_seconds = 300
 
 [tasks.package-check]
 command = ["cargo", "package", "--locked"]

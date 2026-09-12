@@ -5,6 +5,7 @@
 //! repository-specific release automation: tag creation, binary behavior,
 //! examples, and the release plan.
 
+mod platform;
 mod process;
 mod release;
 mod release_artifacts;
@@ -26,7 +27,7 @@ use mono::Version;
 const VERIFY_COMPONENT: &str = "release-verify";
 const BINARY_DEFAULT: &str = "target/debug/mono";
 
-#[derive(Parser)]
+#[derive(Debug, Parser)]
 #[command(
     name = "xtask",
     version,
@@ -38,13 +39,13 @@ struct Cli {
     command: Command,
 }
 
-#[derive(Subcommand)]
+#[derive(Debug, Subcommand)]
 enum Command {
     /// Run this repository's gates against the binary in MONO_BIN.
     Verify {
-        /// Release tag used for binary identity checks.
+        /// Release tag used for binary identity checks, for example v0.1.5.
         #[arg(long)]
-        tag: Option<String>,
+        tag: String,
     },
     /// Write and verify this repository's release artifact contract.
     ReleaseContract {
@@ -78,9 +79,9 @@ enum Command {
     },
     /// Run the complete release preparation gates from one stamped checkout.
     ReleasePrepare {
-        /// Version tag to validate, for example v0.1.5. Defaults to RELEASE_TAG.
+        /// Version tag to validate, for example v0.1.5.
         #[arg(long)]
-        tag: Option<String>,
+        tag: String,
     },
     /// Build one canonical release artifact for a target.
     ReleaseBuild {
@@ -167,7 +168,7 @@ enum Command {
     },
     /// Stamp the pinned manifests with a release version, or restore them.
     ReleaseStamp {
-        /// Version to stamp, for example 0.1.5 or v0.1.5. Defaults to RELEASE_TAG.
+        /// Version to stamp, for example 0.1.5 or v0.1.5. Required unless --restore is set.
         #[arg(long)]
         version: Option<String>,
         /// Restore the pinned placeholders from their `.backup` files.
@@ -315,28 +316,14 @@ impl Tag {
             version,
         })
     }
-
-    pub(crate) fn from_env() -> Result<Self, Error> {
-        let name = env::var("RELEASE_TAG").map_err(|_| {
-            Error::Invalid("RELEASE_TAG is not set (for example RELEASE_TAG=v0.1.1)".to_owned())
-        })?;
-        Self::parse(&name)
-    }
 }
 
-fn verify_command(tag: Option<String>) -> Result<(), Error> {
-    let tag = match tag {
-        Some(tag) => Tag::parse(&tag)?,
-        None => Tag::from_env()?,
-    };
+fn verify_command(tag: String) -> Result<(), Error> {
+    let tag = Tag::parse(&tag)?;
     verify::run(&tag, &binary_path())
 }
 
-fn release_prepare_command(tag: Option<String>) -> Result<(), Error> {
-    let tag = match tag {
-        Some(tag) => tag,
-        None => Tag::from_env()?.name,
-    };
+fn release_prepare_command(tag: String) -> Result<(), Error> {
     let version = parse_version(&tag)?;
     release::prepare(&stamp::repository_root(), &tag, version)
 }
@@ -415,7 +402,11 @@ fn release_stamp_command(version: Option<String>, restore: bool) -> Result<(), E
 
     let version = match version {
         Some(version) => parse_version(&version)?,
-        None => Tag::from_env()?.version,
+        None => {
+            return Err(Error::Invalid(
+                "`--version` is required unless `--restore` is set".to_owned(),
+            ));
+        }
     };
     stamp::apply(&stamp::repository_root(), version)
 }
@@ -444,4 +435,69 @@ fn path_from_env(name: &str, default: &str) -> PathBuf {
 
 fn non_empty(value: Option<String>) -> Option<String> {
     value.filter(|value| !value.is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn verify_requires_explicit_tag() {
+        let error = Cli::try_parse_from(["xtask", "verify"]).unwrap_err();
+        assert!(
+            error.to_string().contains("--tag"),
+            "expected --tag requirement, got: {error}"
+        );
+    }
+
+    #[test]
+    fn release_prepare_requires_explicit_tag() {
+        let error = Cli::try_parse_from(["xtask", "release-prepare"]).unwrap_err();
+        assert!(
+            error.to_string().contains("--tag"),
+            "expected --tag requirement, got: {error}"
+        );
+    }
+
+    #[test]
+    fn release_stamp_requires_version_unless_restore() {
+        // Parsing succeeds (version is Option), but the command function rejects it.
+        let cli = Cli::try_parse_from(["xtask", "release-stamp"]).unwrap();
+        let Command::ReleaseStamp { version, restore } = cli.command else {
+            panic!("unexpected command");
+        };
+        assert!(version.is_none());
+        assert!(!restore);
+        let result = release_stamp_command(version, restore);
+        assert!(
+            result.is_err(),
+            "expected error when neither --version nor --restore is provided"
+        );
+        let error = result.unwrap_err().to_string();
+        assert!(
+            error.contains("--version"),
+            "expected --version requirement, got: {error}"
+        );
+    }
+
+    #[test]
+    fn release_stamp_restore_rejects_version() {
+        let cli =
+            Cli::try_parse_from(["xtask", "release-stamp", "--restore", "--version", "1.0.0"])
+                .unwrap();
+        let Command::ReleaseStamp { version, restore } = cli.command else {
+            panic!("unexpected command");
+        };
+        assert!(restore);
+        let result = release_stamp_command(version, restore);
+        assert!(
+            result.is_err(),
+            "expected error when --restore is combined with --version"
+        );
+        let error = result.unwrap_err().to_string();
+        assert!(
+            error.contains("--restore"),
+            "expected --restore conflict error, got: {error}"
+        );
+    }
 }

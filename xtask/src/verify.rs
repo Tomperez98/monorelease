@@ -19,7 +19,7 @@ const PLANS: &[(&str, &[&str], &str)] = &[
     (
         "the root release pipeline",
         &["plan", "release"],
-        "release-verify",
+        "release-contract-check",
     ),
 ];
 
@@ -90,4 +90,28 @@ fn plans(binary: &Path) -> Result<(), Error> {
         println!("{PREFIX}: {description} plans successfully");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The release pipeline must plan a tag-independent validation task so
+    /// `mono run release` works without hidden --tag configuration.
+    #[test]
+    fn release_pipeline_plans_a_tag_independent_task() {
+        let (description, _args, expected) = &PLANS[1];
+        assert!(
+            description.contains("release"),
+            "expected release pipeline description, got: {description}"
+        );
+        assert!(
+            !expected.contains("verify"),
+            "release pipeline task `{expected}` depends on --tag; must be tag-independent"
+        );
+        assert_eq!(
+            *expected, "release-contract-check",
+            "release pipeline plans `{expected}`, expected `release-contract-check`"
+        );
+    }
 }

@@ -397,7 +397,7 @@ mod tests {
     use crate::config::config_path;
     use crate::runner::{CapturedOutput, RunnerError, TaskResult};
     use crate::scheduler::{RetrySleeper, SchedulerServices};
-    use crate::testing::TempDir;
+    use crate::testing::{TempDir, fixture_command};
     use std::collections::BTreeMap;
     use std::fs;
     use std::sync::Mutex;
@@ -672,13 +672,21 @@ mod tests {
         assert!(output.contains("would run app-build"));
     }
 
-    #[cfg(unix)]
     #[test]
     fn retries_a_failed_task_before_reporting_failure() {
         let temp = TempDir::new();
         let marker = temp.path().join("attempted");
-        let marker = marker.to_string_lossy();
-        fs::write(config_path(temp.path()), format!("[project]\nname = \"fixture\"\n\n[pipelines.ci]\ntasks = [\"build\"]\n\n[tasks.build]\ncommand = [\"sh\", \"-c\", \"if [ ! -e '{marker}' ]; then touch '{marker}'; exit 7; fi; printf success\"]\nretries = 1\n")).unwrap();
+        let build = fixture_command(&[
+            "fail-once",
+            marker.to_string_lossy().as_ref(),
+            "7",
+            "success",
+        ]);
+        fs::write(
+            config_path(temp.path()),
+            format!("[project]\nname = \"fixture\"\n\n[pipelines.ci]\ntasks = [\"build\"]\n\n[tasks.build]\ncommand = {build}\nretries = 1\n"),
+        )
+        .unwrap();
         let output = run_pipeline_with_mode(
             temp.path(),
             None,
@@ -695,13 +703,17 @@ mod tests {
         assert!(output.contains("1 completed"));
     }
 
-    #[cfg(unix)]
     #[test]
     fn runs_finalizers_after_a_failed_task() {
         let temp = TempDir::new();
         let marker = temp.path().join("cleanup-ran");
-        let marker_text = marker.to_string_lossy();
-        fs::write(config_path(temp.path()), format!("[project]\nname = \"fixture\"\n\n[pipelines.ci]\ntasks = [\"build\"]\nfinally = [\"cleanup\"]\n\n[tasks.build]\ncommand = [\"sh\", \"-c\", \"exit 7\"]\n\n[tasks.cleanup]\ncommand = [\"touch\", \"{marker_text}\"]\n")).unwrap();
+        let build = fixture_command(&["fail", "7"]);
+        let cleanup = fixture_command(&["write", marker.to_string_lossy().as_ref(), "ran"]);
+        fs::write(
+            config_path(temp.path()),
+            format!("[project]\nname = \"fixture\"\n\n[pipelines.ci]\ntasks = [\"build\"]\nfinally = [\"cleanup\"]\n\n[tasks.build]\ncommand = {build}\n\n[tasks.cleanup]\ncommand = {cleanup}\n"),
+        )
+        .unwrap();
         let error = run_pipeline_with_mode(
             temp.path(),
             None,
@@ -719,13 +731,22 @@ mod tests {
         assert!(marker.exists());
     }
 
-    #[cfg(unix)]
     #[test]
     fn finalizer_dependencies_run_after_a_normal_failure() {
         let temp = TempDir::new();
         let marker = temp.path().join("cleanup-ran");
-        let marker_text = marker.to_string_lossy();
-        fs::write(config_path(temp.path()), format!("[project]\nname = \"fixture\"\n\n[pipelines.ci]\ntasks = [\"build\"]\nfinally = [\"cleanup\"]\n\n[tasks.build]\ncommand = [\"sh\", \"-c\", \"exit 7\"]\n\n[tasks.prepare-cleanup]\ncommand = [\"touch\", \"prepared\"]\n\n[tasks.cleanup]\ncommand = [\"sh\", \"-c\", \"test -f prepared && touch '{marker_text}'\"]\ndepends_on = [\"prepare-cleanup\"]\n")).unwrap();
+        let build = fixture_command(&["fail", "7"]);
+        let prepare = fixture_command(&["write", "prepared", "prepared"]);
+        let cleanup = fixture_command(&[
+            "write-if-exists",
+            "prepared",
+            marker.to_string_lossy().as_ref(),
+        ]);
+        fs::write(
+            config_path(temp.path()),
+            format!("[project]\nname = \"fixture\"\n\n[pipelines.ci]\ntasks = [\"build\"]\nfinally = [\"cleanup\"]\n\n[tasks.build]\ncommand = {build}\n\n[tasks.prepare-cleanup]\ncommand = {prepare}\n\n[tasks.cleanup]\ncommand = {cleanup}\ndepends_on = [\"prepare-cleanup\"]\n"),
+        )
+        .unwrap();
         let error = run_pipeline_with_mode(
             temp.path(),
             None,

@@ -3,6 +3,7 @@ use crate::config::{MonoConfig, PipelineConfig, ProjectConfig, TaskConfig, confi
 use crate::project::suggest::edit_distance;
 use crate::project::validate::{valid_relative_path, validate_cache_pattern};
 use crate::testing::TempDir;
+use std::fs;
 
 // --- Task 1: pure helper tests ---
 

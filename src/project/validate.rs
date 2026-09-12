@@ -1,5 +1,4 @@
 use std::collections::BTreeSet;
-use std::fs;
 use std::path::{Component, Path};
 
 use crate::config::{StdinMode, TaskConfig, validate_process_value};
@@ -185,11 +184,12 @@ pub(super) fn validate_task_directory(
     }
 
     let cwd_path = root.join(cwd);
-    let canonical = fs::canonicalize(&cwd_path).map_err(|source| ProjectError::TaskDirectory {
-        task: task_name.to_owned(),
-        path: cwd_path.clone(),
-        source,
-    })?;
+    let canonical =
+        dunce::canonicalize(&cwd_path).map_err(|source| ProjectError::TaskDirectory {
+            task: task_name.to_owned(),
+            path: cwd_path.clone(),
+            source,
+        })?;
     if !canonical.starts_with(root) || !canonical.is_dir() {
         return Err(ProjectError::InvalidTask {
             task: task_name.to_owned(),

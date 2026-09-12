@@ -8,7 +8,7 @@ use std::process::Output;
 
 mod support;
 
-use support::{TempDir, mono};
+use support::{TempDir, fixture_command, mono};
 
 fn stdout(output: &Output) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
@@ -119,13 +119,15 @@ fn cacheable_tasks_cannot_inherit_standard_input() {
     assert!(stderr(&output).contains("cannot inherit standard input"));
 }
 
-#[cfg(unix)]
 #[test]
 fn cache_reuses_root_task_outputs_and_supports_bypass() {
     let temp = TempDir::new("cache");
+    let build = fixture_command(&["count-copy", "count", "seed", "artifact"]);
     write_project(
         temp.path(),
-        "[pipelines.ci]\ntasks = [\"build\"]\n\n[tasks.build]\ncommand = [\"sh\", \"-c\", \"n=$(cat count 2>/dev/null || echo 0); echo $((n + 1)) > count; cat seed > artifact\"]\ncache = true\ninputs = [\"seed\"]\noutputs = [\"artifact\"]\n",
+        &format!(
+            "[pipelines.ci]\ntasks = [\"build\"]\n\n[tasks.build]\ncommand = {build}\ncache = true\ninputs = [\"seed\"]\noutputs = [\"artifact\"]\n"
+        ),
     );
     fs::write(temp.path().join("seed"), "hello").unwrap();
     assert!(mono(&["ci"], temp.path()).status.success());
@@ -158,13 +160,13 @@ fn plan_redacts_environment_values() {
     assert!(!text.contains("check"));
 }
 
-#[cfg(unix)]
 #[test]
 fn json_output_contains_lifecycle_events() {
     let temp = TempDir::new("json");
+    let build = fixture_command(&["print", "hello"]);
     write_project(
         temp.path(),
-        "[pipelines.ci]\ntasks = [\"build\"]\n\n[tasks.build]\ncommand = [\"echo\", \"hello\"]\n",
+        &format!("[pipelines.ci]\ntasks = [\"build\"]\n\n[tasks.build]\ncommand = {build}\n"),
     );
     let output = mono(&["ci", "--output", "json"], temp.path());
     assert!(output.status.success(), "{}", stderr(&output));
@@ -272,13 +274,13 @@ fn json_success_documents_cover_non_execution_commands() {
     assert_eq!(clean_document["kind"], "cache_clean");
 }
 
-#[cfg(unix)]
 #[test]
 fn stream_output_prefixes_task_bytes_and_reports_summary() {
     let temp = TempDir::new("stream-output");
+    let build = fixture_command(&["print", "output"]);
     write_project(
         temp.path(),
-        "[pipelines.ci]\ntasks = [\"build\"]\n\n[tasks.build]\ncommand = [\"sh\", \"-c\", \"printf 'output'\"]\n",
+        &format!("[pipelines.ci]\ntasks = [\"build\"]\n\n[tasks.build]\ncommand = {build}\n"),
     );
     let output = mono(&["--ui", "stream", "run", "--no-cache"], temp.path());
     assert!(output.status.success(), "{}", stderr(&output));
@@ -294,13 +296,13 @@ fn stream_output_prefixes_task_bytes_and_reports_summary() {
     );
 }
 
-#[cfg(unix)]
 #[test]
 fn live_output_streams_task_bytes_and_reports_summary() {
     let temp = TempDir::new("live-output");
+    let build = fixture_command(&["delay-print", "one", "20", "two"]);
     write_project(
         temp.path(),
-        "[pipelines.ci]\ntasks = [\"build\"]\n\n[tasks.build]\ncommand = [\"sh\", \"-c\", \"printf one; sleep 0.02; printf two\"]\n",
+        &format!("[pipelines.ci]\ntasks = [\"build\"]\n\n[tasks.build]\ncommand = {build}\n"),
     );
     let output = mono(&["--ui", "stream", "run", "--no-cache"], temp.path());
     assert!(output.status.success(), "{}", stderr(&output));

@@ -14,7 +14,7 @@ pub(crate) struct DiscoveredRoot {
 
 /// Find the nearest root `mono.toml`, walking upward from `start`.
 pub(crate) fn find_root(start: &Path) -> Result<DiscoveredRoot, ProjectError> {
-    let start = fs::canonicalize(start).map_err(|source| ProjectError::Io {
+    let start = dunce::canonicalize(start).map_err(|source| ProjectError::Io {
         path: start.to_path_buf(),
         source,
     })?;

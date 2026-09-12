@@ -250,7 +250,7 @@ enum ChangelogCommands {
     #[command(alias = "scaffold")]
     Prepare {
         /// Version to prepare; omitted versions increment the newest patch release.
-        #[arg(value_name = "VERSION", env = "VERSION", value_parser = NonEmptyStringValueParser::new())]
+        #[arg(value_name = "VERSION", value_parser = NonEmptyStringValueParser::new())]
         version: Option<String>,
         /// Compatibility spelling for the pre-0.2 `--version` flag.
         #[arg(long = "version", hide = true, conflicts_with = "version", value_parser = NonEmptyStringValueParser::new())]
@@ -265,7 +265,7 @@ enum ChangelogCommands {
         #[arg(long, requires = "from", value_parser = NonEmptyStringValueParser::new())]
         to: Option<String>,
         /// URL template for PR bullets, containing `{number}`.
-        #[arg(long, env = "CHANGELOG_PR_URL", value_parser = NonEmptyStringValueParser::new())]
+        #[arg(long, value_parser = NonEmptyStringValueParser::new())]
         pull_request_url: Option<String>,
         /// Changelog file to edit
         #[arg(long, default_value = DEFAULT_CHANGELOG_PATH)]
@@ -274,14 +274,14 @@ enum ChangelogCommands {
     /// Write release notes from the newest changelog entry.
     #[command(name = "release-notes", alias = "notes")]
     ReleaseNotes {
-        /// Release version to require; defaults to the newest entry or RELEASE_TAG.
+        /// Release version to require; defaults to the newest changelog entry.
         #[arg(value_name = "VERSION", value_parser = NonEmptyStringValueParser::new())]
         version: Option<String>,
         /// Compatibility spelling for the pre-0.2 `--version` flag.
         #[arg(long = "version", hide = true, conflicts_with = "version", value_parser = NonEmptyStringValueParser::new())]
         version_flag: Option<String>,
-        /// Release tag to require; defaults to the RELEASE_TAG environment variable.
-        #[arg(long = "release-tag", env = "RELEASE_TAG", hide = true, value_parser = NonEmptyStringValueParser::new())]
+        /// Release tag to require.
+        #[arg(long = "release-tag", value_parser = NonEmptyStringValueParser::new())]
         release_tag: Option<String>,
         /// Changelog file to read
         #[arg(long, default_value = DEFAULT_CHANGELOG_PATH)]
@@ -296,28 +296,27 @@ enum ChangelogCommands {
     },
 }
 
-/// Release metadata that is optional per command and inherited from CI when
-/// the matching environment variable is set. `clap` reads the environment, so
-/// [`ReleaseIdentityOptions::resolve`] is a pure transformation.
+/// Release metadata that is optional per command and must be supplied through
+/// explicit flags. [`ReleaseIdentityOptions::resolve`] is a pure transformation.
 #[derive(Args, Default)]
 #[command(next_help_heading = "Release identity")]
 struct ReleaseIdentityOptions {
-    /// Release tag to record, or the `RELEASE_TAG` environment variable
-    #[arg(long, env = "RELEASE_TAG")]
+    /// Release tag to record
+    #[arg(long)]
     tag: Option<String>,
-    /// Commit the tag points at, or the `GITHUB_SHA` environment variable
-    #[arg(long, env = "GITHUB_SHA")]
+    /// Commit the tag points at
+    #[arg(long)]
     commit: Option<String>,
-    /// Repository the release belongs to, or the `GITHUB_REPOSITORY` environment variable
-    #[arg(long, env = "GITHUB_REPOSITORY")]
+    /// Repository the release belongs to
+    #[arg(long)]
     repository: Option<String>,
     // An annotated tag has one object and a lightweight tag has none. CI exports the
     // empty string for a lightweight tag, so `resolve` drops a set-but-empty value.
     /// Annotated tag object; empty for a lightweight tag
-    #[arg(long = "tag-object", env = "RELEASE_TAG_OBJECT")]
+    #[arg(long = "tag-object")]
     tag_object: Option<String>,
-    /// URL of the workflow run that produced the release, or the `GITHUB_RUN_URL` variable
-    #[arg(long = "workflow-run", env = "GITHUB_RUN_URL")]
+    /// URL of the workflow run that produced the release
+    #[arg(long = "workflow-run")]
     workflow_run: Option<String>,
 }
 
@@ -344,18 +343,16 @@ fn non_empty(value: Option<String>) -> Option<String> {
 #[derive(Args)]
 #[command(next_help_heading = "Release identity")]
 struct SourceIdentityOptions {
-    /// Git tag to verify, or the `RELEASE_TAG` environment variable.
+    /// Git tag to verify.
     #[arg(
         long,
-        env = "RELEASE_TAG",
         required = true,
         value_parser = NonEmptyStringValueParser::new()
     )]
     tag: String,
-    /// Commit the tag must point at, or the `GITHUB_SHA` environment variable.
+    /// Commit the tag must point at.
     #[arg(
         long,
-        env = "GITHUB_SHA",
         required = true,
         value_parser = NonEmptyStringValueParser::new()
     )]

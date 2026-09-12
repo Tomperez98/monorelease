@@ -37,6 +37,91 @@ impl Drop for TempDir {
     }
 }
 
+/// Absolute path to the `mono-fixture` helper binary.
+///
+/// Unit tests run inside `target/<profile>/deps/`, and the fixture is a normal
+/// binary beside that directory. It is built by `--all-targets`, which is the
+/// command `mono.toml` runs.
+pub fn fixture_path() -> PathBuf {
+    let executable = std::env::current_exe().expect("test executable has a path");
+    let profile = executable
+        .parent()
+        .and_then(Path::parent)
+        .expect("test executable lives in a profile directory");
+    let name = if cfg!(windows) {
+        "mono-fixture.exe"
+    } else {
+        "mono-fixture"
+    };
+    let path = profile.join(name);
+    assert!(
+        path.is_file(),
+        "missing {}; build it with `cargo test --all-targets`",
+        path.display()
+    );
+    path
+}
+
+/// A `command = [...]` array for a task that runs the fixture.
+///
+/// Paths are TOML-escaped so a Windows absolute path survives the manifest.
+pub fn fixture_command(args: &[&str]) -> String {
+    let parts = std::iter::once(fixture_path().to_string_lossy().into_owned())
+        .chain(args.iter().map(|arg| (*arg).to_owned()));
+    let quoted = parts
+        .map(|part| format!("\"{}\"", part.replace('\\', "\\\\").replace('"', "\\\"")))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("[{quoted}]")
+}
+
+/// Create a symbolic link, or report that this process is not allowed to.
+///
+/// Creating a symlink is a platform *capability*, not a platform fact: Windows
+/// permits it only with Developer Mode or elevation. Tests call this first so
+/// they exercise symlink behavior wherever it is available instead of being
+/// compiled out on Windows.
+#[allow(dead_code)]
+pub fn create_symlink_or_skip(target: &Path, link: &Path) -> bool {
+    match symlink(target, link) {
+        Ok(()) => true,
+        Err(error) => {
+            eprintln!("skipped: cannot create a symlink here ({error})");
+            false
+        }
+    }
+}
+
+/// Create a symbolic link using whichever API the platform exposes.
+#[allow(dead_code)]
+fn symlink(target: &Path, link: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(target, link)
+    }
+
+    #[cfg(windows)]
+    {
+        // Windows needs the link kind declared up front. Relative targets are
+        // resolved against the link's directory, so `is_dir` is only consulted
+        // for the absolute directory link the cache tests create.
+        if target.is_dir() {
+            std::os::windows::fs::symlink_dir(target, link)
+        } else {
+            std::os::windows::fs::symlink_file(target, link)
+        }
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (target, link);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "symbolic links are not supported",
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::TempDir;
