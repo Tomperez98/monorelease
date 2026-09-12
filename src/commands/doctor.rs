@@ -2,14 +2,19 @@
 
 use std::error::Error as StdError;
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::project::{Project, ProjectError};
 
-/// Validate that `dir` resolves to a healthy root-project manifest.
-pub fn doctor(dir: &Path) -> Result<(), DoctorError> {
-    Project::load(dir)?;
-    Ok(())
+/// Validate that `dir` resolves to a healthy root-project manifest and return
+/// the root it resolved to.
+///
+/// The root is part of the answer because `mono check` reports it; a caller
+/// that discarded it and re-loaded the manifest to learn it would be a second
+/// authority on what a healthy project is.
+pub fn doctor(dir: &Path) -> Result<PathBuf, DoctorError> {
+    let project = Project::load(dir)?;
+    Ok(project.root)
 }
 
 /// Expected failures of [`doctor`].
@@ -56,6 +61,9 @@ mod tests {
         )
         .expect("write project manifest");
 
-        doctor(temp.path()).expect("doctor succeeds");
+        assert_eq!(
+            doctor(temp.path()).expect("doctor succeeds"),
+            dunce::canonicalize(temp.path()).expect("temp path canonicalizes")
+        );
     }
 }

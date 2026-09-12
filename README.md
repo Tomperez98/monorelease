@@ -276,7 +276,7 @@ Timeouts terminate the complete child process tree using Unix process groups or 
 
 ## Release conventions
 
-Mono uses the same provider-neutral release pattern for every project that adopts its release commands:
+Mono's changelog and release commands use a provider-neutral contract; publishing stays an ordinary project task or CI step:
 
 - `CHANGELOG.md` is Markdown.
 - The newest heading is `## (unreleased)` or `## X.Y.Z`.
@@ -286,9 +286,6 @@ Mono uses the same provider-neutral release pattern for every project that adopt
 - The matching changelog entry becomes `RELEASE_NOTES.md`.
 - Prepared entries contain release metadata and meaningful bullets, not empty category placeholders.
 - Release directories contain an explicit, verified artifact inventory and SHA-256 metadata.
-- Publishing remains an ordinary project task or CI step; Mono does not know registries or package managers.
-
-The repository's release files use pinned placeholders for reproducible source releases: the root package in `Cargo.toml`, the `mono` package in `Cargo.lock`, and the displayed Zensical site version are pinned at `0.0.0`. The repository-owned `xtask` coordinator receives an explicit release identity, stamps them from the tag, builds the four canonical native archives, writes `site/release.json`, verifies every user-visible version, and restores the placeholders. The committed files never move. GitHub Actions only provisions toolchains, moves artifacts, deploys Pages, and invokes the coordinator; release commands do not infer their identity from ambient environment variables.
 
 Prepare and review a release from the newest changelog entry:
 
@@ -303,35 +300,15 @@ with editable first-parent merge bullets, pass `--from REF --to REF`. Add
 `--pull-request-url 'https://github.com/org/repo/pull/{number}'` to link
 recognized PR merge commits; this is a read-only Git operation.
 
-Run the pinned-state release preflight before creating the tag:
-
-```console
-cargo run --locked --quiet -- run release-preflight --no-cache --ui stream
-```
-
-Create and push an annotated release tag only after the preflight and changelog
-are approved; the tag push starts the GitHub release workflow:
-
-```console
-cargo run --locked --quiet -p xtask -- tag --tag v0.1.3
-```
-
-The tag is the only version input. To stamp a checkout manually:
-
-```console
-cargo run --locked --quiet -p xtask -- release-stamp --version 0.1.5
-cargo run --locked --quiet -p xtask -- release-stamp --restore
-```
-
-`release-stamp` saves `.backup` copies while stamping. The release coordinator uses it around preparation and documentation builds, while each native build job stamps its own throwaway checkout. The committed placeholders remain unchanged. Mono does not publish to npm, Cargo, Maven, PyPI, or Docker; those operations remain ordinary tasks or CI workflow steps.
+Mono does not publish to npm, Cargo, Maven, PyPI, or Docker; those operations remain ordinary tasks or CI workflow steps.
 
 ## Exit codes
 
 | Code | Meaning |
 | --- | --- |
 | `0` | The command succeeded. |
-| `1` | The request was understood but the project, task, changelog, or release check failed. |
-| `2` | The command line was invalid. |
+| `1` | The request was understood and refused: a red pipeline, an invalid manifest, a rejected changelog or release check. |
+| `2` | The command line was malformed: an unknown flag, or a value with no valid shape (`--jobs 0`, `--date 2001-13-45`). |
 | `3` | Mono or its environment could not carry the command out. |
 
 ## Development

@@ -33,11 +33,18 @@ impl ReleaseNotesTarget {
             .map(Request::parse)
             .transpose()
             .map_err(ChangelogError::Invalid)?;
+        Self::from_requests(version, release_tag)
+    }
+
+    pub fn from_requests(
+        version: Option<Request>,
+        release_tag: Option<Request>,
+    ) -> Result<Self, ChangelogError> {
         if let (Some(version), Some(release_tag)) = (version, release_tag)
             && version != release_tag
         {
             return Err(ChangelogError::Invalid(
-                "requested version does not match RELEASE_TAG".to_owned(),
+                "requested version does not match --release-tag".to_owned(),
             ));
         }
         Ok(Self {
@@ -60,26 +67,95 @@ pub fn validate(path: &Path) -> Result<String, ChangelogError> {
     ))
 }
 
+/// A validated release date accepted by the changelog workflows.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReleaseDate(String);
+
+impl ReleaseDate {
+    pub fn parse(value: &str) -> Result<Self, String> {
+        if is_valid_date(value) {
+            Ok(Self(value.to_owned()))
+        } else {
+            Err("expected `<yyyy-mm-dd>`".to_owned())
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// A validated pull-request URL template.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PullRequestUrl(String);
+
+impl PullRequestUrl {
+    pub fn parse(value: &str) -> Result<Self, String> {
+        validate_pull_request_url(value).map_err(|error| error.to_string())?;
+        Ok(Self(value.to_owned()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+fn parse_release_date(path: &Path, value: &str) -> Result<ReleaseDate, ChangelogError> {
+    ReleaseDate::parse(value).map_err(|_| {
+        invalid(
+            path,
+            format!("invalid release date `{value}`, expected `<yyyy-mm-dd>`"),
+        )
+    })
+}
+
 /// Prepare a new top entry, inferring the next patch version when omitted.
 pub fn prepare(
     path: &Path,
     version: Option<&str>,
     date: Option<&str>,
 ) -> Result<String, ChangelogError> {
-    let date = date.map_or_else(today, str::to_owned);
-    prepare_on(path, version, &date)
+    let version = version
+        .map(Request::parse)
+        .transpose()
+        .map_err(ChangelogError::Invalid)?;
+    let date = date
+        .map(|date| parse_release_date(path, date))
+        .transpose()?;
+    prepare_request(path, version, date.as_ref())
+}
+
+/// Prepare a new top entry from already validated CLI values.
+pub fn prepare_request(
+    path: &Path,
+    version: Option<Request>,
+    date: Option<&ReleaseDate>,
+) -> Result<String, ChangelogError> {
+    let date = date.cloned().unwrap_or_else(|| ReleaseDate(today()));
+    prepare_request_on(path, version, &date)
 }
 
 /// Prepare an entry using a caller-supplied date.
-///
-/// Keeping the clock outside this function makes the workflow deterministic
-/// without requiring a fake clock or global state in tests.
 pub fn prepare_on(
     path: &Path,
     version: Option<&str>,
     date: &str,
 ) -> Result<String, ChangelogError> {
-    prepare_with_bullets(path, version, date, &[])
+    let version = version
+        .map(Request::parse)
+        .transpose()
+        .map_err(ChangelogError::Invalid)?;
+    let date = parse_release_date(path, date)?;
+    prepare_request_on(path, version, &date)
+}
+
+fn prepare_request_on(
+    path: &Path,
+    version: Option<Request>,
+    date: &ReleaseDate,
+) -> Result<String, ChangelogError> {
+    let (changelog, request) = load_prepare_input_request(path, version)?;
+    write_prepared(path, changelog, request, date.as_str(), &[])
 }
 
 /// Prepare a new top entry from first-parent merge commits in an explicit ref range.
@@ -94,20 +170,113 @@ pub fn prepare_from_git(
     to: &str,
     pull_request_url: Option<&str>,
 ) -> Result<String, ChangelogError> {
-    let date = date.map_or_else(today, str::to_owned);
-    let (changelog, request) = load_prepare_input(path, version, &date)?;
+    let version = version
+        .map(Request::parse)
+        .transpose()
+        .map_err(ChangelogError::Invalid)?;
+    let date = date
+        .map(|date| parse_release_date(path, date))
+        .transpose()?;
+    let pull_request_url = pull_request_url
+        .map(PullRequestUrl::parse)
+        .transpose()
+        .map_err(ChangelogError::Invalid)?;
+    prepare_from_git_request(
+        path,
+        version,
+        date.as_ref(),
+        from,
+        to,
+        pull_request_url.as_ref(),
+    )
+}
+
+/// Prepare a changelog entry from already validated values.
+pub fn prepare_from_git_request(
+    path: &Path,
+    version: Option<Request>,
+    date: Option<&ReleaseDate>,
+    from: &str,
+    to: &str,
+    pull_request_url: Option<&PullRequestUrl>,
+) -> Result<String, ChangelogError> {
+    prepare_from_git_with_request(
+        path,
+        version,
+        date,
+        from,
+        to,
+        pull_request_url,
+        git_merge_log,
+    )
+}
+
+/// Prepare a changelog entry with Git supplied by the caller and typed inputs.
+pub fn prepare_from_git_with_request<F>(
+    path: &Path,
+    version: Option<Request>,
+    date: Option<&ReleaseDate>,
+    from: &str,
+    to: &str,
+    pull_request_url: Option<&PullRequestUrl>,
+    mut merge_log: F,
+) -> Result<String, ChangelogError>
+where
+    F: FnMut(&Path, &str, &str) -> Result<String, ChangelogError>,
+{
+    let date = date.cloned().unwrap_or_else(|| ReleaseDate(today()));
+    let (changelog, request) = load_prepare_input_request(path, version)?;
     validate_ref(from)?;
     validate_ref(to)?;
-    validate_pull_request_url(pull_request_url)?;
-    let log = git_merge_log(path, from, to)?;
-    let bullets = format_git_bullets(&log, pull_request_url);
-    let mut message = write_prepared(path, changelog, request, &date, &bullets)?;
+    let log = merge_log(path, from, to)?;
+    let pull_request_url_text = pull_request_url.map(PullRequestUrl::as_str);
+    let bullets = format_git_bullets(&log, pull_request_url_text);
+    let mut message = write_prepared(path, changelog, request, date.as_str(), &bullets)?;
     if bullets.is_empty() {
         message.push_str(&format!(
             "; warning: no first-parent merge commits found in {from}..{to}"
         ));
     }
     Ok(message)
+}
+
+/// Prepare a changelog entry with Git supplied by the caller.
+///
+/// This compatibility wrapper accepts strings and validates them before entering
+/// the typed workflow.
+#[cfg(test)]
+pub(crate) fn prepare_from_git_with<F>(
+    path: &Path,
+    version: Option<&str>,
+    date: Option<&str>,
+    from: &str,
+    to: &str,
+    pull_request_url: Option<&str>,
+    merge_log: F,
+) -> Result<String, ChangelogError>
+where
+    F: FnMut(&Path, &str, &str) -> Result<String, ChangelogError>,
+{
+    let version = version
+        .map(Request::parse)
+        .transpose()
+        .map_err(ChangelogError::Invalid)?;
+    let date = date
+        .map(|date| parse_release_date(path, date))
+        .transpose()?;
+    let pull_request_url = pull_request_url
+        .map(PullRequestUrl::parse)
+        .transpose()
+        .map_err(ChangelogError::Invalid)?;
+    prepare_from_git_with_request(
+        path,
+        version,
+        date.as_ref(),
+        from,
+        to,
+        pull_request_url.as_ref(),
+        merge_log,
+    )
 }
 
 /// Scaffold an entry dated today. Kept as a compatibility wrapper for `prepare`.
@@ -123,31 +292,14 @@ pub fn scaffold_on(path: &Path, version: &str, date: &str) -> Result<String, Cha
     prepare_on(path, Some(version), date)
 }
 
-fn prepare_with_bullets(
+fn load_prepare_input_request(
     path: &Path,
-    version: Option<&str>,
-    date: &str,
-    bullets: &[String],
-) -> Result<String, ChangelogError> {
-    let (changelog, request) = load_prepare_input(path, version, date)?;
-    write_prepared(path, changelog, request, date, bullets)
-}
-
-fn load_prepare_input(
-    path: &Path,
-    version: Option<&str>,
-    date: &str,
+    version: Option<Request>,
 ) -> Result<(Changelog, Request), ChangelogError> {
     let text = read(path)?;
     let changelog = Changelog::parse(&text).map_err(|message| invalid(path, message))?;
-    if !is_valid_date(date) {
-        return Err(invalid(
-            path,
-            format!("invalid release date `{date}`, expected `<yyyy-mm-dd>`"),
-        ));
-    }
     let request = match version {
-        Some(version) => Request::parse(version).map_err(ChangelogError::Invalid)?,
+        Some(version) => version,
         None => Request::Version(
             changelog
                 .next_version()
@@ -318,10 +470,13 @@ fn bounded_text(bytes: &[u8], limit: usize) -> String {
     text
 }
 
-fn validate_pull_request_url(template: Option<&str>) -> Result<(), ChangelogError> {
-    if let Some(template) = template
-        && !template.contains("{number}")
-    {
+/// Reject a pull-request URL template that has no `{number}` placeholder.
+///
+/// Public so the CLI can reject `--pull-request-url` while parsing it, against
+/// the flag the user typed, using exactly the rule this command applies when it
+/// renders bullets.
+pub fn validate_pull_request_url(template: &str) -> Result<(), ChangelogError> {
+    if !template.contains("{number}") {
         return Err(ChangelogError::Invalid(
             "pull-request URL must contain the `{number}` placeholder".to_owned(),
         ));
@@ -564,7 +719,7 @@ mod tests {
     fn release_notes_target_rejects_disagreeing_inputs() {
         let error = ReleaseNotesTarget::parse(Some("1.0.0"), Some("v1.0.1")).unwrap_err();
 
-        assert!(error.to_string().contains("does not match RELEASE_TAG"));
+        assert!(error.to_string().contains("does not match --release-tag"));
     }
 
     #[test]
@@ -645,6 +800,58 @@ mod tests {
     }
 
     #[test]
+    fn scripted_git_log_prepares_without_spawning_git() {
+        let temp = TempDir::new();
+        let path = temp.path().join(DEFAULT_PATH);
+        fs::write(&path, "# Changelog\n\n## 1.0.0\nReleased: 2026-01-01\n").unwrap();
+
+        let message = prepare_from_git_with(
+            &path,
+            None,
+            Some("2001-02-03"),
+            "FROM",
+            "TO",
+            None,
+            |_path, from, to| {
+                assert_eq!((from, to), ("FROM", "TO"));
+                Ok("Merge pull request #42 from team/feature\x1f\nAdd the feature\x1e".to_owned())
+            },
+        )
+        .expect("scripted Git log succeeds");
+
+        assert!(message.contains("1 Git changes"), "{message}");
+        assert!(fs::read_to_string(path).unwrap().contains("#42"));
+    }
+
+    #[test]
+    fn scripted_git_failure_is_returned_without_writing() {
+        let temp = TempDir::new();
+        let path = temp.path().join(DEFAULT_PATH);
+        let original = "# Changelog\n\n## 1.0.0\nReleased: 2026-01-01\n";
+        fs::write(&path, original).unwrap();
+
+        let error = prepare_from_git_with(
+            &path,
+            None,
+            Some("2001-02-03"),
+            "FROM",
+            "TO",
+            None,
+            |_path, _from, _to| {
+                Err(ChangelogError::CommandFailed {
+                    command: "git log".to_owned(),
+                    status: Some(128),
+                    stderr: "bad ref".to_owned(),
+                })
+            },
+        )
+        .expect_err("scripted Git failure is returned");
+
+        assert!(matches!(error, ChangelogError::CommandFailed { .. }));
+        assert_eq!(fs::read_to_string(path).unwrap(), original);
+    }
+
+    #[test]
     fn git_failure_leaves_the_changelog_untouched() {
         let temp = TempDir::new();
         let path = temp.path().join(DEFAULT_PATH);
@@ -659,9 +866,10 @@ mod tests {
 
     #[test]
     fn pull_request_url_templates_require_the_number_placeholder() {
-        let error = validate_pull_request_url(Some("https://example.test/pull")).unwrap_err();
+        let error = validate_pull_request_url("https://example.test/pull").unwrap_err();
 
         assert!(error.to_string().contains("{number}"));
+        validate_pull_request_url("https://example.test/pull/{number}").expect("a template");
     }
 
     #[test]

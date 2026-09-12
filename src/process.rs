@@ -7,12 +7,9 @@
 use std::io;
 use std::process::{Command, ExitStatus};
 
-#[cfg(windows)]
-use process_wrap::std::JobObject;
-#[cfg(unix)]
-use process_wrap::std::ProcessGroup;
 use process_wrap::std::{ChildWrapper, CommandWrap};
 
+use crate::platform;
 use crate::runner::{ChildProcess, ProcessExit, TerminationOutcome};
 
 /// A child process whose process tree can be terminated reliably.
@@ -29,7 +26,7 @@ impl ManagedChild {
     /// Create a child in an OS-backed process group.
     pub(crate) fn spawn(command: Command) -> io::Result<Self> {
         let mut command = CommandWrap::from(command);
-        configure_process_tree(&mut command);
+        platform::configure_process_tree(&mut command);
         Ok(Self {
             child: command.spawn()?,
         })
@@ -48,10 +45,7 @@ impl ManagedChild {
             Err(_error) if self.child.try_wait()?.is_some() => {
                 Ok(TerminationOutcome::AlreadyExited)
             }
-            #[cfg(target_os = "macos")]
-            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
-                // process-wrap can report EPERM when killpg races with a
-                // short-lived child whose process group has disappeared.
+            Err(error) if platform::termination_failure_means_already_exited(&error) => {
                 Ok(TerminationOutcome::AlreadyExited)
             }
             Err(error) => Err(error),
@@ -76,16 +70,6 @@ impl ManagedChild {
             .take()
             .map(|pipe| Box::new(pipe) as Box<dyn std::io::Read + Send>)
     }
-}
-
-#[cfg(unix)]
-fn configure_process_tree(command: &mut CommandWrap) {
-    command.wrap(ProcessGroup::leader());
-}
-
-#[cfg(windows)]
-fn configure_process_tree(command: &mut CommandWrap) {
-    command.wrap(JobObject);
 }
 
 impl ChildProcess for ManagedChild {

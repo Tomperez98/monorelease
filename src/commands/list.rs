@@ -13,23 +13,40 @@ pub fn list(path: &Path) -> Result<String, ListError> {
 }
 
 pub fn list_with_output(path: &Path, output_mode: OutputMode) -> Result<String, ListError> {
-    let project = Project::load(path)?;
+    let document = describe(path)?;
     if output_mode == OutputMode::Json {
-        return serde_json::to_string(&ListDocument::from(&project))
-            .map_err(|source| ListError::Json { source });
+        return serde_json::to_string(&document).map_err(|source| ListError::Json { source });
     }
+    Ok(format_list_document(&document))
+}
 
-    let mut output = format!("project {} ({})", project.name, project.root.display());
+/// Load the project description into an owned value that can be rendered by
+/// multiple transports without retaining the loaded project.
+pub(crate) fn describe(path: &Path) -> Result<ListDocument, ListError> {
+    let project = Project::load(path)?;
+    Ok(ListDocument::from(&project))
+}
+
+fn format_list_document(document: &ListDocument) -> String {
+    let mut output = format!("project {} ({})", document.project, document.root.display());
     output.push_str("\n\npipelines:\n");
-    for (name, pipeline) in &project.pipelines {
-        output.push_str(&format!("  {name}: {}\n", pipeline.tasks.join(", ")));
+    for pipeline in &document.pipelines {
+        output.push_str(&format!(
+            "  {}: {}\n",
+            pipeline.name,
+            pipeline.tasks.join(", ")
+        ));
         if !pipeline.finally.is_empty() {
             output.push_str(&format!("    finally: {}\n", pipeline.finally.join(", ")));
         }
     }
     output.push_str("\ntasks:\n");
-    for (name, task) in &project.tasks {
-        output.push_str(&format!("  {name}: {}\n", format_command(&task.command)));
+    for task in &document.tasks {
+        output.push_str(&format!(
+            "  {}: {}\n",
+            task.id,
+            format_command(&task.command)
+        ));
     }
     output.push_str("\ncommon commands:\n");
     for (command, description) in [
@@ -42,57 +59,57 @@ pub fn list_with_output(path: &Path, output_mode: OutputMode) -> Result<String, 
     ] {
         output.push_str(&format!("  {command}: {description}\n"));
     }
-    Ok(output.trim_end().to_owned())
+    output.trim_end().to_owned()
 }
 
 #[derive(serde::Serialize)]
-struct ListDocument<'a> {
+pub(crate) struct ListDocument {
     schema: u32,
     kind: &'static str,
-    project: &'a str,
-    root: &'a Path,
-    default_pipeline: &'a str,
-    pipelines: Vec<ListPipeline<'a>>,
-    tasks: Vec<ListTask<'a>>,
+    project: String,
+    root: std::path::PathBuf,
+    default_pipeline: String,
+    pipelines: Vec<ListPipeline>,
+    tasks: Vec<ListTask>,
 }
 
 #[derive(serde::Serialize)]
-struct ListPipeline<'a> {
-    name: &'a str,
-    tasks: &'a [String],
-    finally: &'a [String],
+struct ListPipeline {
+    name: String,
+    tasks: Vec<String>,
+    finally: Vec<String>,
 }
 
 #[derive(serde::Serialize)]
-struct ListTask<'a> {
-    id: &'a str,
-    command: &'a [String],
+struct ListTask {
+    id: String,
+    command: Vec<String>,
     stdin: &'static str,
 }
 
-impl<'a> From<&'a Project> for ListDocument<'a> {
-    fn from(project: &'a Project) -> Self {
+impl From<&Project> for ListDocument {
+    fn from(project: &Project) -> Self {
         Self {
             schema: crate::events::EXECUTION_EVENT_SCHEMA,
             kind: "list",
-            project: &project.name,
-            root: &project.root,
-            default_pipeline: &project.default_pipeline,
+            project: project.name.clone(),
+            root: project.root.clone(),
+            default_pipeline: project.default_pipeline.clone(),
             pipelines: project
                 .pipelines
                 .iter()
                 .map(|(name, pipeline)| ListPipeline {
-                    name,
-                    tasks: &pipeline.tasks,
-                    finally: &pipeline.finally,
+                    name: name.clone(),
+                    tasks: pipeline.tasks.clone(),
+                    finally: pipeline.finally.clone(),
                 })
                 .collect(),
             tasks: project
                 .tasks
                 .iter()
                 .map(|(id, task)| ListTask {
-                    id,
-                    command: &task.command,
+                    id: id.clone(),
+                    command: task.command.clone(),
                     stdin: task.stdin.as_str(),
                 })
                 .collect(),

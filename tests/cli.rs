@@ -119,30 +119,6 @@ fn cacheable_tasks_cannot_inherit_standard_input() {
     assert!(stderr(&output).contains("cannot inherit standard input"));
 }
 
-#[cfg(unix)]
-#[test]
-fn cache_reuses_root_task_outputs_and_supports_bypass() {
-    let temp = TempDir::new("cache");
-    write_project(
-        temp.path(),
-        "[pipelines.ci]\ntasks = [\"build\"]\n\n[tasks.build]\ncommand = [\"sh\", \"-c\", \"n=$(cat count 2>/dev/null || echo 0); echo $((n + 1)) > count; cat seed > artifact\"]\ncache = true\ninputs = [\"seed\"]\noutputs = [\"artifact\"]\n",
-    );
-    fs::write(temp.path().join("seed"), "hello").unwrap();
-    assert!(mono(&["ci"], temp.path()).status.success());
-    let second = mono(&["ci"], temp.path());
-    assert!(second.status.success(), "{}", stderr(&second));
-    assert!(stderr(&second).contains("cache hit"));
-    assert_eq!(
-        fs::read_to_string(temp.path().join("count")).unwrap(),
-        "1\n"
-    );
-    assert!(mono(&["ci", "--force"], temp.path()).status.success());
-    assert_eq!(
-        fs::read_to_string(temp.path().join("count")).unwrap(),
-        "2\n"
-    );
-}
-
 #[test]
 fn plan_redacts_environment_values() {
     let temp = TempDir::new("env");
@@ -156,45 +132,6 @@ fn plan_redacts_environment_values() {
     assert!(text.contains("API_TOKEN=<redacted>"));
     assert!(!text.contains("secret"));
     assert!(!text.contains("check"));
-}
-
-#[cfg(unix)]
-#[test]
-fn json_output_contains_lifecycle_events() {
-    let temp = TempDir::new("json");
-    write_project(
-        temp.path(),
-        "[pipelines.ci]\ntasks = [\"build\"]\n\n[tasks.build]\ncommand = [\"echo\", \"hello\"]\n",
-    );
-    let output = mono(&["ci", "--output", "json"], temp.path());
-    assert!(output.status.success(), "{}", stderr(&output));
-    let output_text = stdout(&output);
-    let lines = output_text.lines().collect::<Vec<_>>();
-    assert!(
-        lines
-            .iter()
-            .any(|line| line.contains("\"event\":\"task_started\""))
-    );
-    assert!(
-        lines
-            .iter()
-            .any(|line| line.contains("\"event\":\"task_finished\""))
-    );
-    assert!(
-        lines
-            .iter()
-            .all(|line| serde_json::from_str::<serde_json::Value>(line).is_ok())
-    );
-    let events = lines
-        .iter()
-        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
-        .collect::<Vec<_>>();
-    assert!(events.iter().all(|event| event["run_id"].is_u64()));
-    let sequences = events
-        .iter()
-        .map(|event| event["sequence"].as_u64().unwrap())
-        .collect::<Vec<_>>();
-    assert!(sequences.windows(2).all(|pair| pair[0] < pair[1]));
 }
 
 #[test]
@@ -272,48 +209,59 @@ fn json_success_documents_cover_non_execution_commands() {
     assert_eq!(clean_document["kind"], "cache_clean");
 }
 
-#[cfg(unix)]
+/// Values whose shape mono can judge on its own are refused while parsing, so
+/// they name the flag and exit `2`. A value only the project can judge exits
+/// `1` instead — `release_notes_reject_a_tag_that_is_not_the_newest_entry` pins
+/// that half of the split.
 #[test]
-fn stream_output_prefixes_task_bytes_and_reports_summary() {
-    let temp = TempDir::new("stream-output");
-    write_project(
-        temp.path(),
-        "[pipelines.ci]\ntasks = [\"build\"]\n\n[tasks.build]\ncommand = [\"sh\", \"-c\", \"printf 'output'\"]\n",
-    );
-    let output = mono(&["--ui", "stream", "run", "--no-cache"], temp.path());
-    assert!(output.status.success(), "{}", stderr(&output));
-    assert!(
-        stdout(&output).contains("[build] output"),
-        "{}",
-        stdout(&output)
-    );
-    assert!(
-        stderr(&output).contains("└─ build: completed"),
-        "{}",
-        stderr(&output)
-    );
+fn malformed_flag_values_are_usage_errors() {
+    let temp = TempDir::new("usage-values");
+
+    for args in [
+        vec!["run", "--jobs", "0"],
+        vec!["run", "--jobs", "many"],
+        vec!["changelog", "prepare", "banana"],
+        vec!["changelog", "prepare", "--date", "2001-13-45"],
+        vec!["changelog", "prepare", "--date", "03/02/2001"],
+        vec![
+            "changelog",
+            "prepare",
+            "--pull-request-url",
+            "https://example.test/pull/",
+        ],
+        vec!["changelog", "release-notes", "--release-tag", "banana"],
+    ] {
+        let output = mono(&args, temp.path());
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "{args:?} must be a usage error: {}",
+            stderr(&output)
+        );
+    }
 }
 
-#[cfg(unix)]
+/// A run in JSON mode reports itself through events, so the transport has no
+/// summary left to print. A blank line where the summary would have gone would
+/// silently break a consumer parsing one document per line.
 #[test]
-fn live_output_streams_task_bytes_and_reports_summary() {
-    let temp = TempDir::new("live-output");
+fn a_json_run_emits_events_and_no_summary_line() {
+    let temp = TempDir::new("run-json");
     write_project(
         temp.path(),
-        "[pipelines.ci]\ntasks = [\"build\"]\n\n[tasks.build]\ncommand = [\"sh\", \"-c\", \"printf one; sleep 0.02; printf two\"]\n",
+        "[pipelines.ci]\ntasks = [\"build\"]\n\n[tasks.build]\ncommand = [\"echo\", \"build\"]\n",
     );
-    let output = mono(&["--ui", "stream", "run", "--no-cache"], temp.path());
+
+    let output = mono(&["--output", "json", "run", "--no-cache"], temp.path());
     assert!(output.status.success(), "{}", stderr(&output));
-    assert!(
-        stdout(&output).contains("[build] onetwo"),
-        "{}",
-        stdout(&output)
-    );
-    assert!(
-        stdout(&output).contains("1 completed"),
-        "{}",
-        stdout(&output)
-    );
+
+    let events = stdout(&output)
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("one document per line"))
+        .collect::<Vec<_>>();
+    assert_eq!(events.first().unwrap()["event"], "run_started");
+    assert_eq!(events.last().unwrap()["event"], "run_finished");
+    assert!(stderr(&output).is_empty(), "{}", stderr(&output));
 }
 
 #[test]

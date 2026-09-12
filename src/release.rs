@@ -621,7 +621,7 @@ fn write_file(path: &Path, contents: &str) -> Result<(), ReleaseError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::TempDir;
+    use crate::testing::{TempDir, create_symlink_or_skip};
 
     #[test]
     fn creates_and_verifies_a_deterministic_manifest() {
@@ -696,12 +696,13 @@ mod tests {
         assert!(error.to_string().contains("does not match its metadata"));
     }
 
-    #[cfg(unix)]
     #[test]
     fn rejects_symlinks() {
         let temp = TempDir::new();
         fs::write(temp.path().join("artifact"), b"data").unwrap();
-        std::os::unix::fs::symlink(temp.path().join("artifact"), temp.path().join("link")).unwrap();
+        if !create_symlink_or_skip(&temp.path().join("artifact"), &temp.path().join("link")) {
+            return;
+        }
 
         let error = create_manifest(temp.path(), ReleaseIdentity::default()).unwrap_err();
         assert!(error.to_string().contains("symlink"));

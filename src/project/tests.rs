@@ -1,10 +1,46 @@
 use super::*;
-use crate::config::config_path;
+use crate::config::{MonoConfig, PipelineConfig, ProjectConfig, TaskConfig, config_path};
 use crate::project::suggest::edit_distance;
 use crate::project::validate::{valid_relative_path, validate_cache_pattern};
 use crate::testing::TempDir;
+use std::fs;
 
 // --- Task 1: pure helper tests ---
+
+#[test]
+fn from_config_builds_a_project_without_manifest_io() {
+    let config = MonoConfig {
+        schema: 1,
+        project: ProjectConfig {
+            name: "fixture".to_owned(),
+            default_pipeline: "ci".to_owned(),
+        },
+        tasks: BTreeMap::from([(
+            "build".to_owned(),
+            TaskConfig {
+                command: vec!["echo".to_owned(), "build".to_owned()],
+                timeout_seconds: 600,
+                max_output_bytes: 16 * 1024 * 1024,
+                ..TaskConfig::default()
+            },
+        )]),
+        pipelines: BTreeMap::from([(
+            "ci".to_owned(),
+            PipelineConfig {
+                tasks: vec!["build".to_owned()],
+                finally: Vec::new(),
+            },
+        )]),
+    };
+
+    let virtual_root = std::env::temp_dir().join("mono-virtual-project");
+    let project = Project::from_config(virtual_root.clone(), config)
+        .expect("in-memory project construction succeeds");
+
+    assert_eq!(project.root, virtual_root);
+    assert_eq!(project.name, "fixture");
+    assert_eq!(project.pipelines["ci"].tasks, ["build"]);
+}
 
 #[test]
 fn a_name_without_dimensions_is_its_own_base() {

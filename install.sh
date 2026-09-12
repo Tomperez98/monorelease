@@ -19,9 +19,9 @@ REPOSITORY="Tomperez98/mono"
 BINARY="mono"
 
 #region published defaults
-# `xtask release-docs` replaces this region in the release asset, pinning it to
-# that release and carrying the digests for its archives. The checked-in source
-# remains unpinned and requires --version or MONO_VERSION.
+# Published release assets pin this region to a release and its archive
+# digests. The checked-in source stays unpinned and requires --version or
+# MONO_VERSION.
 default_version=""
 default_checksums=""
 #endregion

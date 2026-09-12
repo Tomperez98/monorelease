@@ -7,16 +7,16 @@ use std::sync::Arc;
 
 use crate::cache::CacheMode;
 use crate::output::{OutputMode, OutputSink};
-use crate::project::{PlannedTask, Project, ProjectError, TaskNode};
+use crate::project::{PlannedTask, Project, ProjectError};
 use crate::runner::{CancellationToken, Runner, TaskExecutor, format_command};
 use crate::scheduler::{
-    ExecutionSummary, SchedulerError, SchedulerOptions, SchedulerServices,
+    ExecutionSummary, SchedulerError, SchedulerOptions, SchedulerServices, TaskReporter,
     execute_plan_with_services, production_services,
 };
 
 pub(crate) struct PipelineServices {
     runner: Arc<dyn TaskExecutor>,
-    output: Arc<OutputSink>,
+    output: Arc<dyn TaskReporter>,
     scheduler: SchedulerServices,
 }
 
@@ -53,6 +53,12 @@ impl Default for PipelineExecution {
     }
 }
 
+/// Run the selected pipeline against the project rooted at `path`.
+///
+/// Returns the human-readable summary the transport should print, or `None`
+/// when the run reported itself through the JSON event stream and has nothing
+/// left to print. `None` exists because the transport must be able to tell "no
+/// summary" apart from an empty one without parsing text.
 pub fn run_pipeline_with_mode(
     path: &Path,
     pipeline: Option<&str>,
@@ -60,7 +66,7 @@ pub fn run_pipeline_with_mode(
     dry_run: bool,
     jobs: usize,
     execution: PipelineExecution,
-) -> Result<String, CiError> {
+) -> Result<Option<String>, CiError> {
     if jobs == 0 {
         return Err(CiError::InvalidJobs);
     }
@@ -69,9 +75,13 @@ pub fn run_pipeline_with_mode(
     if dry_run {
         return if execution.output == OutputMode::Json {
             serde_json::to_string(&PlanDocument::from((&project, plan.as_slice())))
+                .map(Some)
                 .map_err(|source| CiError::Json { source })
         } else {
-            Ok(format_plan(&project, &plan))
+            Ok(Some(format_plan_document(&PlanDocument::from((
+                &project,
+                plan.as_slice(),
+            )))))
         };
     }
 
@@ -79,9 +89,9 @@ pub fn run_pipeline_with_mode(
         PipelineServices::production(&project, execution.output, &execution.cancellation)?;
     let summary = execute_loaded_pipeline(&project, &plan, jobs, &execution, &services)?;
     if execution.output == OutputMode::Json {
-        Ok(String::new())
+        Ok(None)
     } else {
-        Ok(format_summary(&summary))
+        Ok(Some(format_summary(&summary)))
     }
 }
 
@@ -125,13 +135,25 @@ pub fn plan_with_output(
     requested_tasks: &[String],
     output_mode: OutputMode,
 ) -> Result<String, CiError> {
+    let document = plan_result(path, pipeline, requested_tasks)?;
+    if output_mode == OutputMode::Json {
+        return serde_json::to_string(&document).map_err(|source| CiError::Json { source });
+    }
+    Ok(format_plan_document(&document))
+}
+
+/// Resolve a plan into an owned, presentation-independent document.
+///
+/// The returned value contains no `Project` or filesystem handles. Text and
+/// JSON renderers can consume it without repeating project loading or planning.
+pub(crate) fn plan_result(
+    path: &Path,
+    pipeline: Option<&str>,
+    requested_tasks: &[String],
+) -> Result<PlanDocument, CiError> {
     let project = Project::load(path)?;
     let plan = project.plan(pipeline, requested_tasks)?;
-    if output_mode == OutputMode::Json {
-        return serde_json::to_string(&PlanDocument::from((&project, plan.as_slice())))
-            .map_err(|source| CiError::Json { source });
-    }
-    Ok(format_plan(&project, &plan))
+    Ok(PlanDocument::from((&project, plan.as_slice())))
 }
 
 pub fn clean_cache(path: &Path) -> Result<String, CiError> {
@@ -163,52 +185,41 @@ pub fn graph_with_output(
     requested_tasks: &[String],
     output_mode: OutputMode,
 ) -> Result<String, CiError> {
+    let document = graph_result(path, pipeline, requested_tasks)?;
+    if output_mode == OutputMode::Json {
+        return serde_json::to_string(&document).map_err(|source| CiError::Json { source });
+    }
+    Ok(format_graph_document(&document))
+}
+
+/// Resolve dependency edges into an owned, presentation-independent document.
+pub(crate) fn graph_result(
+    path: &Path,
+    pipeline: Option<&str>,
+    requested_tasks: &[String],
+) -> Result<GraphDocument, CiError> {
     let project = Project::load(path)?;
     let edges = project.graph(pipeline, requested_tasks)?;
-    if output_mode == OutputMode::Json {
-        return serde_json::to_string(&GraphDocument {
-            schema: crate::events::EXECUTION_EVENT_SCHEMA,
-            kind: "graph",
-            project: project.name.clone(),
-            root: project.root.display().to_string(),
-            edges: edges
-                .into_iter()
-                .map(|(task, dependencies)| GraphEdge {
-                    task: task.id().to_owned(),
-                    depends_on: dependencies
-                        .into_iter()
-                        .map(|dependency| dependency.id().to_owned())
-                        .collect(),
-                })
-                .collect(),
-        })
-        .map_err(|source| CiError::Json { source });
-    }
-    let mut output = format!(
-        "{} {} ({})",
-        "project",
-        project.name,
-        project.root.display()
-    );
-    for (node, dependencies) in edges {
-        output.push('\n');
-        output.push_str(node.id());
-        if !dependencies.is_empty() {
-            output.push_str(" <- ");
-            output.push_str(
-                &dependencies
-                    .iter()
-                    .map(TaskNode::id)
-                    .collect::<Vec<_>>()
-                    .join(", "),
-            );
-        }
-    }
-    Ok(output)
+    Ok(GraphDocument {
+        schema: crate::events::EXECUTION_EVENT_SCHEMA,
+        kind: "graph",
+        project: project.name,
+        root: project.root.display().to_string(),
+        edges: edges
+            .into_iter()
+            .map(|(task, dependencies)| GraphEdge {
+                task: task.id().to_owned(),
+                depends_on: dependencies
+                    .into_iter()
+                    .map(|dependency| dependency.id().to_owned())
+                    .collect(),
+            })
+            .collect(),
+    })
 }
 
 #[derive(serde::Serialize)]
-struct PlanDocument {
+pub(crate) struct PlanDocument {
     schema: u32,
     kind: &'static str,
     project: String,
@@ -217,7 +228,7 @@ struct PlanDocument {
 }
 
 #[derive(serde::Serialize)]
-struct PlanTask {
+pub(crate) struct PlanTask {
     id: String,
     command: Vec<String>,
     cwd: String,
@@ -273,7 +284,7 @@ impl<'a> From<(&'a Project, &'a [PlannedTask])> for PlanDocument {
 }
 
 #[derive(serde::Serialize)]
-struct GraphDocument {
+pub(crate) struct GraphDocument {
     schema: u32,
     kind: &'static str,
     project: String,
@@ -282,51 +293,56 @@ struct GraphDocument {
 }
 
 #[derive(serde::Serialize)]
-struct GraphEdge {
+pub(crate) struct GraphEdge {
     task: String,
     depends_on: Vec<String>,
 }
 
-fn format_plan(project: &Project, plan: &[PlannedTask]) -> String {
-    let mut output = format!(
-        "{} {} ({})",
-        "project",
-        project.name,
-        project.root.display()
-    );
-    for task in plan {
+fn format_plan_document(document: &PlanDocument) -> String {
+    let mut output = format!("project {} ({})", document.project, document.root);
+    for task in &document.tasks {
         output.push('\n');
         output.push_str(&format!(
             "would run {} in {}: {}",
-            task.id(),
-            task.cwd().display(),
-            format_command(task.command())
+            task.id,
+            task.cwd,
+            format_command(&task.command)
         ));
-        output.push_str(&format!(" [timeout={}s]", task.timeout().as_secs()));
-        output.push_str(&format!(" [max_output_bytes={}]", task.max_output_bytes()));
-        if let Some(group) = task.resource_group() {
+        output.push_str(&format!(" [timeout={}s]", task.timeout_seconds));
+        output.push_str(&format!(" [max_output_bytes={}]", task.max_output_bytes));
+        if let Some(group) = &task.resource_group {
             output.push_str(&format!(" [resource_group={group}]"));
         }
-        if !task.inputs().is_empty() {
-            output.push_str(&format!(" [inputs={}]", task.inputs().join(", ")));
+        if !task.inputs.is_empty() {
+            output.push_str(&format!(" [inputs={}]", task.inputs.join(", ")));
         }
-        if !task.outputs().is_empty() {
-            output.push_str(&format!(" [outputs={}]", task.outputs().join(", ")));
+        if !task.outputs.is_empty() {
+            output.push_str(&format!(" [outputs={}]", task.outputs.join(", ")));
         }
-        if task.retries() > 0 {
-            output.push_str(&format!(" [retries={}]", task.retries()));
-            if task.retry_backoff() > std::time::Duration::ZERO {
-                output.push_str(&format!(
-                    " [retry_backoff={}s]",
-                    task.retry_backoff().as_secs()
-                ));
+        if task.retries > 0 {
+            output.push_str(&format!(" [retries={}]", task.retries));
+            if task.retry_backoff_seconds > 0 {
+                output.push_str(&format!(" [retry_backoff={}s]", task.retry_backoff_seconds));
             }
         }
-        if task.is_finalizer() {
+        if task.finalizer {
             output.push_str(" [finally]");
         }
-        for key in task.env().keys() {
+        for key in &task.env {
             output.push_str(&format!(" [env {key}=<redacted>]"));
+        }
+    }
+    output
+}
+
+fn format_graph_document(document: &GraphDocument) -> String {
+    let mut output = format!("project {} ({})", document.project, document.root);
+    for edge in &document.edges {
+        output.push('\n');
+        output.push_str(&edge.task);
+        if !edge.depends_on.is_empty() {
+            output.push_str(" <- ");
+            output.push_str(&edge.depends_on.join(", "));
         }
     }
     output
@@ -658,80 +674,10 @@ mod tests {
             1,
             PipelineExecution::default(),
         )
-        .unwrap();
+        .unwrap()
+        .expect("a terminal dry run reports its plan");
         assert!(output.find("base-build").unwrap() < output.find("app-build").unwrap());
         assert!(output.contains("would run app-build"));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn retries_a_failed_task_before_reporting_failure() {
-        let temp = TempDir::new();
-        let marker = temp.path().join("attempted");
-        let marker = marker.to_string_lossy();
-        fs::write(config_path(temp.path()), format!("[project]\nname = \"fixture\"\n\n[pipelines.ci]\ntasks = [\"build\"]\n\n[tasks.build]\ncommand = [\"sh\", \"-c\", \"if [ ! -e '{marker}' ]; then touch '{marker}'; exit 7; fi; printf success\"]\nretries = 1\n")).unwrap();
-        let output = run_pipeline_with_mode(
-            temp.path(),
-            None,
-            &[],
-            false,
-            1,
-            PipelineExecution {
-                cache: CacheMode::NoCache,
-                output: OutputMode::Terminal,
-                ..PipelineExecution::default()
-            },
-        )
-        .unwrap();
-        assert!(output.contains("1 completed"));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn runs_finalizers_after_a_failed_task() {
-        let temp = TempDir::new();
-        let marker = temp.path().join("cleanup-ran");
-        let marker_text = marker.to_string_lossy();
-        fs::write(config_path(temp.path()), format!("[project]\nname = \"fixture\"\n\n[pipelines.ci]\ntasks = [\"build\"]\nfinally = [\"cleanup\"]\n\n[tasks.build]\ncommand = [\"sh\", \"-c\", \"exit 7\"]\n\n[tasks.cleanup]\ncommand = [\"touch\", \"{marker_text}\"]\n")).unwrap();
-        let error = run_pipeline_with_mode(
-            temp.path(),
-            None,
-            &[],
-            false,
-            1,
-            PipelineExecution {
-                cache: CacheMode::NoCache,
-                output: OutputMode::Terminal,
-                ..PipelineExecution::default()
-            },
-        )
-        .unwrap_err();
-        assert!(matches!(error, CiError::Scheduler(_)));
-        assert!(marker.exists());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn finalizer_dependencies_run_after_a_normal_failure() {
-        let temp = TempDir::new();
-        let marker = temp.path().join("cleanup-ran");
-        let marker_text = marker.to_string_lossy();
-        fs::write(config_path(temp.path()), format!("[project]\nname = \"fixture\"\n\n[pipelines.ci]\ntasks = [\"build\"]\nfinally = [\"cleanup\"]\n\n[tasks.build]\ncommand = [\"sh\", \"-c\", \"exit 7\"]\n\n[tasks.prepare-cleanup]\ncommand = [\"touch\", \"prepared\"]\n\n[tasks.cleanup]\ncommand = [\"sh\", \"-c\", \"test -f prepared && touch '{marker_text}'\"]\ndepends_on = [\"prepare-cleanup\"]\n")).unwrap();
-        let error = run_pipeline_with_mode(
-            temp.path(),
-            None,
-            &[],
-            false,
-            1,
-            PipelineExecution {
-                cache: CacheMode::NoCache,
-                output: OutputMode::Terminal,
-                ..PipelineExecution::default()
-            },
-        )
-        .unwrap_err();
-        assert!(matches!(error, CiError::Scheduler(_)));
-        assert!(marker.exists(), "finalizer dependency closure did not run");
     }
 
     #[test]

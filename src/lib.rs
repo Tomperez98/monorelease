@@ -17,6 +17,7 @@ pub(crate) mod events;
 /// Version of Mono's machine-readable JSON output contracts.
 pub const JSON_OUTPUT_SCHEMA: u32 = 1;
 mod output;
+mod platform;
 pub(crate) mod process;
 mod project;
 mod release;
@@ -33,14 +34,18 @@ use std::fmt;
 pub use cache::CacheMode;
 pub use changelog::{
     Action as ChangelogAction, Changelog, Entry as ChangelogEntry, Heading, Request, Version,
+    is_valid_date,
 };
 pub use commands::changelog::{
     ChangelogError, DEFAULT_NOTES_PATH as DEFAULT_RELEASE_NOTES_PATH,
-    DEFAULT_PATH as DEFAULT_CHANGELOG_PATH, ReleaseNotesTarget, notes as changelog_notes,
-    prepare as changelog_prepare, prepare_from_git as changelog_prepare_from_git,
-    prepare_on as changelog_prepare_on, release_notes as changelog_release_notes,
-    scaffold as changelog_scaffold, scaffold_on as changelog_scaffold_on,
-    validate as changelog_validate,
+    DEFAULT_PATH as DEFAULT_CHANGELOG_PATH, PullRequestUrl, ReleaseDate, ReleaseNotesTarget,
+    notes as changelog_notes, prepare as changelog_prepare,
+    prepare_from_git as changelog_prepare_from_git,
+    prepare_from_git_request as changelog_prepare_from_git_request,
+    prepare_on as changelog_prepare_on, prepare_request as changelog_prepare_request,
+    release_notes as changelog_release_notes, scaffold as changelog_scaffold,
+    scaffold_on as changelog_scaffold_on, validate as changelog_validate,
+    validate_pull_request_url as changelog_validate_pull_request_url,
 };
 pub use commands::ci::{
     CiError, PipelineExecution, clean_cache, graph, graph_with_output, plan, plan_with_output,

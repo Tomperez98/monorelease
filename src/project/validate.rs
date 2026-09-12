@@ -1,5 +1,4 @@
 use std::collections::BTreeSet;
-use std::fs;
 use std::path::{Component, Path};
 
 use crate::config::{StdinMode, TaskConfig, validate_process_value};
@@ -18,7 +17,6 @@ pub(crate) fn validate_schema(path: &Path, schema: u32) -> Result<(), ProjectErr
 
 pub(super) fn validate_task_config(
     manifest_path: &Path,
-    root: &Path,
     task_name: &str,
     task: &TaskConfig,
 ) -> Result<(), ProjectError> {
@@ -114,28 +112,13 @@ pub(super) fn validate_task_config(
             message: "resource_group must be non-empty and cannot contain ':', NUL, or control characters".to_owned(),
         });
     }
-    if let Some(cwd) = &task.cwd {
-        if !valid_relative_path(cwd) {
-            return Err(ProjectError::InvalidTask {
-                task: task_name.to_owned(),
-                message: "cwd must be an existing relative directory without '..'".to_owned(),
-            });
-        }
-        if !cwd.contains("${") {
-            let cwd_path = root.join(cwd);
-            let canonical =
-                fs::canonicalize(&cwd_path).map_err(|source| ProjectError::TaskDirectory {
-                    task: task_name.to_owned(),
-                    path: cwd_path.clone(),
-                    source,
-                })?;
-            if !canonical.starts_with(root) || !canonical.is_dir() {
-                return Err(ProjectError::InvalidTask {
-                    task: task_name.to_owned(),
-                    message: "cwd must resolve to a directory inside the project root".to_owned(),
-                });
-            }
-        }
+    if let Some(cwd) = &task.cwd
+        && !valid_relative_path(cwd)
+    {
+        return Err(ProjectError::InvalidTask {
+            task: task_name.to_owned(),
+            message: "cwd must be an existing relative directory without '..'".to_owned(),
+        });
     }
     for (dimension, values) in &task.matrix {
         validate_identifier(manifest_path, "matrix dimension", dimension)?;
@@ -183,6 +166,34 @@ pub(super) fn validate_task_config(
         return Err(ProjectError::InvalidTask {
             task: task_name.to_owned(),
             message: "matrix cannot expand to more than 1024 instances".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+pub(super) fn validate_task_directory(
+    root: &Path,
+    task_name: &str,
+    task: &TaskConfig,
+) -> Result<(), ProjectError> {
+    let Some(cwd) = &task.cwd else {
+        return Ok(());
+    };
+    if cwd.contains("${") {
+        return Ok(());
+    }
+
+    let cwd_path = root.join(cwd);
+    let canonical =
+        dunce::canonicalize(&cwd_path).map_err(|source| ProjectError::TaskDirectory {
+            task: task_name.to_owned(),
+            path: cwd_path.clone(),
+            source,
+        })?;
+    if !canonical.starts_with(root) || !canonical.is_dir() {
+        return Err(ProjectError::InvalidTask {
+            task: task_name.to_owned(),
+            message: "cwd must resolve to a directory inside the project root".to_owned(),
         });
     }
     Ok(())

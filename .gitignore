@@ -1,5 +1,3 @@
 /target
 /RELEASE_NOTES.md
 /site
-# Written by `xtask release-stamp`; never committed.
-*.backup
