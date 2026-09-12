@@ -161,6 +161,7 @@ jobs:
       contents: write
       pages: write
       id-token: write
+      attestations: write
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
@@ -205,9 +206,22 @@ jobs:
           name: release-notes
           path: notes
 
-      # The repository-specific xtask owns the artifact inventory, metadata,
-      # checksum, and identity contract. GitHub Actions only assembles the
-      # directory and publishes it.
+      # Build the versioned documentation in the same release job as the
+      # binaries. The coordinator stamps and restores the release files around
+      # the build, so this checkout returns to its pinned state. It also renders
+      # the tag-pinned installers into dist/ with the exact binary digests baked
+      # in, before the final release contract is written.
+      - name: Set up uv
+        uses: astral-sh/setup-uv@94527f2e458b27549849d47d273a16bec83a01e9 # v7
+        with:
+          enable-cache: true
+
+      - name: Build versioned documentation and release installers
+        run: cargo run --locked --quiet -p xtask -- release-docs --version "${RELEASE_TAG#v}" --directory dist
+
+      # The repository-specific xtask owns the complete artifact inventory,
+      # including the rendered installers, metadata, checksums, and identity.
+      # GitHub Actions only assembles the directory and publishes it.
       - name: Write and verify release contract
         env:
           RELEASE_COMMIT: ${{ needs.validate.outputs.source_commit }}
@@ -215,19 +229,10 @@ jobs:
           RELEASE_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: cargo run --locked --quiet -p xtask -- release-contract --directory dist
 
-      # Build the versioned documentation in the same release job as the
-      # binaries. The coordinator stamps and restores the release files around
-      # the build, so this checkout returns to its pinned state. It also renders
-      # the installers into site/ with this release's tag and SHA256SUMS digests
-      # baked in, which is what makes the published copy resolve nothing at run
-      # time.
-      - name: Set up uv
-        uses: astral-sh/setup-uv@94527f2e458b27549849d47d273a16bec83a01e9 # v7
+      - name: Generate installer provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
-          enable-cache: true
-
-      - name: Build versioned documentation
-        run: cargo run --locked --quiet -p xtask -- release-docs --version "${RELEASE_TAG#v}" --directory dist
+          subject-path: dist/install.*
 
       - name: Verify release versions
         run: cargo run --locked --quiet -p xtask -- release-version-check --site site --notes notes/RELEASE_NOTES.md
@@ -254,7 +259,7 @@ jobs:
         id: deployment
         uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4
 
-      # The release only becomes the latest release once every binary asset and
+      # The release only becomes the latest release once every release asset and
       # the versioned documentation site are in place.
       - name: Publish release
         env:

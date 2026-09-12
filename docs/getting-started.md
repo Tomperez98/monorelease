@@ -9,27 +9,26 @@ Install Mono, add a root `mono.toml`, validate the graph, and run your default p
 Linux and macOS:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Tomperez98/mono/main/install.sh | sh
+curl -fsSL https://github.com/Tomperez98/mono/releases/latest/download/install.sh | sh
 ```
 
 Windows (PowerShell):
 
 ```powershell
-irm https://raw.githubusercontent.com/Tomperez98/mono/main/install.ps1 | iex
+irm https://github.com/Tomperez98/mono/releases/latest/download/install.ps1 | iex
 ```
 
-The script resolves the newest release, checks the archive against the release's
-published `SHA256SUMS`, and installs to `~/.local/bin`. Pin a version with
-`--version v0.1.5`, or choose a directory with `--prefix /usr/local`. Remove the
-binary later with `rm ~/.local/bin/mono`, or `Remove-Item` on Windows: Mono keeps
-no state of its own, so removing the binary is the whole uninstall.
-
-The copy of the installer published with each release carries that release's tag
-and checksums already inside, so it installs without contacting the GitHub API:
+The release asset carries its version and archive digest, and installs to
+`~/.local/bin` without contacting the GitHub API. Install a specific release with
+its tag-scoped asset URL:
 
 ```bash
-curl -fsSL https://tomperez98.github.io/mono/install.sh | sh
+curl -fsSL https://github.com/Tomperez98/mono/releases/download/v0.1.5/install.sh | sh
 ```
+
+Choose a directory with `--prefix /usr/local` or `MONO_INSTALL_DIR`. Remove the
+binary later with `rm ~/.local/bin/mono`, or `Remove-Item` on Windows: Mono keeps
+no state of its own, so removing the binary is the whole uninstall.
 
 ### Prebuilt binary
 

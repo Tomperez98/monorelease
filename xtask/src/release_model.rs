@@ -182,10 +182,11 @@ pub struct ReleasePlan {
 /// Return the exact release artifact inventory without touching the filesystem.
 pub fn artifact_inventory(tag: &str) -> Result<Vec<String>, Error> {
     parse_tag(tag)?;
-    let names = ReleaseTarget::all()
+    let mut names = ReleaseTarget::all()
         .iter()
         .map(|target| target.artifact_name(tag))
         .collect::<Vec<_>>();
+    names.extend(INSTALLER_ASSETS.iter().map(|name| (*name).to_owned()));
     if names.iter().any(String::is_empty) {
         return Err(Error::Invalid(
             "release target produced an empty artifact name".to_owned(),
@@ -202,17 +203,12 @@ pub fn artifact_inventory(tag: &str) -> Result<Vec<String>, Error> {
     Ok(names)
 }
 
-/// Where the installers published with the documentation are served.
-///
-/// GitHub Pages redirects this to a custom domain if one is ever configured, so
-/// release bodies written before such a change keep resolving.
-const DOCS_INSTALL_BASE: &str = "https://tomperez98.github.io/mono";
-
-/// Installer file names published beside the versioned documentation.
+/// Installer file names published as release assets.
 pub const SHELL_INSTALLER_FILE: &str = "install.sh";
 pub const POWERSHELL_INSTALLER_FILE: &str = "install.ps1";
+pub const INSTALLER_ASSETS: [&str; 2] = [SHELL_INSTALLER_FILE, POWERSHELL_INSTALLER_FILE];
 
-/// Region a published installer fills in with its release defaults.
+/// Region a release installer asset fills in with its release defaults.
 ///
 /// Both installers carry this region, so the published copy differs from the
 /// checked-in one only inside it. Everything else — including the PowerShell
@@ -222,36 +218,31 @@ const DEFAULTS_REGION_END: &str = "#endregion\n";
 
 /// Install commands for a published release body, pinned to its tag.
 ///
-/// The commands name the release documentation's own copy of the installers,
-/// which `xtask release-docs` rendered with this tag and this release's digests
-/// already inside. Passing the tag anyway is what keeps the command correct
-/// after a newer release overwrites that URL: the newer copy only applies its
-/// baked checksums when the requested tag is its own, and otherwise fetches the
-/// requested release's `SHA256SUMS`.
+/// The commands name the tag-scoped release assets rendered with this tag and
+/// this release's archive digests already inside.
 pub fn install_section(tag: &str) -> Result<String, Error> {
     parse_tag(tag)?;
     Ok(format!(
         "## Install\n\
 \n\
-These commands come from this release's documentation and already carry its tag\n\
-and checksums, so they resolve neither at run time.\n\
+These installers are release assets pinned to `{tag}` and carry this release's\n\
+archive checksums. They do not resolve the release version at run time.\n\
 \n\
 Linux and macOS:\n\
 \n\
 ```bash\n\
-curl -fsSL {DOCS_INSTALL_BASE}/install.sh | sh -s -- --version {tag}\n\
+curl -fsSL https://github.com/Tomperez98/mono/releases/download/{tag}/install.sh | sh\n\
 ```\n\
 \n\
 Windows (PowerShell):\n\
 \n\
 ```powershell\n\
-$env:MONO_VERSION = '{tag}'\n\
-irm {DOCS_INSTALL_BASE}/install.ps1 | iex\n\
+irm https://github.com/Tomperez98/mono/releases/download/{tag}/install.ps1 | iex\n\
 ```\n\
 \n\
-Either one verifies the archive against this release's `SHA256SUMS` and installs\n\
-to `~/.local/bin`. Mono keeps no state of its own, so undoing it is `rm` on the\n\
-installed path.\n"
+Either one verifies the archive against this release's embedded SHA-256 digest and\n\
+installs to `~/.local/bin`. Mono keeps no state of its own, so undoing it is `rm`\n\
+on the installed path.\n"
     ))
 }
 
@@ -279,6 +270,7 @@ pub fn compose_release_notes(tag: &str, notes: &str) -> Result<String, Error> {
 }
 
 /// Parse a `SHA256SUMS` file into artifact name → lowercase digest.
+#[cfg(test)]
 pub fn checksum_table(text: &str) -> Result<BTreeMap<String, String>, Error> {
     let mut table = BTreeMap::new();
     for (index, line) in text.lines().enumerate() {
@@ -314,7 +306,7 @@ pub fn checksum_table(text: &str) -> Result<BTreeMap<String, String>, Error> {
     Ok(table)
 }
 
-/// The `target=digest` defaults a published installer bakes in.
+/// The `target=digest` defaults a release installer asset bakes in.
 ///
 /// Every canonical target must appear. An installer missing one would fall back
 /// to downloading `SHA256SUMS` for that platform, which is the run-time
@@ -331,7 +323,7 @@ pub fn installer_digests(tag: &str, checksums: &BTreeMap<String, String>) -> Res
     Ok(defaults.join(" "))
 }
 
-/// The assignment that identifies which release a published installer serves.
+/// The assignment that identifies which release an installer asset serves.
 pub fn shell_installer_version_marker(tag: &str) -> String {
     format!("default_version='{tag}'")
 }
@@ -681,8 +673,19 @@ mod tests {
     fn release_plan_and_inventory_share_one_target_table() {
         let plan = release_plan(context()).unwrap();
         assert_eq!(plan.targets.len(), 4);
-        assert_eq!(plan.artifact_names.len(), plan.targets.len());
+        assert_eq!(
+            plan.artifact_names.len(),
+            plan.targets.len() + INSTALLER_ASSETS.len()
+        );
         assert_eq!(artifact_inventory("v0.1.5").unwrap(), plan.artifact_names);
+        assert!(
+            plan.artifact_names
+                .contains(&SHELL_INSTALLER_FILE.to_owned())
+        );
+        assert!(
+            plan.artifact_names
+                .contains(&POWERSHELL_INSTALLER_FILE.to_owned())
+        );
     }
 
     #[test]
@@ -691,23 +694,20 @@ mod tests {
 
         assert!(section.starts_with("## Install\n"), "{section}");
         assert!(
-            section.contains(&format!(
-                "{DOCS_INSTALL_BASE}/install.sh | sh -s -- --version v0.1.5"
-            )),
+            section.contains(
+                "https://github.com/Tomperez98/mono/releases/download/v0.1.5/install.sh | sh"
+            ),
             "{section}"
         );
         assert!(
-            section.contains("$env:MONO_VERSION = 'v0.1.5'"),
+            section.contains(
+                "irm https://github.com/Tomperez98/mono/releases/download/v0.1.5/install.ps1 | iex"
+            ),
             "{section}"
         );
-        assert!(
-            section.contains(&format!("irm {DOCS_INSTALL_BASE}/install.ps1 | iex")),
-            "{section}"
-        );
-        assert!(
-            !section.contains("raw.githubusercontent.com"),
-            "the body points at the copy published with this release: {section}"
-        );
+        assert!(!section.contains("tomperez98.github.io"), "{section}");
+        assert!(!section.contains("--version"), "{section}");
+        assert!(!section.contains("MONO_VERSION"), "{section}");
         assert!(
             install_section("0.1.5").is_err(),
             "the tag carries the `v` prefix; a version alone is not a release"

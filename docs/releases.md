@@ -49,7 +49,7 @@ provides it.
 
 ## Repository releases
 
-The repository's release files use pinned placeholders: the root package in `Cargo.toml`, the `mono` package in `Cargo.lock`, and the displayed Zensical site version are pinned at `0.0.0`. The release coordinator stamps all three from the tag before building and restores them before returning. The committed files never move. `release-prepare` owns source validation, changelog/tag agreement, CI, release gates, notes, and packaging checks; `release-build --target` owns native artifact builds and archive creation; `release-docs` builds the versioned Zensical site and writes `site/release.json`; `release-version-check` verifies every local version source; and `release-validate-published` owns the post-publication contract, provenance, reproducibility, and Pages checks. `release-docs` also renders the installers into the documentation it deploys, with the tag and the released `SHA256SUMS` digests baked in, and both the pre-deploy version check and the post-deploy validation refuse a published installer that names another release. Publication composes the release body from the checked changelog notes plus an install section generated from the tag, so the body never names a different version than the artifacts beside it.
+The repository's release files use pinned placeholders: the root package in `Cargo.toml`, the `mono` package in `Cargo.lock`, and the displayed Zensical site version are pinned at `0.0.0`. The release coordinator stamps all three from the tag before building and restores them before returning. The committed files never move. `release-prepare` owns source validation, changelog/tag agreement, CI, release gates, notes, and packaging checks; `release-build --target` owns native artifact builds and archive creation; `release-docs` builds the versioned Zensical site and renders the tag-pinned installers into the release directory; `release-contract` verifies the four archives plus both installers; `release-version-check` verifies every local version source; and `release-validate-published` owns the post-publication contract, provenance, reproducibility, release-asset installer checks, and Pages checks. The installers carry the released archive digests and are published as first-class GitHub Release assets. Publication composes the release body from the checked changelog notes plus tag-scoped installer URLs, so the body never names a different version than the artifacts beside it.
 
 To create and push an annotated release tag after the newest changelog entry
 has been reviewed:
@@ -70,13 +70,14 @@ cargo run -p xtask -- release-stamp --restore
 
 `release-stamp` saves `.backup` copies while stamping and refuses incomplete
 stamp states. Normal release builds should use the coordinator commands rather
-than invoking it directly. The canonical artifacts are the four native archives
-listed by `xtask`; their names, checksums, metadata, and version identity are
-validated from one target table. The installers are not release assets: they are
-rendered from the checked-in scripts into the documentation site, so the exact
-artifact inventory, checksums, and provenance statements stay untouched. Scheduled validation runs the current validator
-from the default branch, clones the immutable release source, rebuilds the Linux
-artifact, verifies every platform artifact and attestation, and checks the
-machine-readable marker deployed with the Pages site. Mono does not publish to npm, Cargo, Maven,
+than invoking it directly. The canonical release assets are the four native archives and the two rendered
+installers listed by `xtask`; their names, checksums, metadata, and version identity
+are validated from one inventory. The documentation site contains release metadata
+and versioned docs, while GitHub Release assets are the canonical installer source.
+Scheduled validation runs the current validator from the default branch, clones the
+immutable release source, rebuilds the Linux artifact, verifies every platform
+artifact and attestation, checks both release installers, executes the published
+installer on supported runners, and checks the machine-readable marker deployed
+with the Pages site. Mono does not publish to npm, Cargo, Maven,
 PyPI, Docker, or any other registry; those operations remain ordinary tasks or
 CI workflow steps.

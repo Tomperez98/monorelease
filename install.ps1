@@ -4,17 +4,17 @@
 Install the mono binary from a GitHub release.
 
 .DESCRIPTION
-Downloads the Windows archive for the newest published release (or a version
-given with -Version), verifies it against the release's published SHA256SUMS,
+Downloads the Windows archive for the release selected by the pinned asset or
+-Version, verifies it against the release's published SHA256SUMS,
 and copies mono.exe to <Prefix>\bin. Mono keeps no state of its own, so undoing
 this is Remove-Item on the installed path.
 
 .EXAMPLE
-irm https://raw.githubusercontent.com/Tomperez98/mono/main/install.ps1 | iex
+irm https://github.com/Tomperez98/mono/releases/latest/download/install.ps1 | iex
 
 .EXAMPLE
 $env:MONO_VERSION = 'v0.1.5'
-irm https://raw.githubusercontent.com/Tomperez98/mono/main/install.ps1 | iex
+irm https://github.com/Tomperez98/mono/releases/latest/download/install.ps1 | iex
 #>
 [CmdletBinding()]
 param(
@@ -25,7 +25,8 @@ param(
     # -Version.
     [string]$Version = "",
 
-    # Directory that receives bin\mono.exe. Default: $HOME\.local.
+    # Directory that receives bin\mono.exe. Default: $HOME\.local or
+    # $env:MONO_INSTALL_DIR when set.
     [string]$Prefix = ""
 )
 
@@ -37,10 +38,9 @@ $Binary = "mono.exe"
 $UserAgent = "mono-install"
 
 #region published defaults
-# `xtask release-docs` replaces this region in the copy published with a release,
-# pinning it to that release and carrying the digests from its SHA256SUMS. Empty
-# means no pinning: the script resolves the newest release and downloads the
-# checksums for it.
+# `xtask release-docs` replaces this region in the release asset, pinning it to
+# that release and carrying the digests for its archives. The checked-in source
+# remains unpinned and requires -Version or MONO_VERSION.
 $DefaultVersion = ""
 $DefaultChecksums = ""
 #endregion
@@ -77,19 +77,15 @@ switch ($env:PROCESSOR_ARCHITECTURE) {
     default { Fail "no prebuilt mono for Windows architecture $($env:PROCESSOR_ARCHITECTURE)" }
 }
 
+if (-not $Prefix -and $env:MONO_INSTALL_DIR) {
+    $Prefix = $env:MONO_INSTALL_DIR
+}
 if (-not $Prefix) {
     $Prefix = Join-Path $HOME ".local"
 }
 
 if (-not $Version) {
-    try {
-        $release = Invoke-RestMethod -UserAgent $UserAgent `
-            -Uri "https://api.github.com/repos/$Repository/releases/latest"
-    }
-    catch {
-        Fail "could not read the latest release tag from the GitHub API: $($_.Exception.Message)"
-    }
-    $Version = $release.tag_name
+    Fail "this installer is not pinned; use a release asset or pass -Version"
 }
 
 # Accept both `0.1.5` and `v0.1.5`; the release tag carries the prefix.

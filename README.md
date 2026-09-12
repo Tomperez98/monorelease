@@ -17,43 +17,50 @@ Mono is a task orchestrator, not a package manager or workspace detector. You de
 
 ### Install script
 
-The script resolves the newest release, checks the archive against the release's
-published `SHA256SUMS`, and installs to `~/.local/bin`.
+The release installer carries its version and archive digest, verifies the
+archive before extraction, and installs to `~/.local/bin`.
 
 Linux and macOS:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Tomperez98/mono/main/install.sh | sh
+curl -fsSL https://github.com/Tomperez98/mono/releases/latest/download/install.sh | sh
 ```
 
 Windows (PowerShell):
 
 ```powershell
-irm https://raw.githubusercontent.com/Tomperez98/mono/main/install.ps1 | iex
+irm https://github.com/Tomperez98/mono/releases/latest/download/install.ps1 | iex
 ```
 
-Pass options after `sh -s --` when the script arrives on stdin:
+Each release also publishes version-pinned copies of both installers as release
+assets. To install a specific release:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Tomperez98/mono/main/install.sh | sh -s -- --version v0.1.5
-curl -fsSL https://raw.githubusercontent.com/Tomperez98/mono/main/install.sh | sh -s -- --prefix /usr/local
+curl -fsSL https://github.com/Tomperez98/mono/releases/download/v0.1.5/install.sh | sh
+```
+
+```powershell
+irm https://github.com/Tomperez98/mono/releases/download/v0.1.5/install.ps1 | iex
+```
+
+The release installers carry the selected release's archive checksums and do not
+query the GitHub API at install time. Pass options after `sh -s --`, or use
+`MONO_VERSION` and `MONO_INSTALL_DIR` when a script arrives through a pipe:
+
+```bash
+curl -fsSL https://github.com/Tomperez98/mono/releases/latest/download/install.sh \
+  | MONO_INSTALL_DIR="$HOME/.local" sh
+```
+
+Or pass an explicit option:
+
+```bash
+curl -fsSL https://github.com/Tomperez98/mono/releases/latest/download/install.sh \
+  | sh -s -- --prefix /usr/local
 ```
 
 Remove the binary with `rm ~/.local/bin/mono`, or `Remove-Item` on Windows — see
 [Uninstall](#uninstall).
-
-Each release also publishes a copy of both installers next to its documentation,
-with its tag and its `SHA256SUMS` digests already inside, so that copy resolves
-neither the version nor the checksums at run time:
-
-```bash
-curl -fsSL https://tomperez98.github.io/mono/install.sh | sh
-```
-
-The copy above is the one the release notes hand out. Both copies accept
-`--version`, or `MONO_VERSION` when the script arrives through a pipe, and fall
-back to the GitHub API only for releases they were not built for; the copy on the
-default branch always uses it.
 
 ### Prebuilt binaries
 

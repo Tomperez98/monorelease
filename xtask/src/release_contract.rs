@@ -159,5 +159,7 @@ mod tests {
         assert!(contents.contains("mono-v1.2.3-aarch64-apple-darwin.tar.gz"));
         assert!(contents.contains("mono-v1.2.3-x86_64-apple-darwin.tar.gz"));
         assert!(contents.contains("mono-v1.2.3-x86_64-pc-windows-msvc.zip"));
+        assert!(contents.lines().any(|line| line == "install.sh"));
+        assert!(contents.lines().any(|line| line == "install.ps1"));
     }
 }

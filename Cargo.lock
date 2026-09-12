@@ -1302,6 +1302,7 @@ dependencies = [
  "flate2",
  "mono",
  "serde_json",
+ "sha2",
  "tar",
  "zip",
 ]

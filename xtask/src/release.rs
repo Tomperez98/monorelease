@@ -5,8 +5,10 @@
 //! versioned documentation, verify its output, and restore the committed
 //! placeholders before returning.
 
+use std::collections::BTreeMap;
 use std::env;
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -14,6 +16,7 @@ use flate2::Compression;
 use flate2::write::GzEncoder;
 use mono::Version;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use tar::Builder;
 use zip::ZipWriter;
 use zip::write::SimpleFileOptions;
@@ -23,10 +26,10 @@ use crate::release_contract;
 use crate::release_model::{
     ArchiveKind, DocsIdentity, ManifestState, POWERSHELL_INSTALLER_FILE, PublicationAction,
     PublicationIntent, PublicationState, ReleaseContext, ReleaseTarget, SHELL_INSTALLER_FILE,
-    VersionContractInput, artifact_inventory, checksum_table, compose_release_notes,
-    installer_digests, powershell_installer, powershell_installer_version_marker,
-    publication_transition, release_context, release_plan, shell_installer,
-    shell_installer_version_marker, version_contract,
+    VersionContractInput, artifact_inventory, compose_release_notes, installer_digests,
+    powershell_installer, powershell_installer_version_marker, publication_transition,
+    release_context, release_plan, shell_installer, shell_installer_version_marker,
+    version_contract,
 };
 use crate::stamp;
 
@@ -311,35 +314,7 @@ pub(crate) fn version_check(
         ManifestState::Pinned,
     )
     .map_err(|error| Error::Invalid(error.to_string()))?;
-    verify_installers(site, &tag.name)?;
     println!("{CHECK_COMPONENT}: all release versions agree on {expected}");
-    Ok(())
-}
-
-/// Verify the installers published with the documentation serve this release.
-///
-/// A published installer that names another tag would pin its downloads to a
-/// release the reader did not ask for, so this runs before the Pages deploy.
-fn verify_installers(site: &Path, tag: &str) -> Result<(), Error> {
-    for (name, marker) in [
-        (SHELL_INSTALLER_FILE, shell_installer_version_marker(tag)),
-        (
-            POWERSHELL_INSTALLER_FILE,
-            powershell_installer_version_marker(tag),
-        ),
-    ] {
-        let path = site.join(name);
-        let text = fs::read_to_string(&path).map_err(|source| Error::Io {
-            path: path.clone(),
-            source,
-        })?;
-        if !text.contains(&marker) {
-            return Err(Error::Invalid(format!(
-                "{} does not name {tag}; it was not rendered for this release",
-                path.display()
-            )));
-        }
-    }
     Ok(())
 }
 
@@ -352,7 +327,7 @@ pub(crate) fn docs(root: &Path, version: Version, directory: &Path) -> Result<()
     let tag = release_tag(version);
     let build_result = build_site(root, version)
         .and_then(|()| write_docs_metadata(root, &tag, version))
-        .and_then(|()| write_installers(root, &tag, directory));
+        .and_then(|()| write_release_installers(root, &tag, directory));
     let restore_result = stamp::restore(root);
 
     match (build_result, restore_result) {
@@ -680,45 +655,83 @@ fn release_tag(version: Version) -> String {
     non_empty_env("RELEASE_TAG").unwrap_or_else(|| format!("v{version}"))
 }
 
-/// Publish the installers beside the documentation, pinned to this release.
+/// Render the release installers into the assembled release directory.
 ///
-/// The digests come from the release directory's `SHA256SUMS`, which the release
-/// contract has already written and verified, so the published installer names
-/// exactly the bytes that were uploaded. No release asset changes: the
-/// documentation site is the only thing this touches.
-fn write_installers(root: &Path, tag: &str, directory: &Path) -> Result<(), Error> {
-    let checksums_path = directory.join("SHA256SUMS");
-    let text = fs::read_to_string(&checksums_path).map_err(|source| Error::Io {
-        path: checksums_path,
+/// The binary digests are computed from the exact files in `directory` before
+/// the final release contract is written. The contract then hashes both the
+/// archives and these rendered scripts, so all published assets share one
+/// verified inventory.
+fn write_release_installers(root: &Path, tag: &str, directory: &Path) -> Result<(), Error> {
+    let digests = installer_digests(tag, &archive_checksum_table(tag, directory)?)?;
+
+    let shell_path = directory.join(SHELL_INSTALLER_FILE);
+    let shell_source = read_installer(root, SHELL_INSTALLER_FILE)?;
+    fs::write(&shell_path, shell_installer(&shell_source, tag, &digests)?).map_err(|source| {
+        Error::Io {
+            path: shell_path.clone(),
+            source,
+        }
+    })?;
+    set_executable(&shell_path)?;
+
+    let powershell_path = directory.join(POWERSHELL_INSTALLER_FILE);
+    let powershell_source = read_installer(root, POWERSHELL_INSTALLER_FILE)?;
+    fs::write(
+        &powershell_path,
+        powershell_installer(&powershell_source, tag, &digests)?,
+    )
+    .map_err(|source| Error::Io {
+        path: powershell_path,
         source,
     })?;
-    let digests = installer_digests(tag, &checksum_table(&text)?)?;
+    Ok(())
+}
 
-    let site = root.join("site");
-    let source = read_installer(root, SHELL_INSTALLER_FILE)?;
-    write_site_file(
-        &site,
-        SHELL_INSTALLER_FILE,
-        shell_installer(&source, tag, &digests)?,
-    )?;
+fn archive_checksum_table(tag: &str, directory: &Path) -> Result<BTreeMap<String, String>, Error> {
+    let mut table = BTreeMap::new();
+    for target in ReleaseTarget::all() {
+        let name = target.artifact_name(tag);
+        let path = directory.join(&name);
+        table.insert(name, sha256_file(&path)?);
+    }
+    Ok(table)
+}
 
-    let source = read_installer(root, POWERSHELL_INSTALLER_FILE)?;
-    write_site_file(
-        &site,
-        POWERSHELL_INSTALLER_FILE,
-        powershell_installer(&source, tag, &digests)?,
-    )?;
+fn sha256_file(path: &Path) -> Result<String, Error> {
+    let mut file = fs::File::open(path).map_err(|source| Error::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let mut digest = Sha256::new();
+    io::copy(&mut file, &mut digest).map_err(|source| Error::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+fn set_executable(path: &Path) -> Result<(), Error> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = fs::metadata(path)
+            .map_err(|source| Error::Io {
+                path: path.to_path_buf(),
+                source,
+            })?
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions).map_err(|source| Error::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    }
     Ok(())
 }
 
 fn read_installer(root: &Path, name: &str) -> Result<String, Error> {
     let path = root.join(name);
     fs::read_to_string(&path).map_err(|source| Error::Io { path, source })
-}
-
-fn write_site_file(site: &Path, name: &str, contents: String) -> Result<(), Error> {
-    let path = site.join(name);
-    fs::write(&path, contents).map_err(|source| Error::Io { path, source })
 }
 
 fn write_docs_metadata(root: &Path, tag: &str, version: Version) -> Result<(), Error> {
@@ -747,6 +760,31 @@ fn read_docs_metadata(site: &Path) -> Result<DocsIdentity, Error> {
         source,
     })?;
     parse_docs_metadata(&text, &path.display().to_string())
+}
+
+fn verify_release_installers(directory: &Path, tag: &str) -> Result<(), Error> {
+    let shell_path = directory.join(SHELL_INSTALLER_FILE);
+    let shell = fs::read_to_string(&shell_path).map_err(|source| Error::Io {
+        path: shell_path.clone(),
+        source,
+    })?;
+    if !shell.contains(&shell_installer_version_marker(tag)) {
+        return Err(Error::Invalid(format!(
+            "published {SHELL_INSTALLER_FILE} does not name {tag}"
+        )));
+    }
+
+    let powershell_path = directory.join(POWERSHELL_INSTALLER_FILE);
+    let powershell = fs::read_to_string(&powershell_path).map_err(|source| Error::Io {
+        path: powershell_path.clone(),
+        source,
+    })?;
+    if !powershell.contains(&powershell_installer_version_marker(tag)) {
+        return Err(Error::Invalid(format!(
+            "published {POWERSHELL_INSTALLER_FILE} does not name {tag}"
+        )));
+    }
+    Ok(())
 }
 
 fn parse_docs_metadata(text: &str, label: &str) -> Result<DocsIdentity, Error> {
@@ -844,8 +882,9 @@ pub(crate) fn validate_published(root: &Path) -> Result<(), Error> {
                 workflow_run: None,
             },
         )?;
-        for target in ReleaseTarget::all() {
-            let artifact = directory.join(target.artifact_name(&tag));
+        verify_release_installers(&directory, &tag)?;
+        for name in artifact_inventory(&tag)? {
+            let artifact = directory.join(name);
             run_gh([
                 "attestation",
                 "verify",
@@ -1028,16 +1067,6 @@ fn verify_published_docs(context: &ReleaseContext, repository: &str) -> Result<(
     }
     let text = http_output(&format!("{base}/{DOCS_METADATA_FILE}"))?;
     let docs = parse_docs_metadata(&text, "published docs metadata")?;
-    // The deployed installer is the artifact users pipe into a shell, so a
-    // stale Pages deploy has to fail validation rather than serve anonymously.
-    let installer = http_output(&format!("{base}/{SHELL_INSTALLER_FILE}"))?;
-    let marker = shell_installer_version_marker(&context.tag);
-    if !installer.contains(&marker) {
-        return Err(Error::Invalid(format!(
-            "published {SHELL_INSTALLER_FILE} does not name {}",
-            context.tag
-        )));
-    }
     let notes = format!("# {}\n", context.version);
     let cargo_lock = "[[package]]\nname = \"mono\"\nversion = \"0.0.0\"\n";
     version_contract(
@@ -1417,8 +1446,6 @@ mod tests {
     #[test]
     fn published_installers_bake_in_the_release_contract() {
         let temp = TempDir::new();
-        let site = temp.path().join("site");
-        fs::create_dir_all(&site).unwrap();
         let dist = temp.path().join("dist");
         fs::create_dir_all(&dist).unwrap();
         fs::write(
@@ -1433,46 +1460,50 @@ mod tests {
         .unwrap();
 
         let tag = "v0.1.5";
-        let checksums = ReleaseTarget::all()
-            .iter()
-            .enumerate()
-            .map(|(index, target)| format!("{:064x}  {}\n", index + 1, target.artifact_name(tag)))
-            .collect::<String>();
-        fs::write(dist.join("SHA256SUMS"), checksums).unwrap();
+        for target in ReleaseTarget::all() {
+            fs::write(dist.join(target.artifact_name(tag)), target.rust_target).unwrap();
+        }
 
-        write_installers(temp.path(), tag, &dist).unwrap();
+        write_release_installers(temp.path(), tag, &dist).unwrap();
+        release_contract::run_with_identity(
+            &dist,
+            false,
+            mono::ReleaseIdentity {
+                release_tag: Some(tag.to_owned()),
+                ..mono::ReleaseIdentity::default()
+            },
+        )
+        .unwrap();
 
-        let shell = fs::read_to_string(site.join(SHELL_INSTALLER_FILE)).unwrap();
+        let shell = fs::read_to_string(dist.join(SHELL_INSTALLER_FILE)).unwrap();
         assert!(
             shell.contains(&shell_installer_version_marker(tag)),
             "{shell}"
         );
-        assert!(
-            shell.contains(&format!("x86_64-unknown-linux-gnu={:064x}", 1)),
-            "{shell}"
-        );
-        verify_installers(&site, tag).unwrap();
+        assert!(shell.contains("x86_64-unknown-linux-gnu="), "{shell}");
+        assert!(dist.join(SHELL_INSTALLER_FILE).metadata().unwrap().len() > 0);
 
-        let powershell = fs::read_to_string(site.join(POWERSHELL_INSTALLER_FILE)).unwrap();
+        let powershell = fs::read_to_string(dist.join(POWERSHELL_INSTALLER_FILE)).unwrap();
         assert!(
             powershell.contains(&powershell_installer_version_marker(tag)),
             "{powershell}"
         );
-        verify_installers(&site, "v0.1.6").expect_err("another tag is rejected");
+        verify_release_installers(&dist, tag).unwrap();
+        verify_release_installers(&dist, "v0.1.6").expect_err("another tag is rejected");
     }
 
     #[test]
-    fn publishing_installers_requires_the_verified_release_contract() {
+    fn publishing_installers_requires_the_release_archives() {
         let temp = TempDir::new();
-        fs::create_dir_all(temp.path().join("site")).unwrap();
+        fs::create_dir_all(temp.path().join("dist")).unwrap();
         fs::write(
             temp.path().join(SHELL_INSTALLER_FILE),
             "#!/bin/sh\nset -eu\n",
         )
         .unwrap();
 
-        let error = write_installers(temp.path(), "v0.1.5", &temp.path().join("absent"))
-            .expect_err("an absent release directory fails");
+        let error = write_release_installers(temp.path(), "v0.1.5", &temp.path().join("dist"))
+            .expect_err("missing release archives fail");
         assert!(error.to_string().contains("failed to access"), "{error}");
     }
 

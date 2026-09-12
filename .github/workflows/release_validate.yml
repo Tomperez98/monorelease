@@ -123,3 +123,67 @@ jobs:
           RELEASE_TAG: ${{ steps.release.outputs.tag }}
           GH_TOKEN: ${{ github.token }}
         run: cargo run --locked --quiet -p xtask -- release-validate-platform --target "${{ matrix.target }}"
+
+  validate_installer:
+    name: Execute ${{ matrix.installer }} installer on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            installer: shell
+          - os: macos-latest
+            installer: shell
+          - os: macos-15-intel
+            installer: shell
+          - os: windows-latest
+            installer: powershell
+    steps:
+      - name: Find latest release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          if gh release view --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            tag="$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName)"
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo 'No published release exists yet.'
+          fi
+
+      - name: Execute published POSIX installer
+        if: steps.release.outputs.exists == 'true' && matrix.installer == 'shell'
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          set -euxo pipefail
+          installer_url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}/install.sh"
+          prefix="$RUNNER_TEMP/mono-install"
+          export MONO_INSTALL_DIR="$prefix"
+          curl -fsSL "$installer_url" | sh
+          reported="$($prefix/bin/mono --version)"
+          test "$reported" = "mono ${RELEASE_TAG#v}"
+
+      - name: Execute published PowerShell installer
+        if: steps.release.outputs.exists == 'true' && matrix.installer == 'powershell'
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $env:MONO_INSTALL_DIR = Join-Path $env:RUNNER_TEMP 'mono-install'
+          $installerUrl = "https://github.com/$env:GITHUB_REPOSITORY/releases/download/$env:RELEASE_TAG/install.ps1"
+          irm $installerUrl | iex
+          $installed = Join-Path $env:MONO_INSTALL_DIR 'bin\mono.exe'
+          $reported = (& $installed --version).Trim()
+          if ($reported -ne "mono $($env:RELEASE_TAG.Substring(1))") {
+            throw "unexpected installed version: $reported"
+          }

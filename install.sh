@@ -2,15 +2,15 @@
 #
 # Install the `mono` binary from a GitHub release.
 #
-#     curl -fsSL https://raw.githubusercontent.com/Tomperez98/mono/main/install.sh | sh
+#     curl -fsSL https://github.com/Tomperez98/mono/releases/latest/download/install.sh | sh
 #
 # Pass options after `sh -s --` when the script arrives on stdin:
 #
 #     curl -fsSL .../install.sh | sh -s -- --version v0.1.5
 #     curl -fsSL .../install.sh | sh -s -- --prefix /usr/local
 #
-# The download is checked against the release's published SHA256SUMS before it
-# is unpacked, and only the `mono` binary is copied out of the archive. Mono keeps
+# The release copy carries its version and archive digest. The download is
+# checked before it is unpacked, and only the `mono` binary is copied out. Mono keeps
 # no state of its own, so undoing this is `rm` on the installed path.
 
 set -eu
@@ -19,10 +19,9 @@ REPOSITORY="Tomperez98/mono"
 BINARY="mono"
 
 #region published defaults
-# `xtask release-docs` replaces this region in the copy published with a release,
-# pinning it to that release and carrying the digests from its SHA256SUMS. Empty
-# means no pinning: the script resolves the newest release and downloads the
-# checksums for it.
+# `xtask release-docs` replaces this region in the release asset, pinning it to
+# that release and carrying the digests for its archives. The checked-in source
+# remains unpinned and requires --version or MONO_VERSION.
 default_version=""
 default_checksums=""
 #endregion
@@ -44,13 +43,13 @@ Usage: install.sh [options]
 
 Options:
   --version <VERSION>  Install a specific release, for example v0.1.5 or 0.1.5.
-                       Default: the release this script was published with when
-                       it carries one, otherwise the newest published release.
-  --prefix <DIR>       Install to <DIR>/bin. Default: $HOME/.local.
+                       Default: the release this script was published with.
+  --prefix <DIR>       Install to <DIR>/bin.
   -h, --help           Print this help.
 
 Environment:
-  MONO_VERSION         Same as --version; the way to pass one through a pipe.
+  MONO_VERSION         Same as --version; useful when piping the script.
+  MONO_INSTALL_DIR     Install directory, overridden by --prefix.
 
 The script needs curl and one of sha256sum, shasum, or openssl.
 EOF
@@ -81,14 +80,6 @@ detect_target() {
       die "no prebuilt mono for $os; see https://github.com/${REPOSITORY}/releases"
       ;;
   esac
-}
-
-# Read the newest published tag from the GitHub API without requiring jq.
-latest_release_tag() {
-  curl -fsSL --proto '=https' --tlsv1.2 \
-    "https://api.github.com/repos/${REPOSITORY}/releases/latest" \
-    | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
-    | head -n 1
 }
 
 # Accept both `0.1.5` and `v0.1.5`; the release tag carries the prefix.
@@ -159,7 +150,10 @@ while [ $# -gt 0 ]; do
 done
 
 if [ -z "$prefix" ]; then
-  [ -n "${HOME:-}" ] || die "HOME is not set; pass --prefix"
+  prefix="${MONO_INSTALL_DIR:-}"
+fi
+if [ -z "$prefix" ]; then
+  [ -n "${HOME:-}" ] || die "HOME is not set; pass --prefix or MONO_INSTALL_DIR"
   prefix="${HOME}/.local"
 fi
 command -v curl >/dev/null 2>&1 || die "curl is required"
@@ -173,9 +167,7 @@ if [ -z "$version" ]; then
   version="$default_version"
 fi
 if [ -z "$version" ]; then
-  version="$(latest_release_tag)"
-  [ -n "$version" ] ||
-    die "could not read the latest release tag from the GitHub API; pass --version"
+  die "this installer is not pinned; use a release asset or pass --version"
 fi
 tag="$(normalize_tag "$version")"
 
