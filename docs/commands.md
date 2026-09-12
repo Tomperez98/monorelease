@@ -14,7 +14,9 @@ Run `mono --help` or `mono help <command>` for the complete option list. Every s
 | `mono plan [PIPELINE]` | Print the dependency-first execution plan without running anything. |
 | `mono graph [PIPELINE]` | Print task dependency edges. |
 | `mono cache clean` | Delete local cache entries. |
-| `mono changelog ...` | Apply Mono's documented changelog conventions. |
+| `mono changelog check` | Validate a changelog file against Mono's release conventions. |
+| `mono changelog prepare [VERSION]` | Infer or create the next editable changelog entry. |
+| `mono changelog release-notes [VERSION]` | Extract release notes from the newest entry. |
 | `mono release ...` | Create or verify provider-neutral release metadata. |
 
 ## Exit codes
@@ -39,11 +41,15 @@ A task that exits non-zero makes `mono` exit `1`, not `3`. Exit `3` means the co
 | `--no-cache` | Skip cache reads and writes. Conflicts with `--force`. |
 | `--force` | Ignore cache hits and refresh successful entries. Conflicts with `--no-cache`. |
 | `--output text\|json` | Select the human or machine output contract. |
-| `--ui auto\|tui\|stream` | Select the human execution presentation; bare `mono` accepts it too. |
+| `--ui auto\|tui\|stream` | Select the human execution presentation for `run` and `task`; bare `mono` accepts it before the command. |
 
 Bare `mono` runs the default pipeline but accepts the global flags only. Use `mono plan` to preview it, or `mono run` to run it with the execution flags.
 
 `--ui auto` uses the interactive task UI on a terminal and task-prefixed streaming output in pipes and CI. `--ui tui` currently resolves the same way, so the full-screen view is used only when a terminal is attached. Use `--ui stream` for predictable task-prefixed lines anywhere.
+
+`mono changelog prepare` creates the next patch entry by default. Pass `unreleased` to explicitly skip a release cycle, or pass a version for a major/minor release. `--date` makes the entry date deterministic. `--from REF --to REF` adds editable bullets from first-parent merge commits without fetching or switching branches. Add `--pull-request-url 'https://github.com/org/repo/pull/{number}'` (or set `CHANGELOG_PR_URL`) to turn recognized merge commits into links.
+
+`mono changelog release-notes` uses the newest entry by default. In CI, `RELEASE_TAG` is accepted as the version and must match that entry. The old `scaffold`, `validate`, and `notes` spellings remain aliases.
 
 `mono release manifest` and `mono release verify` write and read a release directory: `--dist <PATH>` (default `dist`, below the root).
 

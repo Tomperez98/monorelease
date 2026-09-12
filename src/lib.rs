@@ -36,7 +36,9 @@ pub use changelog::{
 };
 pub use commands::changelog::{
     ChangelogError, DEFAULT_NOTES_PATH as DEFAULT_RELEASE_NOTES_PATH,
-    DEFAULT_PATH as DEFAULT_CHANGELOG_PATH, notes as changelog_notes,
+    DEFAULT_PATH as DEFAULT_CHANGELOG_PATH, ReleaseNotesTarget, notes as changelog_notes,
+    prepare as changelog_prepare, prepare_from_git as changelog_prepare_from_git,
+    prepare_on as changelog_prepare_on, release_notes as changelog_release_notes,
     scaffold as changelog_scaffold, scaffold_on as changelog_scaffold_on,
     validate as changelog_validate,
 };

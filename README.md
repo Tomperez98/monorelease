@@ -176,7 +176,9 @@ There are no package manifests, member globs, standalone mode, package selection
 | `mono plan [PIPELINE]` | Print the dependency-first execution plan without running anything. |
 | `mono graph [PIPELINE]` | Print task dependency edges. |
 | `mono cache clean` | Delete local cache entries. |
-| `mono changelog ...` | Apply Mono's documented changelog conventions. |
+| `mono changelog check` | Validate a changelog against Mono's release conventions. |
+| `mono changelog prepare [VERSION]` | Infer or create an editable release entry. |
+| `mono changelog release-notes [VERSION]` | Extract notes from the newest entry. |
 | `mono release ...` | Create or verify provider-neutral release metadata. |
 
 Run `mono --help` or `mono help <command>` for the complete option list.
@@ -194,7 +196,7 @@ Independent tasks run concurrently up to `--jobs` (the default is the number of 
 | `--no-cache` | Skip cache reads and writes. Conflicts with `--force`. |
 | `--force` | Ignore cache hits and refresh successful entries. Conflicts with `--no-cache`. |
 | `--output text\|json` | Select the human or machine output contract. |
-| `--ui auto\|tui\|stream` | Select the human execution presentation; bare `mono` accepts it too. |
+| `--ui auto\|tui\|stream` | Select the human execution presentation for `run` and `task`; bare `mono` accepts it before the command. |
 
 `mono` with no command runs the default pipeline but accepts the global flags only. Use `mono plan` to preview it, or `mono run` to run it with the execution flags.
 
@@ -213,14 +215,29 @@ Mono uses the same provider-neutral release pattern for every project that adopt
 - `CHANGELOG.md` is Markdown.
 - The newest heading is `## (unreleased)` or `## X.Y.Z`.
 - Version entries contain `Released: YYYY-MM-DD`.
-- Release tags are `vX.Y.Z` and must resolve to the checked-out source commit.
+- The newest versioned changelog entry is the release being prepared.
+- Release tags are `vX.Y.Z` and must match the newest entry and resolve to the checked-out source commit.
 - The matching changelog entry becomes `RELEASE_NOTES.md`.
 - Release directories contain an explicit, verified artifact inventory and SHA-256 metadata.
 - Publishing remains an ordinary project task or CI step; Mono does not know registries or package managers.
 
 The repository's release files use pinned placeholders for reproducible source releases: the root package in `Cargo.toml`, the `mono` package in `Cargo.lock`, and the displayed Zensical site version are pinned at `0.0.0`. The release workflow stamps all three from the tag with the `xtask` release coordinator before building. The committed files never move. The coordinator also owns release preparation, versioned documentation, draft creation, artifact upload, retry behavior, and final publication.
 
-To create and push an annotated release tag—the tag push starts the GitHub release workflow:
+Prepare and review a release from the newest changelog entry:
+
+```console
+mono changelog prepare
+mono changelog check
+mono changelog release-notes
+```
+
+To explicitly skip a release cycle, prepare `unreleased`. To seed an entry
+with editable first-parent merge bullets, pass `--from REF --to REF`. Add
+`--pull-request-url 'https://github.com/org/repo/pull/{number}'` to link
+recognized PR merge commits; this is a read-only Git operation.
+
+Create and push an annotated release tag only after the changelog is approved;
+the tag push starts the GitHub release workflow:
 
 ```console
 cargo run -p xtask -- tag --tag v0.1.3

@@ -5,13 +5,51 @@ use std::fmt;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
-use crate::changelog::{Changelog, Request, today};
+use crate::changelog::{Changelog, Request, is_valid_date, today};
 
 /// Default changelog filename used by the CLI.
 pub const DEFAULT_PATH: &str = "CHANGELOG.md";
 /// Default release-notes filename used by the CLI.
 pub const DEFAULT_NOTES_PATH: &str = "RELEASE_NOTES.md";
+const GIT_LOG_BYTES_MAX: usize = 10 * 1024 * 1024;
+const GIT_ERROR_BYTES_MAX: usize = 64 * 1024;
+
+/// The release target supplied by the CLI or release environment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReleaseNotesTarget {
+    version: Option<Request>,
+    release_tag: Option<Request>,
+}
+
+impl ReleaseNotesTarget {
+    pub fn parse(version: Option<&str>, release_tag: Option<&str>) -> Result<Self, ChangelogError> {
+        let version = version
+            .map(Request::parse)
+            .transpose()
+            .map_err(ChangelogError::Invalid)?;
+        let release_tag = release_tag
+            .map(Request::parse)
+            .transpose()
+            .map_err(ChangelogError::Invalid)?;
+        if let (Some(version), Some(release_tag)) = (version, release_tag)
+            && version != release_tag
+        {
+            return Err(ChangelogError::Invalid(
+                "requested version does not match RELEASE_TAG".to_owned(),
+            ));
+        }
+        Ok(Self {
+            version,
+            release_tag,
+        })
+    }
+
+    fn requested(self) -> Option<Request> {
+        self.version.or(self.release_tag)
+    }
+}
 
 pub fn validate(path: &Path) -> Result<String, ChangelogError> {
     let changelog = load(path)?;
@@ -22,9 +60,53 @@ pub fn validate(path: &Path) -> Result<String, ChangelogError> {
     ))
 }
 
-/// Scaffold an entry dated today.
+/// Prepare a new top entry, inferring the next patch version when omitted.
+pub fn prepare(
+    path: &Path,
+    version: Option<&str>,
+    date: Option<&str>,
+) -> Result<String, ChangelogError> {
+    let date = date.map_or_else(today, str::to_owned);
+    prepare_on(path, version, &date)
+}
+
+/// Prepare an entry using a caller-supplied date.
+///
+/// Keeping the clock outside this function makes the workflow deterministic
+/// without requiring a fake clock or global state in tests.
+pub fn prepare_on(
+    path: &Path,
+    version: Option<&str>,
+    date: &str,
+) -> Result<String, ChangelogError> {
+    prepare_with_bullets(path, version, date, &[])
+}
+
+/// Prepare a new top entry from first-parent merge commits in an explicit ref range.
+///
+/// Git state is read only: this function never fetches, switches branches, or writes
+/// anything except the requested changelog file.
+pub fn prepare_from_git(
+    path: &Path,
+    version: Option<&str>,
+    date: Option<&str>,
+    from: &str,
+    to: &str,
+    pull_request_url: Option<&str>,
+) -> Result<String, ChangelogError> {
+    let date = date.map_or_else(today, str::to_owned);
+    let (changelog, request) = load_prepare_input(path, version, &date)?;
+    validate_ref(from)?;
+    validate_ref(to)?;
+    validate_pull_request_url(pull_request_url)?;
+    let log = git_merge_log(path, from, to)?;
+    let bullets = format_git_bullets(&log, pull_request_url);
+    write_prepared(path, changelog, request, &date, &bullets)
+}
+
+/// Scaffold an entry dated today. Kept as a compatibility wrapper for `prepare`.
 pub fn scaffold(path: &Path, version: &str) -> Result<String, ChangelogError> {
-    scaffold_on(path, version, &today())
+    prepare(path, Some(version), None)
 }
 
 /// Scaffold an entry with an explicit date.
@@ -32,20 +114,71 @@ pub fn scaffold(path: &Path, version: &str) -> Result<String, ChangelogError> {
 /// The clock is a parameter rather than a call, so the rendered changelog is
 /// deterministic and a test can assert the date.
 pub fn scaffold_on(path: &Path, version: &str, date: &str) -> Result<String, ChangelogError> {
-    let request = Request::parse(version).map_err(ChangelogError::Invalid)?;
+    prepare_on(path, Some(version), date)
+}
+
+fn prepare_with_bullets(
+    path: &Path,
+    version: Option<&str>,
+    date: &str,
+    bullets: &[String],
+) -> Result<String, ChangelogError> {
+    let (changelog, request) = load_prepare_input(path, version, date)?;
+    write_prepared(path, changelog, request, date, bullets)
+}
+
+fn load_prepare_input(
+    path: &Path,
+    version: Option<&str>,
+    date: &str,
+) -> Result<(Changelog, Request), ChangelogError> {
     let text = read(path)?;
-    let mut changelog = Changelog::parse(&text).map_err(|message| invalid(path, message))?;
-    let action = changelog
-        .scaffold(request, date, &[])
+    let changelog = Changelog::parse(&text).map_err(|message| invalid(path, message))?;
+    if !is_valid_date(date) {
+        return Err(invalid(
+            path,
+            format!("invalid release date `{date}`, expected `<yyyy-mm-dd>`"),
+        ));
+    }
+    let request = match version {
+        Some(version) => Request::parse(version).map_err(ChangelogError::Invalid)?,
+        None => Request::Version(
+            changelog
+                .next_version()
+                .map_err(|message| invalid(path, message))?,
+        ),
+    };
+    Ok((changelog, request))
+}
+
+fn write_prepared(
+    path: &Path,
+    mut changelog: Changelog,
+    request: Request,
+    date: &str,
+    bullets: &[String],
+) -> Result<String, ChangelogError> {
+    changelog
+        .scaffold(request, date, bullets)
         .map_err(|message| invalid(path, message))?;
     write(path, &changelog.render())?;
+    let prepared = request.heading();
+    let suffix = if bullets.is_empty() {
+        String::new()
+    } else {
+        format!(" ({} Git changes)", bullets.len())
+    };
     Ok(format!(
-        "scaffolded {} in {}",
-        action_name(&action),
-        path.display()
+        "prepared {prepared} in {}{}; edit the changelog sections",
+        path.display(),
+        suffix
     ))
 }
 
+/// Extract the requested entry without imposing the top-entry release contract.
+///
+/// This compatibility API remains useful for historical notes. Release workflows
+/// should use [`release_notes`] instead.
 pub fn notes(
     changelog_path: &Path,
     version: &str,
@@ -53,22 +186,57 @@ pub fn notes(
 ) -> Result<String, ChangelogError> {
     let request = Request::parse(version).map_err(ChangelogError::Invalid)?;
     let changelog = load(changelog_path)?;
+    let notes =
+        render_notes(&changelog, request).map_err(|message| invalid(changelog_path, message))?;
+    write(output_path, &notes)?;
+    Ok(format!("wrote {}", output_path.display()))
+}
+
+/// Extract release notes from the newest entry and enforce tag agreement.
+pub fn release_notes(
+    changelog_path: &Path,
+    target: ReleaseNotesTarget,
+    output_path: &Path,
+) -> Result<String, ChangelogError> {
+    let changelog = load(changelog_path)?;
+    let top = changelog.top().heading;
+    if top == crate::changelog::Heading::Unreleased {
+        return Err(invalid(
+            changelog_path,
+            "the newest entry is `(unreleased)`; promote it before releasing".to_owned(),
+        ));
+    }
+    let request = target.requested().unwrap_or_else(|| match top {
+        crate::changelog::Heading::Version(version) => Request::Version(version),
+        crate::changelog::Heading::Unreleased => unreachable!("checked above"),
+    });
+    if request.heading() != top {
+        return Err(invalid(
+            changelog_path,
+            format!(
+                "release version `{}` must match the newest changelog entry `{top}`",
+                request.heading()
+            ),
+        ));
+    }
+    let notes =
+        render_notes(&changelog, request).map_err(|message| invalid(changelog_path, message))?;
+    write(output_path, &notes)?;
+    Ok(format!("wrote {}", output_path.display()))
+}
+
+fn render_notes(changelog: &Changelog, request: Request) -> Result<String, String> {
     let heading = request.heading();
     let entry = changelog
         .entry(heading)
-        .ok_or_else(|| invalid(changelog_path, format!("entry `{heading}` was not found")))?;
+        .ok_or_else(|| format!("entry `{heading}` was not found"))?;
     let body = entry.body.trim();
     if body.is_empty() {
-        return Err(invalid(
-            changelog_path,
-            format!("entry `{heading}` is empty"),
-        ));
+        return Err(format!("entry `{heading}` is empty"));
     }
-    let heading_text = heading.heading();
-    let title = heading_text.trim_start_matches("## ");
-    let notes = format!("# {title}\n\n## Changelog\n\n{body}\n");
-    write(output_path, &notes)?;
-    Ok(format!("wrote {}", output_path.display()))
+    let title = heading.heading();
+    let title = title.trim_start_matches("## ");
+    Ok(format!("# {title}\n\n## Changelog\n\n{body}\n"))
 }
 
 fn load(path: &Path) -> Result<Changelog, ChangelogError> {
@@ -76,11 +244,116 @@ fn load(path: &Path) -> Result<Changelog, ChangelogError> {
     Changelog::parse(&text).map_err(|message| invalid(path, message))
 }
 
-fn action_name(action: &crate::changelog::Action) -> &'static str {
-    match action {
-        crate::changelog::Action::Inserted => "new entry",
-        crate::changelog::Action::Renamed { .. } => "entry",
+fn validate_ref(reference: &str) -> Result<(), ChangelogError> {
+    if reference.is_empty()
+        || reference.starts_with('-')
+        || reference.chars().any(char::is_whitespace)
+        || reference.contains('\0')
+    {
+        return Err(ChangelogError::Invalid(format!(
+            "invalid Git ref `{reference}`"
+        )));
     }
+    Ok(())
+}
+
+fn git_merge_log(path: &Path, from: &str, to: &str) -> Result<String, ChangelogError> {
+    let workdir = path.parent().unwrap_or_else(|| Path::new("."));
+    let range = format!("{from}..{to}");
+    let command = format!("git log --merges --first-parent {range}");
+    let output = Command::new("git")
+        .current_dir(workdir)
+        .args([
+            "log",
+            "--merges",
+            "--first-parent",
+            "--format=%s%x1f%b%x1e",
+            "--end-of-options",
+            &range,
+        ])
+        .output()
+        .map_err(|source| ChangelogError::Command {
+            command: command.clone(),
+            source,
+        })?;
+    if !output.status.success() {
+        return Err(ChangelogError::CommandFailed {
+            command,
+            status: output.status.code(),
+            stderr: bounded_text(&output.stderr, GIT_ERROR_BYTES_MAX),
+        });
+    }
+    if output.stdout.len() > GIT_LOG_BYTES_MAX {
+        return Err(ChangelogError::Invalid(format!(
+            "Git merge log exceeds the {} MiB safety limit",
+            GIT_LOG_BYTES_MAX / (1024 * 1024)
+        )));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+fn bounded_text(bytes: &[u8], limit: usize) -> String {
+    let truncated = bytes.len() > limit;
+    let mut text = String::from_utf8_lossy(&bytes[..bytes.len().min(limit)])
+        .trim()
+        .to_owned();
+    if truncated {
+        text.push('…');
+    }
+    text
+}
+
+fn validate_pull_request_url(template: Option<&str>) -> Result<(), ChangelogError> {
+    if let Some(template) = template
+        && !template.contains("{number}")
+    {
+        return Err(ChangelogError::Invalid(
+            "pull-request URL must contain the `{number}` placeholder".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn format_git_bullets(log: &str, pull_request_url: Option<&str>) -> Vec<String> {
+    log.split('\x1e')
+        .filter_map(|record| {
+            let record = record.trim();
+            if record.is_empty() {
+                return None;
+            }
+            let (subject, body) = record.split_once('\x1f').unwrap_or((record, ""));
+            let subject = subject.trim();
+            let pull_request = subject
+                .strip_prefix("Merge pull request #")
+                .and_then(|rest| rest.split_once(" from "))
+                .and_then(|(number, branch)| {
+                    number.parse::<u64>().ok().map(|number| (number, branch))
+                });
+            let summary = body
+                .lines()
+                .map(str::trim)
+                .find(|line| !line.is_empty())
+                .or_else(|| {
+                    pull_request.map(|(_, branch)| branch.rsplit('/').next().unwrap_or(branch))
+                })
+                .unwrap_or(subject);
+            let bullet = pull_request
+                .map(|(number, _)| {
+                    let reference = pull_request_url
+                        .map(|template| {
+                            format!(
+                                "[#{}]({})",
+                                number,
+                                template.replace("{number}", &number.to_string())
+                            )
+                        })
+                        .unwrap_or_else(|| format!("#{number}"));
+                    format!("- {reference}\n\n  {summary}")
+                })
+                .unwrap_or_else(|| format!("- {summary}"));
+            Some(bullet)
+        })
+        .collect()
 }
 
 fn invalid(path: &Path, message: String) -> ChangelogError {
@@ -108,8 +381,23 @@ fn write(path: &Path, contents: &str) -> Result<(), ChangelogError> {
 
 #[derive(Debug)]
 pub enum ChangelogError {
-    Read { path: PathBuf, source: io::Error },
-    Write { path: PathBuf, source: io::Error },
+    Read {
+        path: PathBuf,
+        source: io::Error,
+    },
+    Write {
+        path: PathBuf,
+        source: io::Error,
+    },
+    Command {
+        command: String,
+        source: io::Error,
+    },
+    CommandFailed {
+        command: String,
+        status: Option<i32>,
+        stderr: String,
+    },
     Invalid(String),
 }
 
@@ -122,6 +410,23 @@ impl fmt::Display for ChangelogError {
             Self::Write { path, source } => {
                 write!(formatter, "failed to write {}: {source}", path.display())
             }
+            Self::Command { command, source } => {
+                write!(formatter, "failed to run `{command}`: {source}")
+            }
+            Self::CommandFailed {
+                command,
+                status,
+                stderr,
+            } => {
+                write!(formatter, "`{command}` failed")?;
+                if let Some(status) = status {
+                    write!(formatter, " with exit status {status}")?;
+                }
+                if !stderr.is_empty() {
+                    write!(formatter, ": {stderr}")?;
+                }
+                Ok(())
+            }
             Self::Invalid(message) => formatter.write_str(message),
         }
     }
@@ -130,8 +435,10 @@ impl fmt::Display for ChangelogError {
 impl StdError for ChangelogError {
     fn source(&self) -> Option<&(dyn StdError + 'static)> {
         match self {
-            Self::Read { source, .. } | Self::Write { source, .. } => Some(source),
-            Self::Invalid(_) => None,
+            Self::Read { source, .. }
+            | Self::Write { source, .. }
+            | Self::Command { source, .. } => Some(source),
+            Self::CommandFailed { .. } | Self::Invalid(_) => None,
         }
     }
 }
@@ -167,6 +474,179 @@ mod tests {
         let output = fs::read_to_string(notes_path).unwrap();
         assert!(output.contains("# 1.0.0"));
         assert!(output.contains("- Shipped."));
+    }
+
+    #[test]
+    fn prepare_infers_the_next_patch_version_and_uses_the_supplied_date() {
+        let temp = TempDir::new();
+        let path = temp.path().join(DEFAULT_PATH);
+        fs::write(&path, "# Changelog\n\n## 1.0.0\nReleased: 2026-01-01\n").unwrap();
+
+        let message = prepare(&path, None, Some("2001-02-03")).unwrap();
+        let rendered = fs::read_to_string(path).unwrap();
+
+        assert!(message.contains("prepared ## 1.0.1"), "{message}");
+        assert!(rendered.contains("## 1.0.1\n"), "{rendered}");
+        assert!(rendered.contains("Released: 2001-02-03\n"), "{rendered}");
+    }
+
+    #[test]
+    fn prepare_on_is_deterministic_without_a_clock() {
+        let temp = TempDir::new();
+        let path = temp.path().join(DEFAULT_PATH);
+        fs::write(&path, "# Changelog\n\n## 1.0.0\nReleased: 2026-01-01\n").unwrap();
+
+        prepare_on(&path, None, "2001-02-03").unwrap();
+
+        assert!(
+            fs::read_to_string(path)
+                .unwrap()
+                .contains("Released: 2001-02-03\n")
+        );
+    }
+
+    #[test]
+    fn prepare_rejects_an_invalid_date_without_writing() {
+        let temp = TempDir::new();
+        let path = temp.path().join(DEFAULT_PATH);
+        let original = "# Changelog\n\n## 1.0.0\nReleased: 2026-01-01\n";
+        fs::write(&path, original).unwrap();
+
+        let error = prepare(&path, None, Some("2026-02-30")).unwrap_err();
+
+        assert!(error.to_string().contains("invalid release date"));
+        assert_eq!(fs::read_to_string(path).unwrap(), original);
+    }
+
+    #[test]
+    fn prepare_can_start_an_unreleased_entry() {
+        let temp = TempDir::new();
+        let path = temp.path().join(DEFAULT_PATH);
+        fs::write(&path, "# Changelog\n\n## 1.0.0\nReleased: 2026-01-01\n").unwrap();
+
+        prepare(&path, Some("unreleased"), Some("2001-02-03")).unwrap();
+
+        let rendered = fs::read_to_string(path).unwrap();
+        assert!(rendered.starts_with("# Changelog\n\n## (unreleased)\n"));
+        assert!(rendered.contains("Released: 2001-02-03\n"));
+    }
+
+    #[test]
+    fn render_notes_is_pure_and_preserves_the_entry_body() {
+        let changelog =
+            Changelog::parse("# Changelog\n\n## 1.0.0\nReleased: 2026-09-11\n\n- Shipped.\n")
+                .unwrap();
+
+        let notes = render_notes(&changelog, Request::parse("1.0.0").unwrap()).unwrap();
+
+        assert_eq!(
+            notes,
+            "# 1.0.0\n\n## Changelog\n\nReleased: 2026-09-11\n\n- Shipped.\n"
+        );
+    }
+
+    #[test]
+    fn release_notes_target_rejects_disagreeing_inputs() {
+        let error = ReleaseNotesTarget::parse(Some("1.0.0"), Some("v1.0.1")).unwrap_err();
+
+        assert!(error.to_string().contains("does not match RELEASE_TAG"));
+    }
+
+    #[test]
+    fn release_notes_require_the_newest_entry() {
+        let temp = TempDir::new();
+        let changelog = temp.path().join(DEFAULT_PATH);
+        let notes_path = temp.path().join(DEFAULT_NOTES_PATH);
+        fs::write(
+            &changelog,
+            "# Changelog\n\n## 1.1.0\nReleased: 2026-09-12\n\n- New.\n\n## 1.0.0\nReleased: 2026-09-11\n\n- Old.\n",
+        )
+        .unwrap();
+
+        let target = ReleaseNotesTarget::parse(Some("1.0.0"), None).unwrap();
+        let error = release_notes(&changelog, target, &notes_path).unwrap_err();
+
+        assert!(error.to_string().contains("must match the newest"));
+        assert!(!notes_path.exists());
+    }
+
+    #[test]
+    fn release_notes_default_to_the_newest_entry() {
+        let temp = TempDir::new();
+        let changelog = temp.path().join(DEFAULT_PATH);
+        let notes_path = temp.path().join(DEFAULT_NOTES_PATH);
+        fs::write(
+            &changelog,
+            "# Changelog\n\n## 1.1.0\nReleased: 2026-09-12\n\n- New.\n\n## 1.0.0\nReleased: 2026-09-11\n\n- Old.\n",
+        )
+        .unwrap();
+
+        let target = ReleaseNotesTarget::parse(None, None).unwrap();
+        release_notes(&changelog, target, &notes_path).unwrap();
+
+        assert!(fs::read_to_string(notes_path).unwrap().contains("- New."));
+    }
+
+    #[test]
+    fn git_merge_subjects_become_editable_bullets() {
+        let log = "Merge pull request #42 from team/feature\x1f\nAdd the feature\x1eMerge branch fix\x1f\nFix the bug\x1e";
+
+        assert_eq!(
+            format_git_bullets(log, None),
+            vec![
+                "- #42\n\n  Add the feature".to_owned(),
+                "- Fix the bug".to_owned(),
+            ]
+        );
+        assert_eq!(
+            format_git_bullets(
+                log,
+                Some("https://github.com/example/project/pull/{number}")
+            ),
+            vec![
+                "- [#42](https://github.com/example/project/pull/42)\n\n  Add the feature"
+                    .to_owned(),
+                "- Fix the bug".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn bounded_git_errors_are_limited_and_marked() {
+        let text = bounded_text(b"abcdefghijklmnopqrstuvwxyz", 8);
+
+        assert_eq!(text, "abcdefgh…");
+    }
+
+    #[test]
+    fn prepare_validates_local_input_before_running_git() {
+        let temp = TempDir::new();
+        let path = temp.path().join(DEFAULT_PATH);
+        fs::write(&path, "not a changelog").unwrap();
+
+        let error = prepare_from_git(&path, None, None, "bad ref", "HEAD", None).unwrap_err();
+
+        assert!(error.to_string().contains("expected the file to start"));
+    }
+
+    #[test]
+    fn git_failure_leaves_the_changelog_untouched() {
+        let temp = TempDir::new();
+        let path = temp.path().join(DEFAULT_PATH);
+        let original = "# Changelog\n\n## 1.0.0\nReleased: 2026-01-01\n";
+        fs::write(&path, original).unwrap();
+
+        let error = prepare_from_git(&path, None, None, "HEAD", "HEAD", None).unwrap_err();
+
+        assert!(matches!(error, ChangelogError::CommandFailed { .. }));
+        assert_eq!(fs::read_to_string(path).unwrap(), original);
+    }
+
+    #[test]
+    fn pull_request_url_templates_require_the_number_placeholder() {
+        let error = validate_pull_request_url(Some("https://example.test/pull")).unwrap_err();
+
+        assert!(error.to_string().contains("{number}"));
     }
 
     #[test]

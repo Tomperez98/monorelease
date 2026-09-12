@@ -3,13 +3,13 @@ name = "mono"
 default_pipeline = "ci"
 
 [pipelines.ci]
-tasks = ["changelog-validate", "fmt", "check", "test", "clippy"]
+tasks = ["changelog-check", "fmt", "check", "test", "clippy"]
 
 [pipelines.release]
 tasks = ["release-verify"]
 
-[tasks.changelog-validate]
-command = ["cargo", "run", "--locked", "--quiet", "--", "changelog", "validate"]
+[tasks.changelog-check]
+command = ["cargo", "run", "--locked", "--quiet", "--", "changelog", "check"]
 timeout_seconds = 30
 
 [tasks.fmt]
@@ -36,11 +36,11 @@ depends_on = ["test"]
 timeout_seconds = 120
 
 [tasks.release-notes]
-command = ["cargo", "run", "--locked", "--quiet", "--", "changelog", "notes"]
+command = ["cargo", "run", "--locked", "--quiet", "--", "changelog", "release-notes"]
 timeout_seconds = 60
 
 [tasks.changelog]
-command = ["cargo", "run", "--locked", "--quiet", "--", "changelog", "scaffold"]
+command = ["cargo", "run", "--locked", "--quiet", "--", "changelog", "prepare"]
 timeout_seconds = 60
 
 [tasks.release-verify]

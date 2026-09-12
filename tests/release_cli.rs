@@ -1,10 +1,25 @@
 //! End-to-end checks for the provider-neutral changelog and release commands.
 
 use std::fs;
+use std::process::Command;
 
 mod support;
 
 use support::{TempDir, mono, mono_with_env};
+
+fn git(temp: &TempDir, args: &[&str]) {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(temp.path())
+        .output()
+        .expect("git is installed");
+    assert!(
+        output.status.success(),
+        "git {:?} failed: {}",
+        args,
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
 
 #[test]
 fn changelog_commands_validate_scaffold_and_render_notes() {
@@ -46,6 +61,118 @@ fn changelog_commands_validate_scaffold_and_render_notes() {
             .unwrap()
             .contains("## 1.1.0")
     );
+}
+
+#[test]
+fn clean_changelog_workflow_infers_versions_and_uses_the_top_entry() {
+    let temp = TempDir::new("clean-changelog");
+    fs::write(
+        temp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n## 1.0.0\nReleased: 2026-09-11\n\n- Shipped.\n",
+    )
+    .unwrap();
+
+    let prepare = mono(
+        &["changelog", "prepare", "--date", "2001-02-03"],
+        temp.path(),
+    );
+    assert!(prepare.status.success(), "prepare failed: {prepare:?}");
+    let changelog = fs::read_to_string(temp.path().join("CHANGELOG.md")).unwrap();
+    assert!(changelog.contains("## 1.0.1\n"));
+    assert!(changelog.contains("Released: 2001-02-03\n"));
+
+    let notes = mono(&["changelog", "release-notes"], temp.path());
+    assert!(notes.status.success(), "notes failed: {notes:?}");
+    assert!(
+        fs::read_to_string(temp.path().join("RELEASE_NOTES.md"))
+            .unwrap()
+            .contains("-\n")
+    );
+}
+
+#[test]
+fn prepare_can_seed_editable_bullets_from_a_git_ref_range() {
+    let temp = TempDir::new("changelog-git");
+    fs::write(
+        temp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n## 1.0.0\nReleased: 2026-09-11\n",
+    )
+    .unwrap();
+
+    git(&temp, &["init"]);
+    git(&temp, &["config", "user.email", "test@example.com"]);
+    git(&temp, &["config", "user.name", "Mono Test"]);
+    git(&temp, &["add", "CHANGELOG.md"]);
+    git(&temp, &["commit", "-m", "base"]);
+    git(&temp, &["branch", "-M", "main"]);
+    git(&temp, &["checkout", "-b", "feature"]);
+    fs::write(temp.path().join("feature.txt"), "feature").unwrap();
+    git(&temp, &["add", "feature.txt"]);
+    git(&temp, &["commit", "-m", "feature"]);
+    git(&temp, &["checkout", "main"]);
+    git(
+        &temp,
+        &[
+            "merge",
+            "--no-ff",
+            "feature",
+            "-m",
+            "Merge pull request #42 from test/feature\n\nAdd the feature",
+        ],
+    );
+
+    let prepare = mono(
+        &[
+            "changelog",
+            "prepare",
+            "--from",
+            "HEAD~1",
+            "--to",
+            "HEAD",
+            "--pull-request-url",
+            "https://github.com/example/project/pull/{number}",
+            "--date",
+            "2001-02-03",
+        ],
+        temp.path(),
+    );
+    assert!(prepare.status.success(), "prepare failed: {prepare:?}");
+    let changelog = fs::read_to_string(temp.path().join("CHANGELOG.md")).unwrap();
+    assert!(
+        changelog.contains("[#42](https://github.com/example/project/pull/42)"),
+        "{changelog}"
+    );
+    assert!(changelog.contains("Add the feature"), "{changelog}");
+}
+
+#[test]
+fn release_notes_reject_a_tag_that_is_not_the_newest_entry() {
+    let temp = TempDir::new("changelog-tag-mismatch");
+    fs::write(
+        temp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n## 1.1.0\nReleased: 2026-09-12\n\n- New.\n\n## 1.0.0\nReleased: 2026-09-11\n\n- Old.\n",
+    )
+    .unwrap();
+
+    let notes = mono_with_env(
+        &["changelog", "release-notes"],
+        temp.path(),
+        &[("RELEASE_TAG", "v1.0.0")],
+    );
+
+    assert_eq!(notes.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&notes.stderr).contains("newest changelog entry"));
+    assert!(!temp.path().join("RELEASE_NOTES.md").exists());
+}
+
+#[test]
+fn changelog_help_hides_execution_only_ui_flags() {
+    let temp = TempDir::new("changelog-help");
+    let help = mono(&["changelog", "--help"], temp.path());
+
+    assert!(help.status.success());
+    assert!(!String::from_utf8_lossy(&help.stdout).contains("--ui"));
+    assert!(String::from_utf8_lossy(&help.stdout).contains("release-notes"));
 }
 
 #[test]
