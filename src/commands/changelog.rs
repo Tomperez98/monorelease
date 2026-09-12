@@ -101,7 +101,13 @@ pub fn prepare_from_git(
     validate_pull_request_url(pull_request_url)?;
     let log = git_merge_log(path, from, to)?;
     let bullets = format_git_bullets(&log, pull_request_url);
-    write_prepared(path, changelog, request, &date, &bullets)
+    let mut message = write_prepared(path, changelog, request, &date, &bullets)?;
+    if bullets.is_empty() {
+        message.push_str(&format!(
+            "; warning: no first-parent merge commits found in {from}..{to}"
+        ));
+    }
+    Ok(message)
 }
 
 /// Scaffold an entry dated today. Kept as a compatibility wrapper for `prepare`.
@@ -169,7 +175,7 @@ fn write_prepared(
         format!(" ({} Git changes)", bullets.len())
     };
     Ok(format!(
-        "prepared {prepared} in {}{}; edit the changelog sections",
+        "prepared {prepared} in {}{}; edit the changelog content",
         path.display(),
         suffix
     ))
@@ -230,13 +236,22 @@ fn render_notes(changelog: &Changelog, request: Request) -> Result<String, Strin
     let entry = changelog
         .entry(heading)
         .ok_or_else(|| format!("entry `{heading}` was not found"))?;
-    let body = entry.body.trim();
-    if body.is_empty() {
-        return Err(format!("entry `{heading}` is empty"));
-    }
+    let body = substantive_body(entry).ok_or_else(|| {
+        format!("entry `{heading}` is empty or contains only its `Released:` line")
+    })?;
     let title = heading.heading();
     let title = title.trim_start_matches("## ");
     Ok(format!("# {title}\n\n## Changelog\n\n{body}\n"))
+}
+
+fn substantive_body(entry: &crate::changelog::Entry) -> Option<&str> {
+    let body = entry.body.trim();
+    let mut lines = body.lines();
+    let first = lines.next()?;
+    if first.starts_with("Released: ") && !lines.any(|line| !line.trim().is_empty()) {
+        return None;
+    }
+    Some(body)
 }
 
 fn load(path: &Path) -> Result<Changelog, ChangelogError> {

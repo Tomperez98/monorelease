@@ -82,11 +82,26 @@ fn clean_changelog_workflow_infers_versions_and_uses_the_top_entry() {
     assert!(changelog.contains("Released: 2001-02-03\n"));
 
     let notes = mono(&["changelog", "release-notes"], temp.path());
+    assert_eq!(notes.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&notes.stderr).contains("only its `Released:` line"));
+
+    let changelog = fs::read_to_string(temp.path().join("CHANGELOG.md")).unwrap();
+    fs::write(
+        temp.path().join("CHANGELOG.md"),
+        changelog.replacen(
+            "Released: 2001-02-03\n\n",
+            "Released: 2001-02-03\n\n- Shipped.\n\n",
+            1,
+        ),
+    )
+    .unwrap();
+
+    let notes = mono(&["changelog", "release-notes"], temp.path());
     assert!(notes.status.success(), "notes failed: {notes:?}");
     assert!(
         fs::read_to_string(temp.path().join("RELEASE_NOTES.md"))
             .unwrap()
-            .contains("-\n")
+            .contains("- Shipped.")
     );
 }
 
@@ -143,6 +158,45 @@ fn prepare_can_seed_editable_bullets_from_a_git_ref_range() {
         "{changelog}"
     );
     assert!(changelog.contains("Add the feature"), "{changelog}");
+}
+
+#[test]
+fn prepare_warns_when_a_git_range_has_no_merge_commits() {
+    let temp = TempDir::new("changelog-no-merges");
+    fs::write(
+        temp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n## 1.0.0\nReleased: 2026-09-11\n",
+    )
+    .unwrap();
+
+    git(&temp, &["init"]);
+    git(&temp, &["config", "user.email", "test@example.com"]);
+    git(&temp, &["config", "user.name", "Mono Test"]);
+    git(&temp, &["add", "CHANGELOG.md"]);
+    git(&temp, &["commit", "-m", "base"]);
+    fs::write(temp.path().join("change.txt"), "change").unwrap();
+    git(&temp, &["add", "change.txt"]);
+    git(&temp, &["commit", "-m", "change"]);
+
+    let prepare = mono(
+        &[
+            "changelog",
+            "prepare",
+            "--from",
+            "HEAD~1",
+            "--to",
+            "HEAD",
+            "--date",
+            "2001-02-03",
+        ],
+        temp.path(),
+    );
+
+    assert!(prepare.status.success(), "prepare failed: {prepare:?}");
+    assert!(String::from_utf8_lossy(&prepare.stdout).contains("no first-parent merge commits"));
+    let changelog = fs::read_to_string(temp.path().join("CHANGELOG.md")).unwrap();
+    assert!(!changelog.contains("### Features"));
+    assert!(!changelog.contains("\n-\n"));
 }
 
 #[test]

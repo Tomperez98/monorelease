@@ -2,21 +2,12 @@
 
 Notable changes per release, newest first.
 
-
 ## 0.1.5
 Released: 2026-09-12
 
-### Features
+- [#15](https://github.com/Tomperez98/mono/pull/15)
 
--
-
-### Fixes
-
--
-
-### Internals
-
--
+  Documentation
 
 ## 0.1.4
 Released: 2026-09-11
