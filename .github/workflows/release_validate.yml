@@ -6,10 +6,6 @@ on:
     workflows: [Release]
     types: [completed]
   schedule:
-    # Two cadences: the four-hourly run catches upstream drift in runners, hashing
-    # tools, and the release page, and is cheap because it only re-checks the
-    # published contract. The platform artifacts cannot change without a new
-    # release, so the four-OS matrix runs weekly behind `github.event.schedule`.
     - cron: '0 */6 * * *'
     - cron: '0 3 * * 0'
 
@@ -22,14 +18,18 @@ concurrency:
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
 
 jobs:
   validate:
-    name: Validate published artifacts
+    name: Validate published release
     if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 25
     steps:
+      # Selecting the release and checking out validation code are workflow
+      # plumbing. The validator clones the immutable release source itself.
       - name: Find latest release
         id: release
         env:
@@ -41,176 +41,91 @@ jobs:
             echo "tag=$tag" >> "$GITHUB_OUTPUT"
           else
             echo "exists=false" >> "$GITHUB_OUTPUT"
-            echo 'No release exists yet; validation is complete.'
+            echo 'No published release exists yet.'
           fi
 
-      # The released source, not `main`: the published binary is checked against
-      # the tag it claims to come from.
-      - name: Check out the released source
+      - name: Check out validation source
         if: steps.release.outputs.exists == 'true'
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
-        with:
-          ref: ${{ steps.release.outputs.tag }}
 
-      - name: Download release assets
-        if: steps.release.outputs.exists == 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          mkdir -p dist
-          gh release download "${{ steps.release.outputs.tag }}" \
-            --repo "$GITHUB_REPOSITORY" \
-            --pattern 'SHA256SUMS' \
-            --pattern 'mono-*' \
-            --dir dist \
-            --clobber
-          if gh release view "${{ steps.release.outputs.tag }}" \
-            --repo "$GITHUB_REPOSITORY" \
-            --json assets \
-            --jq 'any(.assets[]; .name == "BUILD-METADATA.json")' | grep -qx true; then
-            gh release download "${{ steps.release.outputs.tag }}" \
-              --repo "$GITHUB_REPOSITORY" \
-              --pattern 'BUILD-METADATA.json' \
-              --dir dist \
-              --clobber
-          else
-            echo 'No BUILD-METADATA.json asset; validating this legacy release without source metadata.'
-          fi
-
-      # Which gates can run depends on the metadata schema the release carries.
-      # A release cut before the schema existed still gets the checksum and
-      # version gates below. `release.yml` self-verifies what it writes, so a
-      # current release cannot silently degrade to the legacy path.
-      - name: Detect release metadata schema
-        id: metadata
-        if: steps.release.outputs.exists == 'true'
-        run: |
-          schema=none
-          if [[ -f dist/BUILD-METADATA.json ]]; then
-            version="$(jq -r '.manifest_version // empty' dist/BUILD-METADATA.json)" || {
-              echo "::error::dist/BUILD-METADATA.json is not valid JSON" >&2
-              exit 1
-            }
-            case "$version" in
-              1)
-                schema=current
-                ;;
-              '')
-                schema=legacy
-                echo "::warning::$RELEASE_TAG carries pre-schema release metadata; only the legacy checksum and version gates apply."
-                ;;
-              *)
-                echo "::error::BUILD-METADATA.json declares unsupported manifest_version $version" >&2
-                exit 1
-                ;;
-            esac
-          fi
-          echo "schema=$schema" >> "$GITHUB_OUTPUT"
-
-      # The extracted binary stays outside `dist` so the release contract's
-      # inventory remains equal to the published asset set.
-      - name: Extract the Linux artifact
-        if: steps.release.outputs.exists == 'true'
-        run: |
-          archive="$(find dist -maxdepth 1 -type f -name '*x86_64-unknown-linux-gnu.tar.gz' -print -quit)"
-          test -n "$archive"
-          mkdir -p extracted
-          tar -xzf "$archive" -C extracted
-
-      # `xtask` runs the release pipeline; the released binary orchestrates it.
       - name: Install Rust toolchain
-        if: ${{ steps.release.outputs.exists == 'true' && hashFiles('xtask/Cargo.toml') != '' }}
+        if: steps.release.outputs.exists == 'true'
         uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # pinned action
         with:
           toolchain: 1.88.0
           targets: x86_64-unknown-linux-gnu
 
       - name: Cache Cargo dependencies
-        if: ${{ steps.release.outputs.exists == 'true' && hashFiles('xtask/Cargo.toml') != '' }}
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        if: steps.release.outputs.exists == 'true'
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
+          key: release-validation
 
-      - name: Verify published artifact contract
-        if: ${{ steps.release.outputs.exists == 'true' && steps.metadata.outputs.schema == 'current' && hashFiles('xtask/Cargo.toml') != '' }}
+      - name: Validate release contract and published documentation
+        if: steps.release.outputs.exists == 'true'
         env:
           RELEASE_TAG: ${{ steps.release.outputs.tag }}
-        run: cargo run --locked --quiet -p xtask -- release-contract --directory dist --verify-only
+          GH_TOKEN: ${{ github.token }}
+        run: cargo run --locked --quiet -p xtask -- release-validate-published
 
-      # Rebuilds from pinned manifests must be stamped exactly as `release.yml`
-      # stamped them, or the `cmp` below would only be comparing version strings.
-      - name: Stamp pinned manifests with the release version
-        if: ${{ steps.release.outputs.exists == 'true' && hashFiles('xtask/Cargo.toml') != '' }}
-        env:
-          RELEASE_TAG: ${{ steps.release.outputs.tag }}
-        shell: bash
-        run: |
-          cargo run --locked --quiet -p xtask -- release-stamp --version "${RELEASE_TAG#v}"
-          zensical_version="$(sed -n 's/^site_name = "Mono v\([^\"]*\)"$/\1/p' zensical.toml)"
-          test "${RELEASE_TAG#v}" = "$zensical_version" || {
-            echo "Zensical version is $zensical_version, expected ${RELEASE_TAG#v}" >&2
-            exit 1
-          }
-
-      - name: Rebuild released Linux binary
-        if: ${{ steps.release.outputs.exists == 'true' && hashFiles('xtask/Cargo.toml') != '' }}
-        run: cargo build --locked --release --target x86_64-unknown-linux-gnu
-
-      - name: Compare released Linux binary
-        if: ${{ steps.release.outputs.exists == 'true' && hashFiles('xtask/Cargo.toml') != '' }}
-        shell: bash
-        run: |
-          cmp target/x86_64-unknown-linux-gnu/release/mono extracted/mono || {
-            echo 'the released Linux binary differs from a rebuild of its tagged source' >&2
-            sha256sum target/x86_64-unknown-linux-gnu/release/mono extracted/mono
-            exit 1
-          }
-
-      # Every published subject, not just the Linux archive: provenance is
-      # per-digest, so verifying one artifact says nothing about the other three.
-      - name: Verify artifact provenance
-        if: ${{ steps.release.outputs.exists == 'true' && steps.metadata.outputs.schema != 'none' }}
+  validate_platform:
+    name: Validate ${{ matrix.target }} artifact
+    if: ${{ (github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success') && (github.event_name != 'schedule' || github.event.schedule == '0 3 * * 0') }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    steps:
+      - name: Find latest release
+        id: release
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
-          shopt -s nullglob
-          artifacts=( dist/mono-* )
-          test "${#artifacts[@]}" -gt 0 || {
-            echo 'no release artifacts were downloaded' >&2
-            exit 1
-          }
-          for artifact in "${artifacts[@]}"; do
-            echo "verifying provenance of $artifact"
-            gh attestation verify "$artifact" --repo "$GITHUB_REPOSITORY"
-          done
+          if gh release view --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            tag="$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName)"
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo 'No published release exists yet.'
+          fi
 
-      - name: Run the release pipeline with the published binary
-        if: ${{ steps.release.outputs.exists == 'true' && hashFiles('xtask/Cargo.toml') != '' }}
+      - name: Check out validation source
+        if: steps.release.outputs.exists == 'true'
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Install Rust toolchain
+        if: steps.release.outputs.exists == 'true'
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # pinned action
+        with:
+          toolchain: 1.88.0
+
+      - name: Cache Cargo dependencies
+        if: steps.release.outputs.exists == 'true'
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: release-validation-${{ matrix.target }}
+
+      - name: Validate platform artifact
+        if: steps.release.outputs.exists == 'true'
         env:
           RELEASE_TAG: ${{ steps.release.outputs.tag }}
-          MONO_BIN: extracted/mono
-        run: '"$MONO_BIN" run release --output text --ui stream'
+          GH_TOKEN: ${{ github.token }}
+        run: cargo run --locked --quiet -p xtask -- release-validate-platform --target "${{ matrix.target }}"
 
-      # Releases that predate the metadata schema, and releases cut before the
-      # pipeline itself existed: the manifest says little, but the checksums and
-      # the version the binary reports still have to hold.
-      - name: Verify checksums and version
-        if: ${{ steps.release.outputs.exists == 'true' && (hashFiles('xtask/Cargo.toml') == '' || steps.metadata.outputs.schema == 'legacy') }}
-        run: |
-          ( cd dist && sha256sum -c SHA256SUMS )
-          ./extracted/mono --version
-
-  validate_platform:
-    name: Validate ${{ matrix.target }} artifact
-    # Scheduled runs only exercise the matrix on the weekly cadence; a release
-    # event always validates every platform.
-    if: ${{ (github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success') && (github.event_name != 'schedule' || github.event.schedule == '0 3 * * 0') }}
+  validate_installer:
+    name: Execute ${{ matrix.installer }} installer on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 10
     permissions:
@@ -220,17 +135,13 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            archive: tar.gz
+            installer: shell
           - os: macos-latest
-            target: aarch64-apple-darwin
-            archive: tar.gz
+            installer: shell
           - os: macos-15-intel
-            target: x86_64-apple-darwin
-            archive: tar.gz
+            installer: shell
           - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            archive: zip
+            installer: powershell
     steps:
       - name: Find latest release
         id: release
@@ -244,71 +155,35 @@ jobs:
             echo "tag=$tag" >> "$GITHUB_OUTPUT"
           else
             echo "exists=false" >> "$GITHUB_OUTPUT"
-            echo 'No release exists yet; platform validation is complete.'
+            echo 'No published release exists yet.'
           fi
 
-      - name: Download platform artifact
-        if: steps.release.outputs.exists == 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+      - name: Execute published POSIX installer
+        if: steps.release.outputs.exists == 'true' && matrix.installer == 'shell'
         shell: bash
-        run: |
-          mkdir -p dist
-          gh release download "$RELEASE_TAG" \
-            --repo "$GITHUB_REPOSITORY" \
-            --pattern "mono-${RELEASE_TAG}-${{ matrix.target }}.${{ matrix.archive }}" \
-            --dir dist \
-            --clobber
-
-      - name: Extract Unix artifact
-        if: ${{ steps.release.outputs.exists == 'true' && matrix.archive == 'tar.gz' }}
         env:
           RELEASE_TAG: ${{ steps.release.outputs.tag }}
-        shell: bash
         run: |
-          mkdir -p extracted
-          tar -xzf "dist/mono-${RELEASE_TAG}-${{ matrix.target }}.tar.gz" -C extracted
+          set -euxo pipefail
+          installer_url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}/install.sh"
+          prefix="$RUNNER_TEMP/mono-install"
+          export MONO_INSTALL_DIR="$prefix"
+          curl -fsSL "$installer_url" | sh
+          reported="$($prefix/bin/mono --version)"
+          test "$reported" = "mono ${RELEASE_TAG#v}"
 
-      - name: Extract Windows artifact
-        if: ${{ steps.release.outputs.exists == 'true' && matrix.archive == 'zip' }}
-        env:
-          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+      - name: Execute published PowerShell installer
+        if: steps.release.outputs.exists == 'true' && matrix.installer == 'powershell'
         shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force extracted | Out-Null
-          Expand-Archive `
-            -LiteralPath "dist/mono-$env:RELEASE_TAG-${{ matrix.target }}.zip" `
-            -DestinationPath extracted `
-            -Force
-
-      - name: Verify Unix platform artifact
-        if: ${{ steps.release.outputs.exists == 'true' && matrix.archive == 'tar.gz' }}
         env:
           RELEASE_TAG: ${{ steps.release.outputs.tag }}
-        shell: bash
         run: |
-          test -f extracted/LICENSE
-          test -f extracted/README.md
-          reported="$(./extracted/mono --version)"
-          expected="mono ${RELEASE_TAG#v}"
-          echo "$reported"
-          test "$reported" = "$expected" || {
-            echo "artifact reports '$reported', expected '$expected'" >&2
-            exit 1
-          }
-
-      - name: Verify Windows artifact
-        if: ${{ steps.release.outputs.exists == 'true' && matrix.archive == 'zip' }}
-        env:
-          RELEASE_TAG: ${{ steps.release.outputs.tag }}
-        shell: pwsh
-        run: |
-          if (-not (Test-Path extracted/LICENSE)) { throw 'missing extracted/LICENSE' }
-          if (-not (Test-Path extracted/README.md)) { throw 'missing extracted/README.md' }
-          $reported = (& extracted/mono.exe --version).Trim()
-          $expected = "mono " + $env:RELEASE_TAG.Substring(1)
-          Write-Host $reported
-          if ($reported -ne $expected) {
-            throw "artifact reports '$reported', expected '$expected'"
+          $ErrorActionPreference = 'Stop'
+          $env:MONO_INSTALL_DIR = Join-Path $env:RUNNER_TEMP 'mono-install'
+          $installerUrl = "https://github.com/$env:GITHUB_REPOSITORY/releases/download/$env:RELEASE_TAG/install.ps1"
+          irm $installerUrl | iex
+          $installed = Join-Path $env:MONO_INSTALL_DIR 'bin\mono.exe'
+          $reported = (& $installed --version).Trim()
+          if ($reported -ne "mono $($env:RELEASE_TAG.Substring(1))") {
+            throw "unexpected installed version: $reported"
           }

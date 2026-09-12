@@ -12,6 +12,10 @@ tasks = ["release-verify"]
 command = ["cargo", "run", "--locked", "--quiet", "--", "changelog", "check"]
 timeout_seconds = 30
 
+[tasks.release-contract-check]
+command = ["cargo", "run", "--locked", "--quiet", "-p", "xtask", "--", "release-check"]
+timeout_seconds = 30
+
 [tasks.fmt]
 command = ["cargo", "fmt", "--check"]
 timeout_seconds = 30

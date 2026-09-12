@@ -12,9 +12,13 @@ Mono's release commands use a provider-neutral release contract. Publishing rema
 - The matching changelog entry becomes `RELEASE_NOTES.md`.
 - Release directories contain an explicit, verified artifact inventory and SHA-256 metadata.
 
-Use the changelog workflow to prepare, check, and extract a release:
+Use the changelog workflow to prepare, check, and extract a release. Before tagging,
+run `cargo run -p xtask -- release-check` to verify that committed placeholders,
+backup state, and the canonical target table are clean:
 
 ```bash
+cargo run -p xtask -- release-check
+
 # Infer the next patch release and create an editable entry.
 mono changelog prepare
 
@@ -45,7 +49,7 @@ provides it.
 
 ## Repository releases
 
-The repository's release files use pinned placeholders: the root package in `Cargo.toml`, the `mono` package in `Cargo.lock`, and the displayed Zensical site version are pinned at `0.0.0`. The release workflow stamps all three from the tag with the `xtask` release coordinator before building. The committed files never move. `release-prepare` owns source validation, CI, release gates, notes, and Cargo packaging; `release-docs` builds and restores the versioned Zensical site; and `release-publish` owns draft creation, artifact upload, retry behavior, and final publication.
+The repository's release files use pinned placeholders: the root package in `Cargo.toml`, the `mono` package in `Cargo.lock`, and the displayed Zensical site version are pinned at `0.0.0`. The release coordinator stamps all three from the tag before building and restores them before returning. The committed files never move. `release-prepare` owns source validation, changelog/tag agreement, CI, release gates, notes, and packaging checks; `release-build --target` owns native artifact builds and archive creation; `release-docs` builds the versioned Zensical site and renders the tag-pinned installers into the release directory; `release-contract` verifies the four archives plus both installers; `release-version-check` verifies every local version source; and `release-validate-published` owns the post-publication contract, provenance, reproducibility, release-asset installer checks, and Pages checks. The installers carry the released archive digests and are published as first-class GitHub Release assets. Publication composes the release body from the checked changelog notes plus tag-scoped installer URLs, so the body never names a different version than the artifacts beside it.
 
 To create and push an annotated release tag after the newest changelog entry
 has been reviewed:
@@ -54,13 +58,26 @@ has been reviewed:
 cargo run -p xtask -- tag --tag v0.1.3
 ```
 
-The release tag and newest changelog entry must agree. The tag is also the only
-version input for the repository's pinned release manifests; do not edit
-`Cargo.toml` to prepare a release. To stamp a checkout manually:
+The release tag and newest changelog entry must agree. `xtask tag` refuses to
+create or push a tag whose version differs from the newest changelog entry. The
+tag is also the only version input for the repository's pinned release manifests;
+do not edit `Cargo.toml` to prepare a release. To stamp a checkout manually:
 
 ```console
 cargo run -p xtask -- release-stamp --version 0.1.5
 cargo run -p xtask -- release-stamp --restore
 ```
 
-`release-stamp` saves `.backup` copies while stamping. Mono does not publish to npm, Cargo, Maven, PyPI, Docker, or any other registry; those operations remain ordinary tasks or CI workflow steps.
+`release-stamp` saves `.backup` copies while stamping and refuses incomplete
+stamp states. Normal release builds should use the coordinator commands rather
+than invoking it directly. The canonical release assets are the four native archives and the two rendered
+installers listed by `xtask`; their names, checksums, metadata, and version identity
+are validated from one inventory. The documentation site contains release metadata
+and versioned docs, while GitHub Release assets are the canonical installer source.
+Scheduled validation runs the current validator from the default branch, clones the
+immutable release source, rebuilds the Linux artifact, verifies every platform
+artifact and attestation, checks both release installers, executes the published
+installer on supported runners, and checks the machine-readable marker deployed
+with the Pages site. Mono does not publish to npm, Cargo, Maven,
+PyPI, Docker, or any other registry; those operations remain ordinary tasks or
+CI workflow steps.

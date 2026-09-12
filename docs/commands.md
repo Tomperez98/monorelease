@@ -30,6 +30,11 @@ Run `mono --help` or `mono help <command>` for the complete option list. Every s
 
 A task that exits non-zero makes `mono` exit `1`, not `3`. Exit `3` means the command was never given a fair chance to run.
 
+There is no `mono uninstall`: Mono keeps no state of its own, so removing the
+binary is the whole uninstall. `rm ~/.local/bin/mono` for an `install.sh`
+installation, `cargo uninstall mono` for a `cargo install`, and `Remove-Item` on
+Windows; per-project caches are `mono cache clean`.
+
 ## Execution flags
 
 `run` and `task` support:

@@ -4,6 +4,32 @@ Install Mono, add a root `mono.toml`, validate the graph, and run your default p
 
 ## Install
 
+### Install script
+
+Linux and macOS:
+
+```bash
+curl -fsSL https://github.com/Tomperez98/mono/releases/latest/download/install.sh | sh
+```
+
+Windows (PowerShell):
+
+```powershell
+irm https://github.com/Tomperez98/mono/releases/latest/download/install.ps1 | iex
+```
+
+The release asset carries its version and archive digest, and installs to
+`~/.local/bin` without contacting the GitHub API. Install a specific release with
+its tag-scoped asset URL:
+
+```bash
+curl -fsSL https://github.com/Tomperez98/mono/releases/download/v0.1.5/install.sh | sh
+```
+
+Choose a directory with `--prefix /usr/local` or `MONO_INSTALL_DIR`. Remove the
+binary later with `rm ~/.local/bin/mono`, or `Remove-Item` on Windows: Mono keeps
+no state of its own, so removing the binary is the whole uninstall.
+
 ### Prebuilt binary
 
 Download the archive for your platform from the [GitHub releases page](https://github.com/Tomperez98/mono/releases), extract `mono`, and put it on your `PATH`.
