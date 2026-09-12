@@ -24,11 +24,13 @@ Run `mono --help` or `mono help <command>` for the complete option list. Every s
 | Code | Meaning |
 | --- | --- |
 | `0` | The command succeeded. |
-| `1` | The request was understood and failed: a red pipeline, an invalid manifest, a rejected changelog or release check. |
-| `2` | The command line was malformed. |
+| `1` | The request was understood and refused on its merits: a red pipeline, an invalid manifest, a version or date the project disagrees with, a rejected changelog or release check. |
+| `2` | The command line was malformed: an unknown flag, a missing value, or a value whose shape Mono can judge without reading the project (`--jobs 0`, `--date 2001-13-45`, a version that is neither `X.Y.Z` nor `unreleased`). |
 | `3` | Mono or its environment could not carry the command out: an unreadable manifest, a missing `git`, a result that could not be written. |
 
-A task that exits non-zero makes `mono` exit `1`, not `3`. Exit `3` means the command was never given a fair chance to run.
+A task that exits non-zero makes `mono` exit `1`, not `3`. Exit `3` means the command was never given a fair chance to run. A consumer that closes the pipe before a run finishes (`mono run ci | head -1`) is one of those cases: Mono can no longer deliver the output contract it was asked for, so it stops dispatching and exits `3`. A pipe closed after the run finished leaves the exit code alone — the work was done.
+
+`mono changelog` and `mono release` are path-based commands that never load a manifest, so `--dir` selects the directory their relative paths are resolved against rather than a project root to walk up to. From a nested directory, pass the root explicitly: `mono --dir ../.. changelog check`. Every other command walks upward from `--dir` to the nearest `mono.toml`.
 
 There is no `mono uninstall`: Mono keeps no state of its own, so removing the
 binary is the whole uninstall. `rm ~/.local/bin/mono` for an `install.sh`

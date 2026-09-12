@@ -209,6 +209,61 @@ fn json_success_documents_cover_non_execution_commands() {
     assert_eq!(clean_document["kind"], "cache_clean");
 }
 
+/// Values whose shape mono can judge on its own are refused while parsing, so
+/// they name the flag and exit `2`. A value only the project can judge exits
+/// `1` instead — `release_notes_reject_a_tag_that_is_not_the_newest_entry` pins
+/// that half of the split.
+#[test]
+fn malformed_flag_values_are_usage_errors() {
+    let temp = TempDir::new("usage-values");
+
+    for args in [
+        vec!["run", "--jobs", "0"],
+        vec!["run", "--jobs", "many"],
+        vec!["changelog", "prepare", "banana"],
+        vec!["changelog", "prepare", "--date", "2001-13-45"],
+        vec!["changelog", "prepare", "--date", "03/02/2001"],
+        vec![
+            "changelog",
+            "prepare",
+            "--pull-request-url",
+            "https://example.test/pull/",
+        ],
+        vec!["changelog", "release-notes", "--release-tag", "banana"],
+    ] {
+        let output = mono(&args, temp.path());
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "{args:?} must be a usage error: {}",
+            stderr(&output)
+        );
+    }
+}
+
+/// A run in JSON mode reports itself through events, so the transport has no
+/// summary left to print. A blank line where the summary would have gone would
+/// silently break a consumer parsing one document per line.
+#[test]
+fn a_json_run_emits_events_and_no_summary_line() {
+    let temp = TempDir::new("run-json");
+    write_project(
+        temp.path(),
+        "[pipelines.ci]\ntasks = [\"build\"]\n\n[tasks.build]\ncommand = [\"echo\", \"build\"]\n",
+    );
+
+    let output = mono(&["--output", "json", "run", "--no-cache"], temp.path());
+    assert!(output.status.success(), "{}", stderr(&output));
+
+    let events = stdout(&output)
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("one document per line"))
+        .collect::<Vec<_>>();
+    assert_eq!(events.first().unwrap()["event"], "run_started");
+    assert_eq!(events.last().unwrap()["event"], "run_finished");
+    assert!(stderr(&output).is_empty(), "{}", stderr(&output));
+}
+
 #[test]
 fn json_errors_are_documents_on_stdout() {
     let temp = TempDir::new("error-json");

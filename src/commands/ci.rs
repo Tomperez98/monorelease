@@ -53,6 +53,12 @@ impl Default for PipelineExecution {
     }
 }
 
+/// Run the selected pipeline against the project rooted at `path`.
+///
+/// Returns the human-readable summary the transport should print, or `None`
+/// when the run reported itself through the JSON event stream and has nothing
+/// left to print. `None` exists because the transport must be able to tell "no
+/// summary" apart from an empty one without parsing text.
 pub fn run_pipeline_with_mode(
     path: &Path,
     pipeline: Option<&str>,
@@ -60,7 +66,7 @@ pub fn run_pipeline_with_mode(
     dry_run: bool,
     jobs: usize,
     execution: PipelineExecution,
-) -> Result<String, CiError> {
+) -> Result<Option<String>, CiError> {
     if jobs == 0 {
         return Err(CiError::InvalidJobs);
     }
@@ -69,12 +75,13 @@ pub fn run_pipeline_with_mode(
     if dry_run {
         return if execution.output == OutputMode::Json {
             serde_json::to_string(&PlanDocument::from((&project, plan.as_slice())))
+                .map(Some)
                 .map_err(|source| CiError::Json { source })
         } else {
-            Ok(format_plan_document(&PlanDocument::from((
+            Ok(Some(format_plan_document(&PlanDocument::from((
                 &project,
                 plan.as_slice(),
-            ))))
+            )))))
         };
     }
 
@@ -82,9 +89,9 @@ pub fn run_pipeline_with_mode(
         PipelineServices::production(&project, execution.output, &execution.cancellation)?;
     let summary = execute_loaded_pipeline(&project, &plan, jobs, &execution, &services)?;
     if execution.output == OutputMode::Json {
-        Ok(String::new())
+        Ok(None)
     } else {
-        Ok(format_summary(&summary))
+        Ok(Some(format_summary(&summary)))
     }
 }
 
@@ -667,7 +674,8 @@ mod tests {
             1,
             PipelineExecution::default(),
         )
-        .unwrap();
+        .unwrap()
+        .expect("a terminal dry run reports its plan");
         assert!(output.find("base-build").unwrap() < output.find("app-build").unwrap());
         assert!(output.contains("would run app-build"));
     }

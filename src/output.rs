@@ -327,10 +327,9 @@ impl OutputSink {
         let mut writers = self.writers.lock().expect("output lock is not poisoned");
 
         // `run_pipeline_with_mode` returns the human-readable summary to the
-        // CLI transport, which writes it once to stdout. JSON must receive the
-        // lifecycle event here because the transport deliberately returns no
-        // second summary line in that mode. Avoid sending a second text
-        // summary to stderr/stdout from the scheduler.
+        // CLI transport, which writes it once to stdout; it returns `None` in
+        // JSON mode, where the lifecycle event below is the only summary. Avoid
+        // sending a second text summary to stderr/stdout from the scheduler.
         if self.mode == OutputMode::Json {
             self.render_event(
                 &mut writers,

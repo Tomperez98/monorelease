@@ -218,6 +218,34 @@ fn release_notes_reject_a_tag_that_is_not_the_newest_entry() {
     assert!(!temp.path().join("RELEASE_NOTES.md").exists());
 }
 
+/// `changelog` and `release` load no manifest, so `--dir` is the directory
+/// their relative paths are resolved against — unlike execution commands, which
+/// walk up to the project root. This pins the difference so a change to path
+/// resolution has to be deliberate.
+#[test]
+fn changelog_paths_are_rooted_at_the_selected_directory() {
+    let temp = TempDir::new("changelog-dir");
+    fs::create_dir_all(temp.path().join("services/api")).unwrap();
+    fs::write(
+        temp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n## 1.0.0\nReleased: 2026-09-11\n\n- Shipped.\n",
+    )
+    .unwrap();
+    let nested = temp.path().join("services/api");
+
+    let found = mono(&["--dir", "../..", "changelog", "check"], &nested);
+    assert!(
+        found.status.success(),
+        "{}",
+        String::from_utf8_lossy(&found.stderr)
+    );
+    assert!(String::from_utf8_lossy(&found.stdout).contains("CHANGELOG.md"));
+
+    let missing = mono(&["changelog", "check"], &nested);
+    assert_eq!(missing.status.code(), Some(3));
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("CHANGELOG.md"));
+}
+
 #[test]
 fn changelog_help_hides_execution_only_ui_flags() {
     let temp = TempDir::new("changelog-help");

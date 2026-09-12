@@ -307,8 +307,8 @@ Mono does not publish to npm, Cargo, Maven, PyPI, or Docker; those operations re
 | Code | Meaning |
 | --- | --- |
 | `0` | The command succeeded. |
-| `1` | The request was understood but the project, task, changelog, or release check failed. |
-| `2` | The command line was invalid. |
+| `1` | The request was understood and refused: a red pipeline, an invalid manifest, a rejected changelog or release check. |
+| `2` | The command line was malformed: an unknown flag, or a value with no valid shape (`--jobs 0`, `--date 2001-13-45`). |
 | `3` | Mono or its environment could not carry the command out. |
 
 ## Development

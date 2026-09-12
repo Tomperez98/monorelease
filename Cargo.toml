@@ -8,7 +8,7 @@ license = "Apache-2.0"
 repository = "https://github.com/Tomperez98/mono"
 
 [dependencies]
-clap = { version = "4.6.6", features = ["derive", "env"] }
+clap = { version = "4.6.6", features = ["derive"] }
 crossterm = "0.28"
 process-wrap = { version = "10.0.0", features = ["std"] }
 ctrlc = "3.4"
