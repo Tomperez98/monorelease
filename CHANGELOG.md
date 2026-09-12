@@ -2,7 +2,7 @@
 
 Notable changes per release, newest first.
 
-## (unreleased)
+## 0.1.5
 Released: 2026-09-12
 
 ### Features
