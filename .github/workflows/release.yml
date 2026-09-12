@@ -23,9 +23,6 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-  # The tag being released. On a push this is the tag; on a manual run it is the
-  # input, so a failed release can be resumed without touching the tag.
-  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
 
 jobs:
   validate:
@@ -44,11 +41,13 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
-          ref: ${{ env.RELEASE_TAG }}
+          ref: ${{ inputs.tag || github.ref_name }}
 
       - name: Capture release source identity
         id: source-identity
         shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
         run: |
           checkout_commit="$(git rev-parse HEAD)"
           tag_object=''
@@ -86,6 +85,8 @@ jobs:
       # files, runs CI and release gates, packages the crate, writes notes, and
       # restores the committed placeholders before returning.
       - name: Prepare the release
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
         run: cargo run --locked --quiet -p xtask -- release-prepare --tag "$RELEASE_TAG"
 
       - name: Upload release notes
@@ -121,7 +122,7 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
-          ref: ${{ env.RELEASE_TAG }}
+          ref: ${{ inputs.tag || github.ref_name }}
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # pinned action
@@ -137,7 +138,9 @@ jobs:
       # xtask owns stamping, building, identity checks, archive naming, and
       # packaging. The matrix only selects native runners and target triples.
       - name: Build and package release artifact
-        run: cargo run --locked --quiet -p xtask -- release-build --target "${{ matrix.target }}" --directory dist
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: cargo run --locked --quiet -p xtask -- release-build --tag "$RELEASE_TAG" --target "${{ matrix.target }}" --directory dist
 
       - name: Generate build provenance
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
@@ -166,6 +169,7 @@ jobs:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     env:
+      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
       RELEASE_COMMIT: ${{ needs.validate.outputs.source_commit }}
       RELEASE_TAG_OBJECT: ${{ needs.validate.outputs.tag_object }}
       # The run the CLI records as having produced the release.
@@ -176,7 +180,7 @@ jobs:
       - name: Check out the released source
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
-          ref: ${{ env.RELEASE_TAG }}
+          ref: ${{ inputs.tag || github.ref_name }}
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # pinned action
@@ -217,7 +221,12 @@ jobs:
           enable-cache: true
 
       - name: Build versioned documentation and release installers
-        run: cargo run --locked --quiet -p xtask -- release-docs --version "${RELEASE_TAG#v}" --directory dist
+        run: >-
+          cargo run --locked --quiet -p xtask -- release-docs
+          --tag "$RELEASE_TAG"
+          --repository "$GITHUB_REPOSITORY"
+          --workflow-run "$RELEASE_RUN_URL"
+          --directory dist
 
       # The repository-specific xtask owns the complete artifact inventory,
       # including the rendered installers, metadata, checksums, and identity.
@@ -227,7 +236,14 @@ jobs:
           RELEASE_COMMIT: ${{ needs.validate.outputs.source_commit }}
           RELEASE_TAG_OBJECT: ${{ needs.validate.outputs.tag_object }}
           RELEASE_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        run: cargo run --locked --quiet -p xtask -- release-contract --directory dist
+        run: >-
+          cargo run --locked --quiet -p xtask -- release-contract
+          --directory dist
+          --tag "$RELEASE_TAG"
+          --commit "$RELEASE_COMMIT"
+          --repository "$GITHUB_REPOSITORY"
+          --tag-object "$RELEASE_TAG_OBJECT"
+          --workflow-run "$RELEASE_RUN_URL"
 
       - name: Generate installer provenance
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
@@ -235,7 +251,11 @@ jobs:
           subject-path: dist/install.*
 
       - name: Verify release versions
-        run: cargo run --locked --quiet -p xtask -- release-version-check --site site --notes notes/RELEASE_NOTES.md
+        run: >-
+          cargo run --locked --quiet -p xtask -- release-version-check
+          --tag "$RELEASE_TAG"
+          --site site
+          --notes notes/RELEASE_NOTES.md
 
       - name: Configure GitHub Pages
         uses: actions/configure-pages@983d7736d9b0ae728b81ab479565c72886d7745b # v5
@@ -253,7 +273,12 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ env.RELEASE_TAG }}
           GITHUB_REPOSITORY: ${{ github.repository }}
-        run: cargo run --locked --quiet -p xtask -- release-publish --directory dist --notes notes/RELEASE_NOTES.md
+        run: >-
+          cargo run --locked --quiet -p xtask -- release-publish
+          --tag "$RELEASE_TAG"
+          --repository "$GITHUB_REPOSITORY"
+          --directory dist
+          --notes notes/RELEASE_NOTES.md
 
       - name: Deploy documentation to GitHub Pages
         id: deployment
@@ -266,7 +291,12 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ env.RELEASE_TAG }}
           GITHUB_REPOSITORY: ${{ github.repository }}
-        run: cargo run --locked --quiet -p xtask -- release-publish --notes notes/RELEASE_NOTES.md --finalize
+        run: >-
+          cargo run --locked --quiet -p xtask -- release-publish
+          --tag "$RELEASE_TAG"
+          --repository "$GITHUB_REPOSITORY"
+          --notes notes/RELEASE_NOTES.md
+          --finalize
 
   alert_failure:
     name: Alert on failure
@@ -276,5 +306,7 @@ jobs:
     permissions: {}
     steps:
       - name: Annotate the failed run
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
         run: |
           echo "::error::$RELEASE_TAG failed. See $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"

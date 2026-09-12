@@ -6,7 +6,6 @@
 //! the resulting decisions.
 
 use std::collections::BTreeMap;
-use std::env;
 use std::fmt;
 use std::fs;
 use std::path::Path;
@@ -15,7 +14,6 @@ use mono::{Changelog, Heading, Version};
 
 use crate::Error;
 
-pub const RELEASE_TAG_ENV: &str = "RELEASE_TAG";
 const PINNED_VERSION: &str = "0.0.0";
 const DOCS_METADATA_SCHEMA: u32 = 1;
 
@@ -135,22 +133,6 @@ pub fn release_context(
 }
 
 impl ReleaseContext {
-    pub fn from_environment(root: &Path) -> Result<Self, Error> {
-        let tag = required_env(RELEASE_TAG_ENV)?;
-        let source_commit = match non_empty_env("RELEASE_COMMIT") {
-            Some(commit) => commit,
-            None => git_output(root, &["rev-parse", "HEAD"])?,
-        };
-        let mut context = release_context(
-            &tag,
-            source_commit,
-            non_empty_env("GITHUB_REPOSITORY").as_deref(),
-            non_empty_env("RELEASE_RUN_URL").as_deref(),
-        )?;
-        context.tag_object = non_empty_env("RELEASE_TAG_OBJECT");
-        Ok(context)
-    }
-
     pub fn validate_changelog(&self, root: &Path) -> Result<(), Error> {
         let path = root.join("CHANGELOG.md");
         let text = fs::read_to_string(&path).map_err(|source| Error::Io {
@@ -617,39 +599,6 @@ fn lockfile_package_version(text: &str, package: &str) -> Option<String> {
         }
     }
     None
-}
-
-fn required_env(name: &str) -> Result<String, Error> {
-    non_empty_env(name).ok_or_else(|| Error::Invalid(format!("{name} is not set")))
-}
-
-fn non_empty_env(name: &str) -> Option<String> {
-    env::var(name).ok().filter(|value| !value.is_empty())
-}
-
-fn git_output(root: &Path, args: &[&str]) -> Result<String, Error> {
-    let output = std::process::Command::new("git")
-        .args(args)
-        .current_dir(root)
-        .output()
-        .map_err(|source| Error::Spawn {
-            program: format!("git {}", args.join(" ")),
-            source,
-        })?;
-    if output.status.success() {
-        return Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned());
-    }
-    Err(Error::Command(format!(
-        "`git {}` failed: {}",
-        args.join(" "),
-        String::from_utf8_lossy(&output.stderr).trim()
-    )))
-}
-
-impl fmt::Display for ArchiveKind {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.extension())
-    }
 }
 
 #[cfg(test)]

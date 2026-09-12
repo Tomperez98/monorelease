@@ -19,6 +19,9 @@ backup state, and the canonical target table are clean:
 ```bash
 cargo run -p xtask -- release-check
 
+# Run the complete pinned-state preflight before tagging.
+cargo run --locked --quiet -- run release-preflight --no-cache --ui stream
+
 # Infer the next patch release and create an editable entry.
 mono changelog prepare
 
@@ -49,13 +52,13 @@ provides it.
 
 ## Repository releases
 
-The repository's release files use pinned placeholders: the root package in `Cargo.toml`, the `mono` package in `Cargo.lock`, and the displayed Zensical site version are pinned at `0.0.0`. The release coordinator stamps all three from the tag before building and restores them before returning. The committed files never move. `release-prepare` owns source validation, changelog/tag agreement, CI, release gates, notes, and packaging checks; `release-build --target` owns native artifact builds and archive creation; `release-docs` builds the versioned Zensical site and renders the tag-pinned installers into the release directory; `release-contract` verifies the four archives plus both installers; `release-version-check` verifies every local version source; and `release-validate-published` owns the post-publication contract, provenance, reproducibility, release-asset installer checks, and Pages checks. The installers carry the released archive digests and are published as first-class GitHub Release assets. Publication composes the release body from the checked changelog notes plus tag-scoped installer URLs, so the body never names a different version than the artifacts beside it.
+The repository's release files use pinned placeholders: the root package in `Cargo.toml`, the `mono` package in `Cargo.lock`, and the displayed Zensical site version are pinned at `0.0.0`. The release coordinator stamps all three from the tag before building and restores them before returning. The committed files never move. Release commands receive their tag and release identity explicitly; GitHub environment variables are workflow adapters, not part of the release-domain interface. `release-prepare` owns source validation, changelog/tag agreement, CI, release gates, notes, and packaging checks; `release-build --tag TAG --target TARGET` owns native artifact builds and archive creation; `release-docs --tag TAG --repository OWNER/REPO` builds the versioned Zensical site and renders the tag-pinned installers into the release directory; `release-contract` verifies the four archives plus both installers; `release-version-check --tag TAG` verifies every local version source; and `release-validate-published --tag TAG --repository OWNER/REPO` owns the post-publication contract, provenance, reproducibility, release-asset installer checks, and Pages checks. The installers carry the released archive digests and are published as first-class GitHub Release assets. Publication composes the release body from the checked changelog notes plus tag-scoped installer URLs, so the body never names a different version than the artifacts beside it.
 
 To create and push an annotated release tag after the newest changelog entry
 has been reviewed:
 
 ```console
-cargo run -p xtask -- tag --tag v0.1.3
+cargo run --locked --quiet -p xtask -- tag --tag v0.1.3
 ```
 
 The release tag and newest changelog entry must agree. `xtask tag` refuses to
@@ -64,8 +67,8 @@ tag is also the only version input for the repository's pinned release manifests
 do not edit `Cargo.toml` to prepare a release. To stamp a checkout manually:
 
 ```console
-cargo run -p xtask -- release-stamp --version 0.1.5
-cargo run -p xtask -- release-stamp --restore
+cargo run --locked --quiet -p xtask -- release-stamp --version 0.1.5
+cargo run --locked --quiet -p xtask -- release-stamp --restore
 ```
 
 `release-stamp` saves `.backup` copies while stamping and refuses incomplete

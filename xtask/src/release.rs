@@ -22,14 +22,14 @@ use zip::ZipWriter;
 use zip::write::SimpleFileOptions;
 
 use crate::Error;
+use crate::release_artifacts::{ComposedNotes, artifact_paths};
 use crate::release_contract;
 use crate::release_model::{
     ArchiveKind, DocsIdentity, ManifestState, POWERSHELL_INSTALLER_FILE, PublicationAction,
     PublicationIntent, PublicationState, ReleaseContext, ReleaseTarget, SHELL_INSTALLER_FILE,
-    VersionContractInput, artifact_inventory, compose_release_notes, installer_digests,
-    powershell_installer, powershell_installer_version_marker, publication_transition,
-    release_context, release_plan, shell_installer, shell_installer_version_marker,
-    version_contract,
+    VersionContractInput, artifact_inventory, installer_digests, powershell_installer,
+    powershell_installer_version_marker, publication_transition, release_context, release_plan,
+    shell_installer, shell_installer_version_marker, version_contract,
 };
 use crate::stamp;
 
@@ -65,10 +65,8 @@ pub(crate) fn prepare(root: &Path, tag: &str, version: Version) -> Result<(), Er
             &commit,
         ],
     )?;
-    stamp::apply(root, version)?;
-
-    let result = (|| {
-        run_command(
+    stamp::with_stamped(root, version, || {
+        run_command_without_release_context(
             root,
             "cargo",
             [
@@ -89,14 +87,20 @@ pub(crate) fn prepare(root: &Path, tag: &str, version: Version) -> Result<(), Er
             [
                 "run",
                 "--locked",
+                "--quiet",
                 "--",
-                "run",
-                "release",
-                "--no-cache",
-                "--output",
-                "text",
-                "--ui",
-                "stream",
+                "changelog",
+                "release-notes",
+                tag,
+                "--output-file",
+                "RELEASE_NOTES.md",
+            ],
+        )?;
+        run_command(
+            root,
+            "cargo",
+            [
+                "run", "--locked", "--quiet", "-p", "xtask", "--", "verify", "--tag", tag,
             ],
         )?;
         run_command(root, "cargo", ["package", "--locked", "--allow-dirty"])?;
@@ -107,20 +111,9 @@ pub(crate) fn prepare(root: &Path, tag: &str, version: Version) -> Result<(), Er
             ));
         }
         Ok(())
-    })();
-
-    let restore = stamp::restore(root);
-    match (result, restore) {
-        (Ok(()), Ok(())) => {
-            println!("{PREPARE_COMPONENT}: release gates and package passed for {tag}");
-            Ok(())
-        }
-        (Err(error), Ok(())) => Err(error),
-        (Ok(()), Err(error)) => Err(error),
-        (Err(error), Err(restore)) => Err(Error::Command(format!(
-            "release preparation failed: {error}; restoring pinned files also failed: {restore}"
-        ))),
-    }
+    })?;
+    println!("{PREPARE_COMPONENT}: release gates and package passed for {tag}");
+    Ok(())
 }
 
 /// Build one canonical release artifact from the release target table.
@@ -136,9 +129,7 @@ pub(crate) fn build(
         .map_err(|error| Error::Command(error.to_string()))?;
     let context = release_context(&tag.name, commit, None, None)?;
     context.validate_changelog(root)?;
-    stamp::apply(root, tag.version)?;
-
-    let result = (|| {
+    stamp::with_stamped(root, tag.version, || {
         verify_stamped_manifests(root, &context)?;
         run_command_slice(
             root,
@@ -158,24 +149,13 @@ pub(crate) fn build(
             .join(target.binary_name());
         assert_binary_identity(&binary, tag.version)?;
         package_artifact(root, &binary, target, &context, directory)
-    })();
-    let restore = stamp::restore(root);
-
-    match (result, restore) {
-        (Ok(()), Ok(())) => {
-            println!(
-                "{BUILD_COMPONENT}: built {} for {}",
-                target.artifact_name(&context.tag),
-                target.rust_target
-            );
-            Ok(())
-        }
-        (Err(error), Ok(())) => Err(error),
-        (Ok(()), Err(error)) => Err(error),
-        (Err(error), Err(restore)) => Err(Error::Command(format!(
-            "release build failed: {error}; restoring pinned files also failed: {restore}"
-        ))),
-    }
+    })?;
+    println!(
+        "{BUILD_COMPONENT}: built {} for {}",
+        target.artifact_name(&context.tag),
+        target.rust_target
+    );
+    Ok(())
 }
 
 /// Verify the committed repository state before any release stamping occurs.
@@ -321,26 +301,30 @@ pub(crate) fn version_check(
 /// Build the release-tagged documentation without leaving release versions in
 /// the checkout. The caller must provide a parsed release version; parsing
 /// belongs at the CLI boundary.
-pub(crate) fn docs(root: &Path, version: Version, directory: &Path) -> Result<(), Error> {
-    stamp::apply(root, version)?;
-
-    let tag = release_tag(version);
-    let build_result = build_site(root, version)
-        .and_then(|()| write_docs_metadata(root, &tag, version))
-        .and_then(|()| write_release_installers(root, &tag, directory));
-    let restore_result = stamp::restore(root);
-
-    match (build_result, restore_result) {
-        (Ok(()), Ok(())) => {
-            println!("{COMPONENT}: built versioned documentation in site/");
-            Ok(())
-        }
-        (Err(build), Ok(())) => Err(build),
-        (Ok(()), Err(restore)) => Err(restore),
-        (Err(build), Err(restore)) => Err(Error::Command(format!(
-            "documentation build failed: {build}; restoring pinned files also failed: {restore}"
-        ))),
-    }
+pub(crate) fn docs(
+    root: &Path,
+    tag: &crate::Tag,
+    repository: &str,
+    workflow_run: Option<&str>,
+    directory: &Path,
+) -> Result<(), Error> {
+    let source_commit = git_output(root, &["rev-parse", "HEAD"])?;
+    stamp::with_stamped(root, tag.version, || {
+        build_site(root, tag.version)
+            .and_then(|()| {
+                write_docs_metadata(
+                    root,
+                    &tag.name,
+                    tag.version,
+                    &source_commit,
+                    repository,
+                    workflow_run,
+                )
+            })
+            .and_then(|()| write_release_installers(root, &tag.name, directory))
+    })?;
+    println!("{COMPONENT}: built versioned documentation in site/");
+    Ok(())
 }
 
 /// Create or reuse the draft GitHub release and upload the assembled release
@@ -348,18 +332,18 @@ pub(crate) fn docs(root: &Path, version: Version, directory: &Path) -> Result<()
 /// deployed the documentation.
 pub(crate) fn publish(
     tag: &str,
+    repository: &str,
     directory: &Path,
     notes: &Path,
     finalize: bool,
 ) -> Result<(), Error> {
-    let repository = required_env("GITHUB_REPOSITORY")?;
     // The draft and the final publication must carry the same body, so both are
     // composed from the same checked changelog notes.
     let composed = ComposedNotes::write(tag, notes)?;
     let notes = composed.path();
     println!("{PUBLISH_COMPONENT}: composed the {tag} release body with the install section");
     if finalize {
-        let state = publication_state(tag, &repository)?;
+        let state = publication_state(tag, repository)?;
         let transition = publication_transition(state, PublicationIntent::Finalize)
             .map_err(|error| Error::Invalid(error.to_string()))?;
         if transition
@@ -374,7 +358,7 @@ pub(crate) fn publish(
             "edit",
             tag,
             "--repo",
-            &repository,
+            repository,
             "--title",
             tag,
             "--notes-file",
@@ -391,7 +375,7 @@ pub(crate) fn publish(
         return Ok(());
     }
 
-    let state = create_or_reuse_draft(tag, &repository, notes)?;
+    let state = create_or_reuse_draft(tag, repository, notes)?;
     if state == PublicationState::Published {
         return Ok(());
     }
@@ -409,50 +393,13 @@ pub(crate) fn publish(
         .collect::<Result<Vec<_>, _>>()?;
     let mut upload_args = vec!["release", "upload", tag];
     upload_args.extend(artifact_args.iter().copied());
-    upload_args.extend(["--repo", &repository, "--clobber"]);
+    upload_args.extend(["--repo", repository, "--clobber"]);
     run_gh(upload_args)?;
     println!(
         "{PUBLISH_COMPONENT}: uploaded {} artifacts to draft {tag}",
         artifacts.len()
     );
     Ok(())
-}
-
-/// The release body: checked changelog notes plus the generated install section.
-///
-/// `gh --notes-file` reads a path, so the composed body is written to a
-/// temporary file instead of being passed as one enormous argument. The file is
-/// removed when this value is dropped, including on the early returns above it.
-struct ComposedNotes {
-    directory: PathBuf,
-    path: PathBuf,
-}
-
-impl ComposedNotes {
-    fn write(tag: &str, notes: &Path) -> Result<Self, Error> {
-        let text = fs::read_to_string(notes).map_err(|source| Error::Io {
-            path: notes.to_path_buf(),
-            source,
-        })?;
-        let composed = compose_release_notes(tag, &text)?;
-        let directory = temporary_directory("notes")?;
-        let path = directory.join("RELEASE_NOTES.md");
-        fs::write(&path, composed).map_err(|source| Error::Io {
-            path: path.clone(),
-            source,
-        })?;
-        Ok(Self { directory, path })
-    }
-
-    fn path(&self) -> &Path {
-        &self.path
-    }
-}
-
-impl Drop for ComposedNotes {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.directory);
-    }
 }
 
 fn verify_stamped_manifests(root: &Path, context: &ReleaseContext) -> Result<(), Error> {
@@ -650,11 +597,6 @@ fn lockfile_package_version(text: &str, package: &str) -> Option<String> {
     None
 }
 
-/// The tag a documentation build belongs to: CI exports it, a local run derives it.
-fn release_tag(version: Version) -> String {
-    non_empty_env("RELEASE_TAG").unwrap_or_else(|| format!("v{version}"))
-}
-
 /// Render the release installers into the assembled release directory.
 ///
 /// The binary digests are computed from the exact files in `directory` before
@@ -735,16 +677,21 @@ fn read_installer(root: &Path, name: &str) -> Result<String, Error> {
     fs::read_to_string(&path).map_err(|source| Error::Io { path, source })
 }
 
-fn write_docs_metadata(root: &Path, tag: &str, version: Version) -> Result<(), Error> {
-    let source_commit =
-        non_empty_env("RELEASE_COMMIT").unwrap_or(git_output(root, &["rev-parse", "HEAD"])?);
+fn write_docs_metadata(
+    root: &Path,
+    tag: &str,
+    version: Version,
+    source_commit: &str,
+    repository: &str,
+    workflow_run: Option<&str>,
+) -> Result<(), Error> {
     let metadata = json!({
         "schema_version": DOCS_METADATA_SCHEMA,
         "version": version.to_string(),
         "tag": tag,
         "source_commit": source_commit,
-        "repository": non_empty_env("GITHUB_REPOSITORY"),
-        "workflow_run": non_empty_env("RELEASE_RUN_URL"),
+        "repository": repository,
+        "workflow_run": workflow_run,
     });
     let path = root.join("site").join(DOCS_METADATA_FILE);
     fs::write(
@@ -817,16 +764,19 @@ fn parse_docs_metadata(text: &str, label: &str) -> Result<DocsIdentity, Error> {
     })
 }
 
-pub(crate) fn validate_published(root: &Path) -> Result<(), Error> {
-    let tag = required_env("RELEASE_TAG")?;
-    let repository = required_env("GITHUB_REPOSITORY")?;
+pub(crate) fn validate_published(
+    root: &Path,
+    tag: &crate::Tag,
+    repository: &str,
+) -> Result<(), Error> {
+    let tag_name = &tag.name;
     let directory = temporary_directory("published")?;
     let source_root = temporary_directory("published-source")?;
     let result = (|| {
         let mut patterns = vec!["SHA256SUMS", "BUILD-METADATA.json"];
-        let names = artifact_inventory(&tag)?;
+        let names = artifact_inventory(tag_name)?;
         patterns.extend(names.iter().map(String::as_str));
-        gh_download(&tag, &repository, &directory, &patterns)?;
+        gh_download(tag_name, repository, &directory, &patterns)?;
 
         let metadata_path = directory.join("BUILD-METADATA.json");
         let metadata_text = fs::read_to_string(&metadata_path).map_err(|source| Error::Io {
@@ -844,12 +794,12 @@ pub(crate) fn validate_published(root: &Path) -> Result<(), Error> {
             .source_commit
             .clone()
             .ok_or_else(|| Error::Invalid("BUILD-METADATA.json has no source_commit".to_owned()))?;
-        if manifest.release_tag.as_deref() != Some(tag.as_str()) {
+        if manifest.release_tag.as_deref() != Some(tag_name.as_str()) {
             return Err(Error::Invalid(format!(
-                "published metadata tag does not match {tag}"
+                "published metadata tag does not match {tag_name}"
             )));
         }
-        let context = release_context(&tag, source_commit.clone(), Some(&repository), None)?;
+        let context = release_context(tag_name, source_commit.clone(), Some(repository), None)?;
 
         let source_path = source_root
             .to_str()
@@ -860,31 +810,31 @@ pub(crate) fn validate_published(root: &Path) -> Result<(), Error> {
             &[
                 "repo",
                 "clone",
-                &repository,
+                repository,
                 source_path,
                 "--",
                 "--branch",
-                &tag,
+                tag_name,
                 "--depth",
                 "1",
             ],
         )?;
-        mono::verify_source(&source_root, &tag, &source_commit)
+        mono::verify_source(&source_root, tag_name, &source_commit)
             .map_err(|error| Error::Command(error.to_string()))?;
 
         release_contract::run_with_identity(
             &directory,
             true,
             mono::ReleaseIdentity {
-                repository: Some(repository.clone()),
-                release_tag: Some(tag.clone()),
+                repository: Some(repository.to_owned()),
+                release_tag: Some(tag_name.clone()),
                 source_commit: Some(source_commit),
                 tag_object: None,
                 workflow_run: None,
             },
         )?;
-        verify_release_installers(&directory, &tag)?;
-        for name in artifact_inventory(&tag)? {
+        verify_release_installers(&directory, tag_name)?;
+        for name in artifact_inventory(tag_name)? {
             let artifact = directory.join(name);
             run_gh([
                 "attestation",
@@ -893,18 +843,18 @@ pub(crate) fn validate_published(root: &Path) -> Result<(), Error> {
                     .to_str()
                     .ok_or_else(|| Error::Invalid("non-UTF8 artifact path".to_owned()))?,
                 "--repo",
-                &repository,
+                repository,
             ])?;
         }
         let linux = ReleaseTarget::find("x86_64-unknown-linux-gnu")?;
         let extracted = temporary_directory("published-linux")?;
         extract_archive(
-            &directory.join(linux.artifact_name(&tag)),
+            &directory.join(linux.artifact_name(tag_name)),
             linux,
             &extracted,
         )?;
         rebuild_and_compare(&source_root, &context, &extracted.join("mono"))?;
-        verify_published_docs(&context, &repository)?;
+        verify_published_docs(&context, repository)?;
         let _ = fs::remove_dir_all(&extracted);
         Ok(())
     })();
@@ -913,17 +863,18 @@ pub(crate) fn validate_published(root: &Path) -> Result<(), Error> {
     result
 }
 
-pub(crate) fn validate_platform(root: &Path, target_name: &str) -> Result<(), Error> {
-    let context = ReleaseContext::from_environment(root)?;
-    let repository = context
-        .repository
-        .clone()
-        .ok_or_else(|| Error::Invalid("GITHUB_REPOSITORY is not set".to_owned()))?;
+pub(crate) fn validate_platform(
+    _root: &Path,
+    tag: &crate::Tag,
+    repository: &str,
+    target_name: &str,
+) -> Result<(), Error> {
+    let context = release_context(&tag.name, "published-validation", Some(repository), None)?;
     let target = ReleaseTarget::find(target_name)?;
     let directory = temporary_directory("platform")?;
     let result = (|| {
         let artifact_name = target.artifact_name(&context.tag);
-        gh_download(&context.tag, &repository, &directory, &[&artifact_name])?;
+        gh_download(&context.tag, repository, &directory, &[&artifact_name])?;
         let extracted = directory.join("extracted");
         fs::create_dir_all(&extracted).map_err(|source| Error::Io {
             path: extracted.clone(),
@@ -949,8 +900,7 @@ fn rebuild_and_compare(
     released: &Path,
 ) -> Result<(), Error> {
     let target = ReleaseTarget::find("x86_64-unknown-linux-gnu")?;
-    stamp::apply(root, context.version)?;
-    let result = (|| {
+    stamp::with_stamped(root, context.version, || {
         run_command_slice(
             root,
             "cargo",
@@ -982,16 +932,7 @@ fn rebuild_and_compare(
             ));
         }
         Ok(())
-    })();
-    let restore = stamp::restore(root);
-    match (result, restore) {
-        (Ok(()), Ok(())) => Ok(()),
-        (Err(error), Ok(())) => Err(error),
-        (Ok(()), Err(error)) => Err(error),
-        (Err(error), Err(restore)) => Err(Error::Command(format!(
-            "rebuild failed: {error}; restore failed: {restore}"
-        ))),
-    }
+    })
 }
 
 fn extract_archive(path: &Path, target: ReleaseTarget, destination: &Path) -> Result<(), Error> {
@@ -1138,10 +1079,6 @@ fn http_output(url: &str) -> Result<String, Error> {
     }
 }
 
-fn non_empty_env(name: &str) -> Option<String> {
-    env::var(name).ok().filter(|value| !value.is_empty())
-}
-
 fn run_command_slice(root: &Path, program: &str, args: &[&str]) -> Result<(), Error> {
     let status = Command::new(program)
         .args(args)
@@ -1161,14 +1098,39 @@ fn run_command_slice(root: &Path, program: &str, args: &[&str]) -> Result<(), Er
 }
 
 fn run_command<const N: usize>(root: &Path, program: &str, args: [&str; N]) -> Result<(), Error> {
-    let status = Command::new(program)
-        .args(args)
-        .current_dir(root)
-        .status()
-        .map_err(|source| Error::Spawn {
-            program: format!("{program} {}", args.join(" ")),
-            source,
-        })?;
+    run_command_with_policy(root, program, args, false)
+}
+
+fn run_command_without_release_context<const N: usize>(
+    root: &Path,
+    program: &str,
+    args: [&str; N],
+) -> Result<(), Error> {
+    run_command_with_policy(root, program, args, true)
+}
+
+fn run_command_with_policy<const N: usize>(
+    root: &Path,
+    program: &str,
+    args: [&str; N],
+    clear_release_context: bool,
+) -> Result<(), Error> {
+    let mut command = Command::new(program);
+    command.args(args).current_dir(root);
+    if clear_release_context {
+        for name in [
+            "RELEASE_TAG",
+            "RELEASE_TAG_OBJECT",
+            "RELEASE_COMMIT",
+            "RELEASE_RUN_URL",
+        ] {
+            command.env_remove(name);
+        }
+    }
+    let status = command.status().map_err(|source| Error::Spawn {
+        program: format!("{program} {}", args.join(" ")),
+        source,
+    })?;
     if status.success() {
         return Ok(());
     }
@@ -1256,49 +1218,6 @@ fn create_or_reuse_draft(
         }
     }
     Ok(state)
-}
-
-fn artifact_paths(directory: &Path) -> Result<Vec<PathBuf>, Error> {
-    let mut paths = fs::read_dir(directory)
-        .map_err(|source| Error::Io {
-            path: directory.to_path_buf(),
-            source,
-        })?
-        .map(|entry| {
-            let entry = entry.map_err(|source| Error::Io {
-                path: directory.to_path_buf(),
-                source,
-            })?;
-            let path = entry.path();
-            let file_type = entry.file_type().map_err(|source| Error::Io {
-                path: path.clone(),
-                source,
-            })?;
-            if file_type.is_file() {
-                Ok(Some(path))
-            } else {
-                Ok(None)
-            }
-        })
-        .collect::<Result<Vec<_>, Error>>()?
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>();
-    paths.sort();
-    if paths.is_empty() {
-        return Err(Error::Invalid(format!(
-            "release artifact directory {} contains no files",
-            directory.display()
-        )));
-    }
-    Ok(paths)
-}
-
-fn required_env(name: &str) -> Result<String, Error> {
-    env::var(name)
-        .ok()
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| Error::Invalid(format!("{name} is not set")))
 }
 
 fn run_gh<'a>(args: impl IntoIterator<Item = &'a str>) -> Result<(), Error> {
@@ -1404,47 +1323,6 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     #[test]
-    fn artifact_paths_are_sorted_and_exclude_directories() {
-        let temp = TempDir::new();
-        fs::write(temp.path().join("z-last"), "last").unwrap();
-        fs::write(temp.path().join("a-first"), "first").unwrap();
-        fs::create_dir(temp.path().join("nested")).unwrap();
-
-        let paths = artifact_paths(temp.path()).unwrap();
-        let names = paths
-            .iter()
-            .map(|path| path.file_name().unwrap().to_str().unwrap())
-            .collect::<Vec<_>>();
-        assert_eq!(names, ["a-first", "z-last"]);
-    }
-
-    #[test]
-    fn artifact_paths_reject_an_empty_directory() {
-        let temp = TempDir::new();
-        let error = artifact_paths(temp.path()).unwrap_err();
-        assert!(error.to_string().contains("contains no files"), "{error}");
-    }
-
-    #[test]
-    fn composed_notes_carry_the_install_section_and_clean_up_after_themselves() {
-        let temp = TempDir::new();
-        let notes = temp.path().join("RELEASE_NOTES.md");
-        fs::write(&notes, "# 0.1.5\n\n## Changelog\n\nReleased: 2026-09-12\n").unwrap();
-
-        let path = {
-            let composed = ComposedNotes::write("v0.1.5", &notes).unwrap();
-            let path = composed.path().to_path_buf();
-            let text = fs::read_to_string(&path).unwrap();
-            assert!(text.starts_with("# 0.1.5\n"), "{text}");
-            assert!(text.contains("## Install"), "{text}");
-            assert!(text.contains("## Changelog"), "{text}");
-            path
-        };
-
-        assert!(!path.exists(), "the temporary release body is removed");
-    }
-
-    #[test]
     fn published_installers_bake_in_the_release_contract() {
         let temp = TempDir::new();
         let dist = temp.path().join("dist");
@@ -1506,20 +1384,6 @@ mod tests {
         let error = write_release_installers(temp.path(), "v0.1.5", &temp.path().join("dist"))
             .expect_err("missing release archives fail");
         assert!(error.to_string().contains("failed to access"), "{error}");
-    }
-
-    #[test]
-    fn composed_notes_refuse_a_release_notes_file_for_another_version() {
-        let temp = TempDir::new();
-        let notes = temp.path().join("RELEASE_NOTES.md");
-        fs::write(&notes, "# 0.1.4\n\nbody\n").unwrap();
-
-        let error = match ComposedNotes::write("v0.1.5", &notes) {
-            Ok(_) => panic!("a mismatched heading must be rejected"),
-            Err(error) => error,
-        };
-
-        assert!(error.to_string().contains("must start with"), "{error}");
     }
 
     struct TempDir(PathBuf);

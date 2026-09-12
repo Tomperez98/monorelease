@@ -4,8 +4,8 @@
 //! `0.0.0` in `Cargo.toml`, in the `mono` package entry of `Cargo.lock`, and in
 //! the displayed Zensical site name/footer. The release process rewrites all
 //! three from the tag just before building. The committed files therefore never
-//! drift, and the CHANGELOG heading (gated against `RELEASE_TAG` by the
-//! `release-notes` task) is the only version source.
+//! drift, and the CHANGELOG heading validated by the release context is the
+//! only committed version source.
 //!
 //! Rewriting is paired with `--restore` so a local run leaves the working tree
 //! clean, mirroring TigerBeetle's `backup_create`/`backup_restore`.
@@ -104,6 +104,27 @@ pub(crate) fn restore(root: &Path) -> Result<(), Error> {
         println!("{COMPONENT}: restored {} from backup", restored.join(", "));
     }
     Ok(())
+}
+
+/// Run an operation against stamped manifests and always restore the pinned
+/// checkout before returning. The operation and restoration errors are both
+/// preserved when both fail.
+pub(crate) fn with_stamped<T>(
+    root: &Path,
+    version: Version,
+    operation: impl FnOnce() -> Result<T, Error>,
+) -> Result<T, Error> {
+    apply(root, version)?;
+    let result = operation();
+    let restore = restore(root);
+    match (result, restore) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+        (Err(error), Err(restore)) => Err(Error::Invalid(format!(
+            "stamped operation failed: {error}; restoring pinned files also failed: {restore}"
+        ))),
+    }
 }
 
 fn restore_file(backup: &Path, path: &Path) -> Result<(), Error> {
@@ -413,6 +434,36 @@ copyright = \"Mono v0.0.0 · Apache-2.0 License\"
             ZENSICAL
         );
         assert!(!backup_path(&root.path().join(CARGO_LOCK)).exists());
+    }
+
+    #[test]
+    fn with_stamped_restores_after_operation_failure() {
+        let root = TempDir::new();
+        fs::write(root.path().join(CARGO_TOML), MANIFEST).unwrap();
+        fs::write(root.path().join(CARGO_LOCK), LOCKFILE).unwrap();
+        fs::write(root.path().join(ZENSICAL_TOML), ZENSICAL).unwrap();
+
+        let error = with_stamped(root.path(), Version::parse("1.2.3").unwrap(), || {
+            Err::<(), _>(Error::Invalid("operation failed".to_owned()))
+        })
+        .unwrap_err();
+
+        assert!(error.to_string().contains("operation failed"));
+        assert_eq!(
+            fs::read_to_string(root.path().join(CARGO_TOML)).unwrap(),
+            MANIFEST
+        );
+        assert_eq!(
+            fs::read_to_string(root.path().join(CARGO_LOCK)).unwrap(),
+            LOCKFILE
+        );
+        assert_eq!(
+            fs::read_to_string(root.path().join(ZENSICAL_TOML)).unwrap(),
+            ZENSICAL
+        );
+        for relative in [CARGO_TOML, CARGO_LOCK, ZENSICAL_TOML] {
+            assert!(!backup_path(&root.path().join(relative)).exists());
+        }
     }
 
     #[test]
