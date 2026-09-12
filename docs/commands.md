@@ -47,9 +47,9 @@ Bare `mono` runs the default pipeline but accepts the global flags only. Use `mo
 
 `--ui auto` uses the interactive task UI on a terminal and task-prefixed streaming output in pipes and CI. `--ui tui` currently resolves the same way, so the full-screen view is used only when a terminal is attached. Use `--ui stream` for predictable task-prefixed lines anywhere.
 
-`mono changelog prepare` creates the next patch entry by default. Pass `unreleased` to explicitly skip a release cycle, or pass a version for a major/minor release. `--date` makes the entry date deterministic. `--from REF --to REF` adds editable bullets from first-parent merge commits without fetching or switching branches. Add `--pull-request-url 'https://github.com/org/repo/pull/{number}'` (or set `CHANGELOG_PR_URL`) to turn recognized merge commits into links.
+`mono changelog prepare` creates the next patch entry by default. Pass `unreleased` to explicitly skip a release cycle, or pass a version for a major/minor release. The generated entry contains only its release metadata and harvested bullets; it does not add empty category placeholders. `--date` makes the entry date deterministic. `--from REF --to REF` adds editable bullets from first-parent merge commits without fetching or switching branches. If that range has no merge commits, preparation succeeds with a warning so you can add content manually. Add `--pull-request-url 'https://github.com/org/repo/pull/{number}'` (or set `CHANGELOG_PR_URL`) to turn recognized merge commits into links.
 
-`mono changelog release-notes` uses the newest entry by default. In CI, `RELEASE_TAG` is accepted as the version and must match that entry. The old `scaffold`, `validate`, and `notes` spellings remain aliases.
+`mono changelog release-notes` uses the newest entry by default. In CI, `RELEASE_TAG` is accepted as the version and must match that entry. It rejects entries containing only `Released:` without substantive release content. The old `scaffold`, `validate`, and `notes` spellings remain aliases.
 
 `mono release manifest` and `mono release verify` write and read a release directory: `--dist <PATH>` (default `dist`, below the root).
 

@@ -31,14 +31,17 @@ mono changelog release-notes
 ```
 
 `prepare` never fetches remotes, switches branches, or changes Git state. It only
-reads the requested refs and atomically updates the changelog. Use
-`--pull-request-url` or `CHANGELOG_PR_URL` to link recognized PR merge commits.
-`scaffold`,
+reads the requested refs and atomically updates the changelog. Generated entries
+contain release metadata and harvested bullets, not empty category placeholders.
+A range with no merge commits produces a warning and leaves the entry for manual
+editing. Use `--pull-request-url` or `CHANGELOG_PR_URL` to link recognized PR
+merge commits. `scaffold`,
 `validate`, and `notes` remain compatibility aliases.
 
 The newest changelog entry is the release being prepared. Release-note
-extraction rejects an older version and requires `RELEASE_TAG` to match the
-newest entry when CI provides it.
+extraction rejects an older version, requires substantive content beyond
+`Released:`, and requires `RELEASE_TAG` to match the newest entry when CI
+provides it.
 
 ## Repository releases
 

@@ -218,6 +218,7 @@ Mono uses the same provider-neutral release pattern for every project that adopt
 - The newest versioned changelog entry is the release being prepared.
 - Release tags are `vX.Y.Z` and must match the newest entry and resolve to the checked-out source commit.
 - The matching changelog entry becomes `RELEASE_NOTES.md`.
+- Prepared entries contain release metadata and meaningful bullets, not empty category placeholders.
 - Release directories contain an explicit, verified artifact inventory and SHA-256 metadata.
 - Publishing remains an ordinary project task or CI step; Mono does not know registries or package managers.
 

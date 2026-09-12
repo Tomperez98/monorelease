@@ -342,15 +342,11 @@ pub fn is_valid_date(date: &str) -> bool {
 }
 
 fn new_entry_body(date: &str, bullets: &[String]) -> String {
-    let mut body = format!("Released: {date}\n");
-    if !bullets.is_empty() {
+    let mut body = format!("Released: {date}\n\n");
+    for bullet in bullets {
+        body.push_str(bullet);
         body.push('\n');
-        for bullet in bullets {
-            body.push_str(bullet);
-            body.push('\n');
-        }
     }
-    body.push_str("\n### Features\n\n-\n\n### Fixes\n\n-\n\n### Internals\n\n-\n\n");
     body
 }
 
@@ -426,6 +422,24 @@ mod tests {
             .unwrap();
         assert!(matches!(action, Action::Renamed { .. }));
         assert!(changelog.render().contains("## 1.1.0\n"));
+    }
+
+    #[test]
+    fn new_entries_contain_metadata_and_bullets_without_empty_sections() {
+        let mut changelog =
+            Changelog::parse("# Changelog\n\n## 1.0.0\nReleased: 2026-01-01\n").unwrap();
+        changelog
+            .scaffold(
+                Request::parse("1.1.0").unwrap(),
+                "2026-09-11",
+                &["- [#42](https://example.test/42)\n\n  Improve releases.".to_owned()],
+            )
+            .unwrap();
+
+        let rendered = changelog.render();
+        assert!(rendered.contains("Released: 2026-09-11\n\n- [#42]"));
+        assert!(!rendered.contains("### Features"));
+        assert!(!rendered.contains("\n-\n"));
     }
 
     #[test]
