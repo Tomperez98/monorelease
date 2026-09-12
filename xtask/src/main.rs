@@ -7,6 +7,7 @@
 
 mod process;
 mod release;
+mod release_artifacts;
 mod release_contract;
 mod release_model;
 mod stamp;
@@ -30,7 +31,7 @@ const BINARY_DEFAULT: &str = "target/debug/mono";
     name = "xtask",
     version,
     about = "Repository-specific release automation for mono",
-    after_help = "Run `cargo run -p xtask -- release-prepare --tag v0.1.5` to validate a release, `cargo run -p xtask -- release-build --target x86_64-unknown-linux-gnu` to build one canonical artifact, or `cargo run -p xtask -- tag --tag v0.1.5` to create and push a release tag."
+    after_help = "Run `cargo run -p xtask -- release-prepare --tag v0.1.5` to validate a release, `cargo run -p xtask -- release-build --tag v0.1.5 --target x86_64-unknown-linux-gnu` to build one canonical artifact, or `cargo run -p xtask -- tag --tag v0.1.5` to create and push a release tag."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -40,12 +41,31 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Run this repository's gates against the binary in MONO_BIN.
-    Verify,
+    Verify {
+        /// Release tag used for binary identity checks.
+        #[arg(long)]
+        tag: Option<String>,
+    },
     /// Write and verify this repository's release artifact contract.
     ReleaseContract {
         /// Release artifact directory.
         #[arg(long, default_value = release_contract::default_directory())]
         directory: PathBuf,
+        /// Release tag, for example v0.1.5.
+        #[arg(long)]
+        tag: String,
+        /// Source commit recorded in the release manifest.
+        #[arg(long)]
+        commit: String,
+        /// Repository recorded in the release manifest.
+        #[arg(long)]
+        repository: Option<String>,
+        /// Annotated tag object recorded in the release manifest.
+        #[arg(long)]
+        tag_object: Option<String>,
+        /// Workflow run URL recorded in the release manifest.
+        #[arg(long)]
+        workflow_run: Option<String>,
         /// Verify an existing manifest without rewriting it.
         #[arg(long)]
         verify_only: bool,
@@ -64,6 +84,9 @@ enum Command {
     },
     /// Build one canonical release artifact for a target.
     ReleaseBuild {
+        /// Release tag, for example v0.1.5.
+        #[arg(long)]
+        tag: String,
         /// Rust target from the canonical release target table.
         #[arg(long)]
         target: String,
@@ -73,9 +96,15 @@ enum Command {
     },
     /// Build the versioned documentation for a release tag.
     ReleaseDocs {
-        /// Version to stamp, for example 0.1.5 or v0.1.5. Defaults to RELEASE_TAG.
+        /// Release tag, for example v0.1.5.
         #[arg(long)]
-        version: Option<String>,
+        tag: String,
+        /// GitHub repository recorded in the generated docs metadata.
+        #[arg(long)]
+        repository: String,
+        /// Release workflow URL recorded in the generated docs metadata.
+        #[arg(long)]
+        workflow_run: Option<String>,
         /// Release directory holding the SHA256SUMS the installers bake in.
         #[arg(long, default_value = "dist")]
         directory: PathBuf,
@@ -84,6 +113,9 @@ enum Command {
     ReleaseCheck,
     /// Verify every user-visible release version source agrees.
     ReleaseVersionCheck {
+        /// Release tag, for example v0.1.5.
+        #[arg(long)]
+        tag: String,
         /// Binary to query with --version.
         #[arg(long)]
         binary: Option<PathBuf>,
@@ -95,15 +127,34 @@ enum Command {
         notes: PathBuf,
     },
     /// Validate the published GitHub release and deployed documentation.
-    ReleaseValidatePublished,
+    ReleaseValidatePublished {
+        /// Release tag, for example v0.1.5.
+        #[arg(long)]
+        tag: String,
+        /// GitHub repository, for example org/repo.
+        #[arg(long)]
+        repository: String,
+    },
     /// Validate one native platform release artifact.
     ReleaseValidatePlatform {
+        /// Release tag, for example v0.1.5.
+        #[arg(long)]
+        tag: String,
+        /// GitHub repository, for example org/repo.
+        #[arg(long)]
+        repository: String,
         /// Rust target from the canonical release target table.
         #[arg(long)]
         target: String,
     },
     /// Create or finalize the GitHub release from the assembled artifacts.
     ReleasePublish {
+        /// Release tag, for example v0.1.5.
+        #[arg(long)]
+        tag: String,
+        /// GitHub repository to publish to.
+        #[arg(long)]
+        repository: String,
         /// Release artifact directory.
         #[arg(long, default_value = release_contract::default_directory())]
         directory: PathBuf,
@@ -153,52 +204,84 @@ impl std::error::Error for Error {}
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let (component, result) = match cli.command {
-        Command::Verify => (VERIFY_COMPONENT, verify_command()),
+        Command::Verify { tag } => (VERIFY_COMPONENT, verify_command(tag)),
         Command::ReleaseContract {
             directory,
+            tag,
+            commit,
+            repository,
+            tag_object,
+            workflow_run,
             verify_only,
         } => (
             release_contract::COMPONENT,
-            release_contract::run(&directory, verify_only),
+            release_contract::run_with_identity(
+                &directory,
+                verify_only,
+                mono::ReleaseIdentity {
+                    repository: non_empty(repository),
+                    release_tag: Some(tag),
+                    source_commit: Some(commit),
+                    tag_object: non_empty(tag_object),
+                    workflow_run: non_empty(workflow_run),
+                },
+            ),
         ),
         Command::Tag { tag } => (tag::COMPONENT, tag::run(&tag)),
         Command::ReleasePrepare { tag } => {
             (release::PREPARE_COMPONENT, release_prepare_command(tag))
         }
-        Command::ReleaseBuild { target, directory } => (
+        Command::ReleaseBuild {
+            tag,
+            target,
+            directory,
+        } => (
             release::BUILD_COMPONENT,
-            release_build_command(target, directory),
+            release_build_command(tag, target, directory),
         ),
-        Command::ReleaseDocs { version, directory } => {
-            (release::COMPONENT, release_docs_command(version, directory))
-        }
+        Command::ReleaseDocs {
+            tag,
+            repository,
+            workflow_run,
+            directory,
+        } => (
+            release::COMPONENT,
+            release_docs_command(tag, repository, workflow_run, directory),
+        ),
         Command::ReleaseCheck => (
             release::STATE_COMPONENT,
             release::check(&stamp::repository_root()),
         ),
         Command::ReleaseVersionCheck {
+            tag,
             binary,
             site,
             notes,
         } => (
             release::CHECK_COMPONENT,
-            release_version_check_command(binary, site, notes),
+            release_version_check_command(tag, binary, site, notes),
         ),
-        Command::ReleaseValidatePublished => (
+        Command::ReleaseValidatePublished { tag, repository } => (
             release::VALIDATE_COMPONENT,
-            release_validate_published_command(),
+            release_validate_published_command(tag, repository),
         ),
-        Command::ReleaseValidatePlatform { target } => (
+        Command::ReleaseValidatePlatform {
+            tag,
+            repository,
+            target,
+        } => (
             release::VALIDATE_COMPONENT,
-            release_validate_platform_command(target),
+            release_validate_platform_command(tag, repository, target),
         ),
         Command::ReleasePublish {
+            tag,
+            repository,
             directory,
             notes,
             finalize,
         } => (
             release::PUBLISH_COMPONENT,
-            release_publish_command(directory, notes, finalize),
+            release_publish_command(tag, repository, directory, notes, finalize),
         ),
         Command::ReleaseStamp { version, restore } => {
             (stamp::COMPONENT, release_stamp_command(version, restore))
@@ -221,21 +304,32 @@ pub(crate) struct Tag {
 }
 
 impl Tag {
+    pub(crate) fn parse(text: &str) -> Result<Self, Error> {
+        let version = Version::parse(text.strip_prefix('v').unwrap_or(text)).ok_or_else(|| {
+            Error::Invalid(format!(
+                "release tag is `{text}`, expected `v<major>.<minor>.<patch>` (for example v0.1.1)"
+            ))
+        })?;
+        Ok(Self {
+            name: text.to_owned(),
+            version,
+        })
+    }
+
     pub(crate) fn from_env() -> Result<Self, Error> {
         let name = env::var("RELEASE_TAG").map_err(|_| {
             Error::Invalid("RELEASE_TAG is not set (for example RELEASE_TAG=v0.1.1)".to_owned())
         })?;
-        let version = Version::parse(name.strip_prefix('v').unwrap_or(&name)).ok_or_else(|| {
-            Error::Invalid(format!(
-                "RELEASE_TAG is `{name}`, expected `v<major>.<minor>.<patch>` (for example v0.1.1)"
-            ))
-        })?;
-        Ok(Self { name, version })
+        Self::parse(&name)
     }
 }
 
-fn verify_command() -> Result<(), Error> {
-    verify::run(&Tag::from_env()?, &binary_path())
+fn verify_command(tag: Option<String>) -> Result<(), Error> {
+    let tag = match tag {
+        Some(tag) => Tag::parse(&tag)?,
+        None => Tag::from_env()?,
+    };
+    verify::run(&tag, &binary_path())
 }
 
 fn release_prepare_command(tag: Option<String>) -> Result<(), Error> {
@@ -247,52 +341,66 @@ fn release_prepare_command(tag: Option<String>) -> Result<(), Error> {
     release::prepare(&stamp::repository_root(), &tag, version)
 }
 
-fn release_build_command(target: String, directory: PathBuf) -> Result<(), Error> {
-    release::build(
+fn release_build_command(tag: String, target: String, directory: PathBuf) -> Result<(), Error> {
+    let tag = Tag::parse(&tag)?;
+    release::build(&stamp::repository_root(), &tag, &target, &directory)
+}
+
+fn release_docs_command(
+    tag: String,
+    repository: String,
+    workflow_run: Option<String>,
+    directory: PathBuf,
+) -> Result<(), Error> {
+    let tag = Tag::parse(&tag)?;
+    release::docs(
         &stamp::repository_root(),
-        &Tag::from_env()?,
-        &target,
+        &tag,
+        &repository,
+        workflow_run.as_deref(),
         &directory,
     )
 }
 
-fn release_docs_command(version: Option<String>, directory: PathBuf) -> Result<(), Error> {
-    let version = match version {
-        Some(version) => parse_version(&version)?,
-        None => Tag::from_env()?.version,
-    };
-    release::docs(&stamp::repository_root(), version, &directory)
-}
-
 fn release_version_check_command(
+    tag: String,
     binary: Option<PathBuf>,
     site: PathBuf,
     notes: PathBuf,
 ) -> Result<(), Error> {
+    let tag = Tag::parse(&tag)?;
     release::version_check(
         &stamp::repository_root(),
-        &Tag::from_env()?,
+        &tag,
         binary.as_deref(),
         &site,
         &notes,
     )
 }
 
-fn release_validate_published_command() -> Result<(), Error> {
-    release::validate_published(&stamp::repository_root())
+fn release_validate_published_command(tag: String, repository: String) -> Result<(), Error> {
+    let tag = Tag::parse(&tag)?;
+    release::validate_published(&stamp::repository_root(), &tag, &repository)
 }
 
-fn release_validate_platform_command(target: String) -> Result<(), Error> {
-    release::validate_platform(&stamp::repository_root(), &target)
+fn release_validate_platform_command(
+    tag: String,
+    repository: String,
+    target: String,
+) -> Result<(), Error> {
+    let tag = Tag::parse(&tag)?;
+    release::validate_platform(&stamp::repository_root(), &tag, &repository, &target)
 }
 
 fn release_publish_command(
+    tag: String,
+    repository: String,
     directory: PathBuf,
     notes: PathBuf,
     finalize: bool,
 ) -> Result<(), Error> {
-    let tag = Tag::from_env()?;
-    release::publish(&tag.name, &directory, &notes, finalize)
+    let tag = Tag::parse(&tag)?;
+    release::publish(&tag.name, &repository, &directory, &notes, finalize)
 }
 
 fn release_stamp_command(version: Option<String>, restore: bool) -> Result<(), Error> {
@@ -332,4 +440,8 @@ fn path_from_env(name: &str, default: &str) -> PathBuf {
         Some(value) if !value.is_empty() => PathBuf::from(value),
         _ => PathBuf::from(default),
     }
+}
+
+fn non_empty(value: Option<String>) -> Option<String> {
+    value.filter(|value| !value.is_empty())
 }

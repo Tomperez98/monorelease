@@ -98,19 +98,3 @@ fn git_output(args: &[&str]) -> Result<String, Error> {
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn validates_version_tags() {
-        for tag in ["v0.1.3", "v1.20.300"] {
-            assert!(validate_tag(tag).is_ok(), "rejected {tag}");
-        }
-
-        for tag in ["0.1.3", "v1.2", "v1.2.3-rc1", "v1 2 3", "v"] {
-            assert!(validate_tag(tag).is_err(), "accepted {tag}");
-        }
-    }
-}

@@ -66,7 +66,10 @@ jobs:
         env:
           RELEASE_TAG: ${{ steps.release.outputs.tag }}
           GH_TOKEN: ${{ github.token }}
-        run: cargo run --locked --quiet -p xtask -- release-validate-published
+        run: >-
+          cargo run --locked --quiet -p xtask -- release-validate-published
+          --tag "$RELEASE_TAG"
+          --repository "$GITHUB_REPOSITORY"
 
   validate_platform:
     name: Validate ${{ matrix.target }} artifact
@@ -122,7 +125,11 @@ jobs:
         env:
           RELEASE_TAG: ${{ steps.release.outputs.tag }}
           GH_TOKEN: ${{ github.token }}
-        run: cargo run --locked --quiet -p xtask -- release-validate-platform --target "${{ matrix.target }}"
+        run: >-
+          cargo run --locked --quiet -p xtask -- release-validate-platform
+          --tag "$RELEASE_TAG"
+          --repository "$GITHUB_REPOSITORY"
+          --target "${{ matrix.target }}"
 
   validate_installer:
     name: Execute ${{ matrix.installer }} installer on ${{ matrix.os }}

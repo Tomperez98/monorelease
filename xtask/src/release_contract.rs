@@ -8,7 +8,6 @@
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use mono::{
@@ -26,11 +25,6 @@ const DEFAULT_DIRECTORY: &str = "dist";
 // temporary inventory file.
 static EXPECTED_INVENTORY_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-pub(crate) fn run(directory: &Path, verify_only: bool) -> Result<(), Error> {
-    let identity = release_identity()?;
-    run_with_identity(directory, verify_only, identity)
-}
-
 pub(crate) fn run_with_identity(
     directory: &Path,
     verify_only: bool,
@@ -39,7 +33,7 @@ pub(crate) fn run_with_identity(
     let tag = identity
         .release_tag
         .as_deref()
-        .ok_or_else(|| Error::Invalid("RELEASE_TAG is not set".to_owned()))?;
+        .ok_or_else(|| Error::Invalid("release contract identity has no tag".to_owned()))?;
     let expected_path = expected_inventory(tag)?;
 
     let result = if verify_only {
@@ -72,39 +66,6 @@ pub(crate) fn run_with_identity(
     Ok(())
 }
 
-fn release_identity() -> Result<ReleaseIdentity, Error> {
-    let tag = required_env("RELEASE_TAG")?;
-    let source_commit = match non_empty_env("RELEASE_COMMIT") {
-        Some(commit) => commit,
-        None => git_output(&["rev-parse", "HEAD"])?,
-    };
-    let tag_object = match non_empty_env("RELEASE_TAG_OBJECT") {
-        Some(tag_object) => Some(tag_object),
-        None => annotated_tag_object(&tag)?,
-    };
-
-    Ok(ReleaseIdentity {
-        repository: non_empty_env("GITHUB_REPOSITORY"),
-        release_tag: Some(tag),
-        source_commit: Some(source_commit),
-        tag_object,
-        workflow_run: non_empty_env("RELEASE_RUN_URL"),
-    })
-}
-
-fn annotated_tag_object(tag: &str) -> Result<Option<String>, Error> {
-    match git_output(&["cat-file", "-t", tag])?.as_str() {
-        "tag" => {
-            let tag_ref = format!("{tag}^{{tag}}");
-            Ok(Some(git_output(&["rev-parse", &tag_ref])?))
-        }
-        "commit" => Ok(None),
-        object_type => Err(Error::Invalid(format!(
-            "release tag {tag} resolves to unsupported Git object type {object_type}"
-        ))),
-    }
-}
-
 fn expected_inventory(tag: &str) -> Result<PathBuf, Error> {
     let expected = artifact_inventory(tag)?;
     let unique = EXPECTED_INVENTORY_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -119,32 +80,6 @@ fn expected_inventory(tag: &str) -> Result<PathBuf, Error> {
         ))
     })?;
     Ok(path)
-}
-
-fn required_env(name: &str) -> Result<String, Error> {
-    non_empty_env(name).ok_or_else(|| Error::Invalid(format!("{name} is not set")))
-}
-
-fn non_empty_env(name: &str) -> Option<String> {
-    env::var(name).ok().filter(|value| !value.is_empty())
-}
-
-fn git_output(args: &[&str]) -> Result<String, Error> {
-    let output = Command::new("git")
-        .args(args)
-        .output()
-        .map_err(|source| Error::Spawn {
-            program: format!("git {}", args.join(" ")),
-            source,
-        })?;
-    if !output.status.success() {
-        return Err(Error::Command(format!(
-            "`git {}` failed: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&output.stderr).trim()
-        )));
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
 fn release_error(error: ReleaseError) -> Error {
