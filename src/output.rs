@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::events::{ExecutionEvent, TaskStatus, TaskStream};
 use crate::project::TaskNode;
 use crate::runner::{CancellationToken, RunnerError, TaskResult};
+use crate::scheduler::TaskReporter;
 use crate::stream_output::StreamFormatter;
 use crate::tui::TuiController;
 
@@ -52,6 +53,49 @@ struct Writers {
     out: Box<dyn Write + Send>,
     err: Box<dyn Write + Send>,
     stream: StreamFormatter,
+}
+
+impl TaskReporter for OutputSink {
+    fn present_start(&self, node: &TaskNode) -> io::Result<()> {
+        self.present_start(node)
+    }
+
+    fn present_success(&self, node: &TaskNode, result: &TaskResult) -> io::Result<()> {
+        self.present_success(node, result)
+    }
+
+    fn present_blocked(&self, node: &TaskNode) -> io::Result<()> {
+        self.present_blocked(node)
+    }
+
+    fn present_failure(&self, node: &TaskNode, error: &RunnerError) -> io::Result<()> {
+        self.present_failure(node, error)
+    }
+
+    fn is_live(&self) -> bool {
+        self.is_live()
+    }
+
+    fn present_attempt(&self, node: &TaskNode, attempt: u32, max_attempts: u32) -> io::Result<()> {
+        self.present_attempt(node, attempt, max_attempts)
+    }
+
+    fn present_live_output(
+        &self,
+        node: &TaskNode,
+        stream: TaskStream,
+        bytes: Vec<u8>,
+    ) -> io::Result<()> {
+        self.present_live_output(node, stream, bytes)
+    }
+
+    fn present_run_start(&self, project: &Path, task_count: usize) -> io::Result<()> {
+        self.present_run_start(project, task_count)
+    }
+
+    fn present_run_finished(&self, summary: &crate::scheduler::ExecutionSummary) -> io::Result<()> {
+        self.present_run_finished(summary)
+    }
 }
 
 impl std::fmt::Debug for OutputSink {

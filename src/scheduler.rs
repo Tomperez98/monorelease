@@ -10,9 +10,33 @@ use std::thread;
 use std::time::Duration;
 
 use crate::cache::{CacheBackend, CacheError, CacheMode, CacheSession, CacheStore};
-use crate::output::OutputSink;
+use crate::events::TaskStream;
 use crate::project::{PlannedTask, Project, TaskNode};
 use crate::runner::{CancellationToken, RunnerError, TaskExecutor, TaskResult};
+
+/// Receives structured execution lifecycle events without prescribing their
+/// text, JSON, stream, or TUI presentation.
+pub(crate) trait TaskReporter: Send + Sync {
+    fn present_start(&self, node: &TaskNode) -> std::io::Result<()>;
+    fn present_success(&self, node: &TaskNode, result: &TaskResult) -> std::io::Result<()>;
+    fn present_blocked(&self, node: &TaskNode) -> std::io::Result<()>;
+    fn present_failure(&self, node: &TaskNode, error: &RunnerError) -> std::io::Result<()>;
+    fn is_live(&self) -> bool;
+    fn present_attempt(
+        &self,
+        node: &TaskNode,
+        attempt: u32,
+        max_attempts: u32,
+    ) -> std::io::Result<()>;
+    fn present_live_output(
+        &self,
+        node: &TaskNode,
+        stream: TaskStream,
+        bytes: Vec<u8>,
+    ) -> std::io::Result<()>;
+    fn present_run_start(&self, project: &Path, task_count: usize) -> std::io::Result<()>;
+    fn present_run_finished(&self, summary: &ExecutionSummary) -> std::io::Result<()>;
+}
 
 /// The environment collected once at the edge of a scheduler run.
 ///
@@ -80,7 +104,7 @@ pub(crate) fn execute_plan_with_services(
     project: &Project,
     plan: &[PlannedTask],
     runner: Arc<dyn TaskExecutor>,
-    output: &Arc<OutputSink>,
+    output: &Arc<dyn TaskReporter>,
     options: &SchedulerOptions<'_>,
 ) -> Result<ExecutionSummary, SchedulerError> {
     execute_plan_with_options(project, plan, runner, output, options)
@@ -90,7 +114,7 @@ fn execute_plan_with_options(
     project: &Project,
     plan: &[PlannedTask],
     runner: Arc<dyn TaskExecutor>,
-    output: &Arc<OutputSink>,
+    output: &Arc<dyn TaskReporter>,
     options: &SchedulerOptions<'_>,
 ) -> Result<ExecutionSummary, SchedulerError> {
     assert!(options.jobs > 0, "scheduler requires at least one worker");
@@ -657,7 +681,7 @@ struct WorkerJob {
     dependency_keys: Vec<String>,
     runner: Arc<dyn TaskExecutor>,
     cancellation: CancellationToken,
-    output: Arc<OutputSink>,
+    output: Arc<dyn TaskReporter>,
 }
 
 fn worker_loop(
@@ -855,6 +879,7 @@ mod tests {
     use crate::cache::CacheBackend;
     use crate::config::config_path;
     use crate::events::TaskStatus;
+    use crate::output::OutputSink;
     use crate::project::Project;
     use crate::runner::{CapturedOutput, RunnerError, TaskResult};
     use crate::testing::TempDir;
@@ -1434,7 +1459,7 @@ mod tests {
         }
     }
 
-    fn terminal_sink() -> Arc<OutputSink> {
+    fn terminal_sink() -> Arc<dyn TaskReporter> {
         Arc::new(OutputSink::test_sink(
             crate::output::OutputMode::Terminal,
             1,
@@ -1455,7 +1480,7 @@ mod tests {
         manifest: &str,
         jobs: usize,
         executor: &Arc<ScriptedExecutor>,
-        output: &Arc<OutputSink>,
+        output: &Arc<dyn TaskReporter>,
         cache_mode: CacheMode,
         cancellation: &CancellationToken,
     ) -> Result<ExecutionSummary, SchedulerError> {
@@ -1483,7 +1508,7 @@ mod tests {
         manifest: &str,
         jobs: usize,
         executor: &Arc<ScriptedExecutor>,
-        output: &Arc<OutputSink>,
+        output: &Arc<dyn TaskReporter>,
         cache_mode: CacheMode,
         cancellation: &CancellationToken,
         cache: Arc<dyn CacheBackend>,
@@ -1580,7 +1605,7 @@ mod tests {
     #[test]
     fn an_output_failure_is_reported_before_any_task_runs() {
         let executor = Arc::new(ScriptedExecutor::default());
-        let output: Arc<OutputSink> = Arc::new(OutputSink::test_sink(
+        let output: Arc<dyn TaskReporter> = Arc::new(OutputSink::test_sink(
             crate::output::OutputMode::Terminal,
             1,
             Box::new(FailingWriter),

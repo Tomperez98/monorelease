@@ -94,12 +94,39 @@ pub fn prepare_from_git(
     to: &str,
     pull_request_url: Option<&str>,
 ) -> Result<String, ChangelogError> {
+    prepare_from_git_with(
+        path,
+        version,
+        date,
+        from,
+        to,
+        pull_request_url,
+        git_merge_log,
+    )
+}
+
+/// Prepare a changelog entry with Git supplied by the caller.
+///
+/// The production wrapper above supplies the real Git process. Tests and other
+/// callers can provide a scripted log or failure without spawning a process.
+pub(crate) fn prepare_from_git_with<F>(
+    path: &Path,
+    version: Option<&str>,
+    date: Option<&str>,
+    from: &str,
+    to: &str,
+    pull_request_url: Option<&str>,
+    mut merge_log: F,
+) -> Result<String, ChangelogError>
+where
+    F: FnMut(&Path, &str, &str) -> Result<String, ChangelogError>,
+{
     let date = date.map_or_else(today, str::to_owned);
     let (changelog, request) = load_prepare_input(path, version, &date)?;
     validate_ref(from)?;
     validate_ref(to)?;
     validate_pull_request_url(pull_request_url)?;
-    let log = git_merge_log(path, from, to)?;
+    let log = merge_log(path, from, to)?;
     let bullets = format_git_bullets(&log, pull_request_url);
     let mut message = write_prepared(path, changelog, request, &date, &bullets)?;
     if bullets.is_empty() {
@@ -642,6 +669,58 @@ mod tests {
         let error = prepare_from_git(&path, None, None, "bad ref", "HEAD", None).unwrap_err();
 
         assert!(error.to_string().contains("expected the file to start"));
+    }
+
+    #[test]
+    fn scripted_git_log_prepares_without_spawning_git() {
+        let temp = TempDir::new();
+        let path = temp.path().join(DEFAULT_PATH);
+        fs::write(&path, "# Changelog\n\n## 1.0.0\nReleased: 2026-01-01\n").unwrap();
+
+        let message = prepare_from_git_with(
+            &path,
+            None,
+            Some("2001-02-03"),
+            "FROM",
+            "TO",
+            None,
+            |_path, from, to| {
+                assert_eq!((from, to), ("FROM", "TO"));
+                Ok("Merge pull request #42 from team/feature\x1f\nAdd the feature\x1e".to_owned())
+            },
+        )
+        .expect("scripted Git log succeeds");
+
+        assert!(message.contains("1 Git changes"), "{message}");
+        assert!(fs::read_to_string(path).unwrap().contains("#42"));
+    }
+
+    #[test]
+    fn scripted_git_failure_is_returned_without_writing() {
+        let temp = TempDir::new();
+        let path = temp.path().join(DEFAULT_PATH);
+        let original = "# Changelog\n\n## 1.0.0\nReleased: 2026-01-01\n";
+        fs::write(&path, original).unwrap();
+
+        let error = prepare_from_git_with(
+            &path,
+            None,
+            Some("2001-02-03"),
+            "FROM",
+            "TO",
+            None,
+            |_path, _from, _to| {
+                Err(ChangelogError::CommandFailed {
+                    command: "git log".to_owned(),
+                    status: Some(128),
+                    stderr: "bad ref".to_owned(),
+                })
+            },
+        )
+        .expect_err("scripted Git failure is returned");
+
+        assert!(matches!(error, ChangelogError::CommandFailed { .. }));
+        assert_eq!(fs::read_to_string(path).unwrap(), original);
     }
 
     #[test]

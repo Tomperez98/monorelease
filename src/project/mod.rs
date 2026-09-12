@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use serde::Serialize;
 
-use crate::config::{PipelineConfig, StdinMode, TaskConfig, config_path};
+use crate::config::{MonoConfig, PipelineConfig, StdinMode, TaskConfig, config_path};
 use crate::discovery::find_root;
 
 mod matrix;
@@ -24,7 +24,9 @@ use matrix::{
 };
 use suggest::closest_name;
 pub(crate) use validate::validate_schema;
-use validate::{validate_identifier, validate_task_config, validate_task_reference};
+use validate::{
+    validate_identifier, validate_task_config, validate_task_directory, validate_task_reference,
+};
 
 /// A task identity in the single root graph.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
@@ -157,8 +159,24 @@ impl Project {
     /// Find and load the nearest root `mono.toml`.
     pub fn load(start: &Path) -> Result<Self, ProjectError> {
         let discovered = find_root(start)?;
-        let root = discovered.root;
-        let config = discovered.config;
+        let project = Self::from_config(discovered.root, discovered.config)?;
+        for (task_name, task) in &project.tasks {
+            validate_task_directory(&project.root, task_name, task)?;
+        }
+        assert!(
+            project.root.is_dir(),
+            "discovered project root must be a directory"
+        );
+        Ok(project)
+    }
+
+    /// Validate an already parsed manifest and build the executable project.
+    ///
+    /// This is the pure project-construction boundary: it performs no file
+    /// reads, directory discovery, environment access, or process execution.
+    /// Production loading belongs in [`Self::load`]; callers that already have
+    /// a parsed manifest can test all graph and task validation in memory.
+    pub fn from_config(root: PathBuf, config: MonoConfig) -> Result<Self, ProjectError> {
         let manifest_path = config_path(&root);
         validate_schema(&manifest_path, config.schema)?;
 
@@ -193,7 +211,7 @@ impl Project {
         }
 
         for (task_name, task) in &config.tasks {
-            validate_task_config(&manifest_path, &root, task_name, task)?;
+            validate_task_config(&manifest_path, task_name, task)?;
         }
 
         let project = Self {
@@ -211,7 +229,6 @@ impl Project {
 
     fn assert_invariants(&self) {
         assert!(self.root.is_absolute(), "project root must be absolute");
-        assert!(self.root.is_dir(), "project root must be a directory");
         assert!(!self.name.is_empty(), "project name must not be empty");
         assert!(self.pipelines.contains_key(&self.default_pipeline));
     }
@@ -364,8 +381,23 @@ impl Project {
         if !self.pipelines.contains_key(&self.default_pipeline) {
             return Err(self.unknown_pipeline(&self.default_pipeline));
         }
-        for pipeline_name in self.pipelines.keys() {
-            self.plan(Some(pipeline_name), &[])?;
+        for (pipeline_name, pipeline) in &self.pipelines {
+            self.plan_nodes(Some(pipeline_name), &[])?;
+            let mut state = BTreeMap::new();
+            let mut ordered = Vec::new();
+            let mut stack = Vec::new();
+            for task_name in &pipeline.finally {
+                for root in self.root_nodes(task_name)? {
+                    let task = self.task_config(&root)?;
+                    if task.cache {
+                        return Err(ProjectError::InvalidTask {
+                            task: root.id().to_owned(),
+                            message: "finalizer tasks cannot be cached".to_owned(),
+                        });
+                    }
+                    self.visit_task(&root, &mut state, &mut stack, &mut ordered)?;
+                }
+            }
         }
         Ok(())
     }

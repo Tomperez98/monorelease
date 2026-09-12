@@ -4,7 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::config::{MonoConfig, config_path};
-use crate::project::{ProjectError, validate_schema};
+use crate::project::ProjectError;
 
 #[derive(Debug)]
 pub(crate) struct DiscoveredRoot {
@@ -29,7 +29,6 @@ pub(crate) fn find_root(start: &Path) -> Result<DiscoveredRoot, ProjectError> {
         let manifest_path = config_path(&current);
         if manifest_path.is_file() {
             let config = read_manifest(&manifest_path)?;
-            validate_schema(&manifest_path, config.schema)?;
             return Ok(DiscoveredRoot {
                 root: current,
                 config,
@@ -132,7 +131,7 @@ mod tests {
         )
         .expect("write manifest");
 
-        let error = find_root(temp.path()).expect_err("schema 2 is rejected");
+        let error = crate::project::Project::load(temp.path()).expect_err("schema 2 is rejected");
 
         assert!(
             matches!(error, ProjectError::UnsupportedSchema { found: 2, .. }),
