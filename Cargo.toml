@@ -1,22 +1,11 @@
 [package]
 name = "mono"
-# `cargo run`/`cargo test` must keep selecting the CLI, not the test fixture in
-# `src/bin/mono-fixture.rs`; the pipeline tasks in mono.toml call bare `cargo run`.
-default-run = "mono"
-# Pinned placeholder. The release workflow rewrites this (and the matching
-# `Cargo.lock` entry) from the release tag with `xtask release-stamp`, so the
-# committed version never drifts. See README "Release conventions".
 version = "0.0.0"
 edition = "2024"
 rust-version = "1.88"
 description = "Manifest-driven project command orchestration"
 license = "Apache-2.0"
 repository = "https://github.com/Tomperez98/mono"
-# Repository automation, not part of the published crate.
-exclude = ["/xtask"]
-
-[workspace]
-members = ["xtask"]
 
 [dependencies]
 clap = { version = "4.6.6", features = ["derive", "env"] }

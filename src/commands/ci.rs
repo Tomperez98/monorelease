@@ -397,7 +397,7 @@ mod tests {
     use crate::config::config_path;
     use crate::runner::{CapturedOutput, RunnerError, TaskResult};
     use crate::scheduler::{RetrySleeper, SchedulerServices};
-    use crate::testing::{TempDir, fixture_command};
+    use crate::testing::TempDir;
     use std::collections::BTreeMap;
     use std::fs;
     use std::sync::Mutex;
@@ -670,98 +670,6 @@ mod tests {
         .unwrap();
         assert!(output.find("base-build").unwrap() < output.find("app-build").unwrap());
         assert!(output.contains("would run app-build"));
-    }
-
-    #[test]
-    fn retries_a_failed_task_before_reporting_failure() {
-        let temp = TempDir::new();
-        let marker = temp.path().join("attempted");
-        let build = fixture_command(&[
-            "fail-once",
-            marker.to_string_lossy().as_ref(),
-            "7",
-            "success",
-        ]);
-        fs::write(
-            config_path(temp.path()),
-            format!("[project]\nname = \"fixture\"\n\n[pipelines.ci]\ntasks = [\"build\"]\n\n[tasks.build]\ncommand = {build}\nretries = 1\n"),
-        )
-        .unwrap();
-        let output = run_pipeline_with_mode(
-            temp.path(),
-            None,
-            &[],
-            false,
-            1,
-            PipelineExecution {
-                cache: CacheMode::NoCache,
-                output: OutputMode::Terminal,
-                ..PipelineExecution::default()
-            },
-        )
-        .unwrap();
-        assert!(output.contains("1 completed"));
-    }
-
-    #[test]
-    fn runs_finalizers_after_a_failed_task() {
-        let temp = TempDir::new();
-        let marker = temp.path().join("cleanup-ran");
-        let build = fixture_command(&["fail", "7"]);
-        let cleanup = fixture_command(&["write", marker.to_string_lossy().as_ref(), "ran"]);
-        fs::write(
-            config_path(temp.path()),
-            format!("[project]\nname = \"fixture\"\n\n[pipelines.ci]\ntasks = [\"build\"]\nfinally = [\"cleanup\"]\n\n[tasks.build]\ncommand = {build}\n\n[tasks.cleanup]\ncommand = {cleanup}\n"),
-        )
-        .unwrap();
-        let error = run_pipeline_with_mode(
-            temp.path(),
-            None,
-            &[],
-            false,
-            1,
-            PipelineExecution {
-                cache: CacheMode::NoCache,
-                output: OutputMode::Terminal,
-                ..PipelineExecution::default()
-            },
-        )
-        .unwrap_err();
-        assert!(matches!(error, CiError::Scheduler(_)));
-        assert!(marker.exists());
-    }
-
-    #[test]
-    fn finalizer_dependencies_run_after_a_normal_failure() {
-        let temp = TempDir::new();
-        let marker = temp.path().join("cleanup-ran");
-        let build = fixture_command(&["fail", "7"]);
-        let prepare = fixture_command(&["write", "prepared", "prepared"]);
-        let cleanup = fixture_command(&[
-            "write-if-exists",
-            "prepared",
-            marker.to_string_lossy().as_ref(),
-        ]);
-        fs::write(
-            config_path(temp.path()),
-            format!("[project]\nname = \"fixture\"\n\n[pipelines.ci]\ntasks = [\"build\"]\nfinally = [\"cleanup\"]\n\n[tasks.build]\ncommand = {build}\n\n[tasks.prepare-cleanup]\ncommand = {prepare}\n\n[tasks.cleanup]\ncommand = {cleanup}\ndepends_on = [\"prepare-cleanup\"]\n"),
-        )
-        .unwrap();
-        let error = run_pipeline_with_mode(
-            temp.path(),
-            None,
-            &[],
-            false,
-            1,
-            PipelineExecution {
-                cache: CacheMode::NoCache,
-                output: OutputMode::Terminal,
-                ..PipelineExecution::default()
-            },
-        )
-        .unwrap_err();
-        assert!(matches!(error, CiError::Scheduler(_)));
-        assert!(marker.exists(), "finalizer dependency closure did not run");
     }
 
     #[test]

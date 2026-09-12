@@ -37,44 +37,6 @@ impl Drop for TempDir {
     }
 }
 
-/// Absolute path to the `mono-fixture` helper binary.
-///
-/// Unit tests run inside `target/<profile>/deps/`, and the fixture is a normal
-/// binary beside that directory. It is built by `--all-targets`, which is the
-/// command `mono.toml` runs.
-pub fn fixture_path() -> PathBuf {
-    let executable = std::env::current_exe().expect("test executable has a path");
-    let profile = executable
-        .parent()
-        .and_then(Path::parent)
-        .expect("test executable lives in a profile directory");
-    let name = if cfg!(windows) {
-        "mono-fixture.exe"
-    } else {
-        "mono-fixture"
-    };
-    let path = profile.join(name);
-    assert!(
-        path.is_file(),
-        "missing {}; build it with `cargo test --all-targets`",
-        path.display()
-    );
-    path
-}
-
-/// A `command = [...]` array for a task that runs the fixture.
-///
-/// Paths are TOML-escaped so a Windows absolute path survives the manifest.
-pub fn fixture_command(args: &[&str]) -> String {
-    let parts = std::iter::once(fixture_path().to_string_lossy().into_owned())
-        .chain(args.iter().map(|arg| (*arg).to_owned()));
-    let quoted = parts
-        .map(|part| format!("\"{}\"", part.replace('\\', "\\\\").replace('"', "\\\"")))
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!("[{quoted}]")
-}
-
 /// Create a symbolic link, or report that this process is not allowed to.
 ///
 /// Creating a symlink is a platform *capability*, not a platform fact: Windows

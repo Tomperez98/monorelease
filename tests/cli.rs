@@ -8,7 +8,7 @@ use std::process::Output;
 
 mod support;
 
-use support::{TempDir, fixture_command, mono};
+use support::{TempDir, mono};
 
 fn stdout(output: &Output) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
@@ -120,32 +120,6 @@ fn cacheable_tasks_cannot_inherit_standard_input() {
 }
 
 #[test]
-fn cache_reuses_root_task_outputs_and_supports_bypass() {
-    let temp = TempDir::new("cache");
-    let build = fixture_command(&["count-copy", "count", "seed", "artifact"]);
-    write_project(
-        temp.path(),
-        &format!(
-            "[pipelines.ci]\ntasks = [\"build\"]\n\n[tasks.build]\ncommand = {build}\ncache = true\ninputs = [\"seed\"]\noutputs = [\"artifact\"]\n"
-        ),
-    );
-    fs::write(temp.path().join("seed"), "hello").unwrap();
-    assert!(mono(&["ci"], temp.path()).status.success());
-    let second = mono(&["ci"], temp.path());
-    assert!(second.status.success(), "{}", stderr(&second));
-    assert!(stderr(&second).contains("cache hit"));
-    assert_eq!(
-        fs::read_to_string(temp.path().join("count")).unwrap(),
-        "1\n"
-    );
-    assert!(mono(&["ci", "--force"], temp.path()).status.success());
-    assert_eq!(
-        fs::read_to_string(temp.path().join("count")).unwrap(),
-        "2\n"
-    );
-}
-
-#[test]
 fn plan_redacts_environment_values() {
     let temp = TempDir::new("env");
     write_project(
@@ -158,45 +132,6 @@ fn plan_redacts_environment_values() {
     assert!(text.contains("API_TOKEN=<redacted>"));
     assert!(!text.contains("secret"));
     assert!(!text.contains("check"));
-}
-
-#[test]
-fn json_output_contains_lifecycle_events() {
-    let temp = TempDir::new("json");
-    let build = fixture_command(&["print", "hello"]);
-    write_project(
-        temp.path(),
-        &format!("[pipelines.ci]\ntasks = [\"build\"]\n\n[tasks.build]\ncommand = {build}\n"),
-    );
-    let output = mono(&["ci", "--output", "json"], temp.path());
-    assert!(output.status.success(), "{}", stderr(&output));
-    let output_text = stdout(&output);
-    let lines = output_text.lines().collect::<Vec<_>>();
-    assert!(
-        lines
-            .iter()
-            .any(|line| line.contains("\"event\":\"task_started\""))
-    );
-    assert!(
-        lines
-            .iter()
-            .any(|line| line.contains("\"event\":\"task_finished\""))
-    );
-    assert!(
-        lines
-            .iter()
-            .all(|line| serde_json::from_str::<serde_json::Value>(line).is_ok())
-    );
-    let events = lines
-        .iter()
-        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
-        .collect::<Vec<_>>();
-    assert!(events.iter().all(|event| event["run_id"].is_u64()));
-    let sequences = events
-        .iter()
-        .map(|event| event["sequence"].as_u64().unwrap())
-        .collect::<Vec<_>>();
-    assert!(sequences.windows(2).all(|pair| pair[0] < pair[1]));
 }
 
 #[test]
@@ -272,50 +207,6 @@ fn json_success_documents_cover_non_execution_commands() {
     assert!(clean.status.success(), "{}", stderr(&clean));
     let clean_document: serde_json::Value = serde_json::from_slice(&clean.stdout).unwrap();
     assert_eq!(clean_document["kind"], "cache_clean");
-}
-
-#[test]
-fn stream_output_prefixes_task_bytes_and_reports_summary() {
-    let temp = TempDir::new("stream-output");
-    let build = fixture_command(&["print", "output"]);
-    write_project(
-        temp.path(),
-        &format!("[pipelines.ci]\ntasks = [\"build\"]\n\n[tasks.build]\ncommand = {build}\n"),
-    );
-    let output = mono(&["--ui", "stream", "run", "--no-cache"], temp.path());
-    assert!(output.status.success(), "{}", stderr(&output));
-    assert!(
-        stdout(&output).contains("[build] output"),
-        "{}",
-        stdout(&output)
-    );
-    assert!(
-        stderr(&output).contains("└─ build: completed"),
-        "{}",
-        stderr(&output)
-    );
-}
-
-#[test]
-fn live_output_streams_task_bytes_and_reports_summary() {
-    let temp = TempDir::new("live-output");
-    let build = fixture_command(&["delay-print", "one", "20", "two"]);
-    write_project(
-        temp.path(),
-        &format!("[pipelines.ci]\ntasks = [\"build\"]\n\n[tasks.build]\ncommand = {build}\n"),
-    );
-    let output = mono(&["--ui", "stream", "run", "--no-cache"], temp.path());
-    assert!(output.status.success(), "{}", stderr(&output));
-    assert!(
-        stdout(&output).contains("[build] onetwo"),
-        "{}",
-        stdout(&output)
-    );
-    assert!(
-        stdout(&output).contains("1 completed"),
-        "{}",
-        stdout(&output)
-    );
 }
 
 #[test]

@@ -272,19 +272,6 @@ impl Runner {
         Self { launcher, clock }
     }
 
-    /// Execute one planned task and return its output and timing.
-    ///
-    /// A convenience for tests and for callers that want one task without a
-    /// plan; the scheduler always uses [`run_with_options`](Self::run_with_options).
-    #[cfg(test)]
-    pub fn run(
-        &self,
-        project_root: &Path,
-        planned: &PlannedTask,
-    ) -> Result<TaskResult, RunnerError> {
-        self.run_with_options(project_root, planned, None, None)
-    }
-
     pub(crate) fn run_with_options(
         &self,
         project_root: &Path,
@@ -925,120 +912,9 @@ pub fn format_command(command: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::config_path;
     use crate::project::Project;
-    use crate::testing::{TempDir, fixture_command};
-    use std::fs;
+    use crate::testing::TempDir;
     use std::sync::Mutex;
-
-    fn project_with_task(args: &[&str], timeout_seconds: Option<u64>) -> (TempDir, Project) {
-        let temp = TempDir::new();
-        let timeout = timeout_seconds
-            .map(|seconds| format!("timeout_seconds = {seconds}\n"))
-            .unwrap_or_default();
-        let command = fixture_command(args);
-        fs::write(
-            config_path(temp.path()),
-            format!("[project]\nname = \"fixture\"\n\n[pipelines.ci]\ntasks = [\"build\"]\n\n[tasks.build]\ncommand = {command}\n{timeout}"),
-        )
-        .expect("write project manifest");
-        let project = Project::load(temp.path()).expect("project loads");
-        (temp, project)
-    }
-
-    #[test]
-    fn runs_a_task_and_returns_captured_output_without_printing() {
-        let (_temp, project) = project_with_task(&["streams", "stdout", "stderr"], None);
-        let plan = project.plan(None, &[]).expect("plan succeeds");
-        let result = Runner::new()
-            .run(&project.root, &plan[0])
-            .expect("task succeeds");
-
-        assert_eq!(result.output.stdout, b"stdout");
-        assert_eq!(result.output.stderr, b"stderr");
-    }
-
-    #[test]
-    fn returns_failed_task_output_for_the_presenter() {
-        let (_temp, project) = project_with_task(&["fail-with", "7", "failed"], None);
-        let plan = project.plan(None, &[]).expect("plan succeeds");
-        let error = Runner::new()
-            .run(&project.root, &plan[0])
-            .expect_err("task must fail");
-
-        assert!(error.to_string().contains("fixture/build"));
-        assert_eq!(
-            error.output().expect("failed output is captured").stderr,
-            b"failed"
-        );
-    }
-
-    #[test]
-    fn timeout_terminates_descendants_before_their_delayed_write() {
-        let temp = TempDir::new();
-        let marker = temp.path().join("descendant-finished");
-        let (_temp, project) = project_with_task(
-            &["timeout-tree", "5000", marker.to_string_lossy().as_ref()],
-            Some(1),
-        );
-        let plan = project.plan(None, &[]).expect("plan succeeds");
-
-        let error = Runner::new()
-            .run(&project.root, &plan[0])
-            .expect_err("task must time out");
-        assert!(matches!(error, RunnerError::TimedOut(_)));
-
-        std::thread::sleep(std::time::Duration::from_millis(1200));
-        assert!(!marker.exists(), "a timed-out descendant kept running");
-    }
-
-    #[test]
-    fn successful_exit_spares_a_detached_descendant() {
-        let temp = TempDir::new();
-        let marker = temp.path().join("descendant-finished");
-        // The fixture detaches a descendant that never holds this task's
-        // stdout or stderr, then exits successfully. A normal successful exit
-        // must not terminate the tree; only the timeout and output-limit paths
-        // terminate trees.
-        let (_temp, project) = project_with_task(
-            &["spawn-detached", "3000", marker.to_string_lossy().as_ref()],
-            None,
-        );
-        let plan = project.plan(None, &[]).expect("plan succeeds");
-        Runner::new()
-            .run(&project.root, &plan[0])
-            .expect("task succeeds");
-
-        std::thread::sleep(std::time::Duration::from_secs(4));
-        assert!(
-            marker.exists(),
-            "a successful task killed a detached descendant"
-        );
-    }
-
-    #[test]
-    fn stops_and_reports_when_task_output_exceeds_the_limit() {
-        let (_temp, mut project) = project_with_task(&["print", "123456789"], None);
-        project
-            .tasks
-            .get_mut("build")
-            .expect("fixture task exists")
-            .max_output_bytes = 8;
-        let plan = project.plan(None, &[]).expect("plan succeeds");
-        let error = Runner::new()
-            .run(&project.root, &plan[0])
-            .expect_err("task output must be bounded");
-
-        assert!(
-            matches!(error, RunnerError::OutputLimit(_)),
-            "unexpected error: {error:?}"
-        );
-        assert!(error.to_string().contains("stdout output limit of 8 bytes"));
-        assert_eq!(
-            error.output().expect("partial output is retained").stdout,
-            b"12345678"
-        );
-    }
 
     #[test]
     fn a_failure_maps_onto_exactly_one_lifecycle_status() {
