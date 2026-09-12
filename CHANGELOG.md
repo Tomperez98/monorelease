@@ -2,6 +2,14 @@
 
 Notable changes per release, newest first.
 
+## (unreleased)
+Released: 2026-09-12
+
+### Features
+
+- Add documentation page
+
+
 ## 0.1.4
 Released: 2026-09-11
 

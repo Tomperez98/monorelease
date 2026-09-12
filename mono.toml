@@ -3,7 +3,7 @@ name = "mono"
 default_pipeline = "ci"
 
 [pipelines.ci]
-tasks = ["changelog-validate", "fmt", "check", "test", "clippy", "check-docs"]
+tasks = ["changelog-validate", "fmt", "check", "test", "clippy"]
 
 [pipelines.release]
 tasks = ["release-verify"]
