@@ -63,7 +63,7 @@ mod tests {
 
         assert_eq!(
             doctor(temp.path()).expect("doctor succeeds"),
-            fs::canonicalize(temp.path()).expect("temp path canonicalizes")
+            dunce::canonicalize(temp.path()).expect("temp path canonicalizes")
         );
     }
 }

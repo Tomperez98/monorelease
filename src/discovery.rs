@@ -81,7 +81,7 @@ mod tests {
         assert_eq!(discovered.config.project.name, "fixture");
         assert_eq!(
             discovered.root,
-            fs::canonicalize(temp.path()).expect("temp path canonicalizes")
+            dunce::canonicalize(temp.path()).expect("temp path canonicalizes")
         );
     }
 
@@ -96,7 +96,7 @@ mod tests {
 
         assert_eq!(
             discovered.root,
-            fs::canonicalize(temp.path()).expect("temp path canonicalizes")
+            dunce::canonicalize(temp.path()).expect("temp path canonicalizes")
         );
     }
 

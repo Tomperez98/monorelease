@@ -1,3 +1,7 @@
+// The public application error union is intentionally passed by value here;
+// its platform-dependent size exceeds Clippy's threshold on Windows.
+#![allow(clippy::result_large_err)]
+
 use std::path::{Path, PathBuf};
 
 use mono::{

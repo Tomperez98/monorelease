@@ -33,10 +33,11 @@ fn from_config_builds_a_project_without_manifest_io() {
         )]),
     };
 
-    let project = Project::from_config(PathBuf::from("/virtual/project"), config)
+    let virtual_root = std::env::temp_dir().join("mono-virtual-project");
+    let project = Project::from_config(virtual_root.clone(), config)
         .expect("in-memory project construction succeeds");
 
-    assert_eq!(project.root, PathBuf::from("/virtual/project"));
+    assert_eq!(project.root, virtual_root);
     assert_eq!(project.name, "fixture");
     assert_eq!(project.pipelines["ci"].tasks, ["build"]);
 }
