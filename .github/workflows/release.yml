@@ -50,11 +50,6 @@ jobs:
         id: source-identity
         shell: bash
         run: |
-          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
-            echo "RELEASE_TAG must match v<major>.<minor>.<patch>, got '$RELEASE_TAG'" >&2
-            exit 1
-          }
-
           checkout_commit="$(git rev-parse HEAD)"
           tag_object=''
           if [[ "$(git cat-file -t "$RELEASE_TAG")" == tag ]]; then
@@ -110,16 +105,12 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            archive: tar.gz
           - os: macos-latest
             target: aarch64-apple-darwin
-            archive: tar.gz
           - os: macos-15-intel
             target: x86_64-apple-darwin
-            archive: tar.gz
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            archive: zip
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     permissions:
@@ -143,53 +134,10 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
-      # The stamped manifests are not committed: every job stamps its own
-      # checkout from the tag, and the committed placeholders stay pinned.
-      - name: Stamp pinned manifests with the release version
-        shell: bash
-        run: cargo run --locked --quiet -p xtask -- release-stamp --version "${RELEASE_TAG#v}"
-
-      - name: Build release binary
-        run: cargo build --locked --release --target ${{ matrix.target }}
-
-      # The artifact must identify itself as the release being cut, not as
-      # whatever the source happened to carry.
-      - name: Assert artifact identity
-        shell: bash
-        run: |
-          version="${RELEASE_TAG#v}"
-          binary="target/${{ matrix.target }}/release/mono"
-          if [[ "${{ matrix.archive }}" == "zip" ]]; then binary="$binary.exe"; fi
-          reported="$("$binary" --version)"
-          echo "$reported"
-          test "$reported" = "mono $version" || {
-            echo "$binary reports '$reported', expected 'mono $version'" >&2
-            exit 1
-          }
-
-      - name: Package Unix artifact
-        if: matrix.archive == 'tar.gz'
-        shell: bash
-        run: |
-          mkdir -p dist
-          tar -czf "dist/mono-${RELEASE_TAG}-${{ matrix.target }}.tar.gz" \
-            -C "target/${{ matrix.target }}/release" mono \
-            -C "$GITHUB_WORKSPACE" LICENSE README.md
-
-      - name: Package Windows artifact
-        if: matrix.archive == 'zip'
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force dist | Out-Null
-          $staging = "dist/staging"
-          New-Item -ItemType Directory -Force $staging | Out-Null
-          Copy-Item "target/${{ matrix.target }}/release/mono.exe" "$staging/mono.exe"
-          Copy-Item LICENSE "$staging/LICENSE"
-          Copy-Item README.md "$staging/README.md"
-          Compress-Archive `
-            -Path "$staging/*" `
-            -DestinationPath "dist/mono-$env:RELEASE_TAG-${{ matrix.target }}.zip"
-          Remove-Item -Recurse -Force $staging
+      # xtask owns stamping, building, identity checks, archive naming, and
+      # packaging. The matrix only selects native runners and target triples.
+      - name: Build and package release artifact
+        run: cargo run --locked --quiet -p xtask -- release-build --target "${{ matrix.target }}" --directory dist
 
       - name: Generate build provenance
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
@@ -269,14 +217,20 @@ jobs:
 
       # Build the versioned documentation in the same release job as the
       # binaries. The coordinator stamps and restores the release files around
-      # the build, so this checkout returns to its pinned state.
+      # the build, so this checkout returns to its pinned state. It also renders
+      # the installers into site/ with this release's tag and SHA256SUMS digests
+      # baked in, which is what makes the published copy resolve nothing at run
+      # time.
       - name: Set up uv
         uses: astral-sh/setup-uv@94527f2e458b27549849d47d273a16bec83a01e9 # v7
         with:
           enable-cache: true
 
       - name: Build versioned documentation
-        run: cargo run --locked --quiet -p xtask -- release-docs --version "${RELEASE_TAG#v}"
+        run: cargo run --locked --quiet -p xtask -- release-docs --version "${RELEASE_TAG#v}" --directory dist
+
+      - name: Verify release versions
+        run: cargo run --locked --quiet -p xtask -- release-version-check --site site --notes notes/RELEASE_NOTES.md
 
       - name: Configure GitHub Pages
         uses: actions/configure-pages@983d7736d9b0ae728b81ab479565c72886d7745b # v5

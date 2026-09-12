@@ -15,12 +15,21 @@ use mono::{
 };
 
 use crate::Error;
+use crate::release_model::artifact_inventory;
 
 pub(crate) const COMPONENT: &str = "release-contract";
 const DEFAULT_DIRECTORY: &str = "dist";
 
 pub(crate) fn run(directory: &Path, verify_only: bool) -> Result<(), Error> {
     let identity = release_identity()?;
+    run_with_identity(directory, verify_only, identity)
+}
+
+pub(crate) fn run_with_identity(
+    directory: &Path,
+    verify_only: bool,
+    identity: ReleaseIdentity,
+) -> Result<(), Error> {
     let tag = identity
         .release_tag
         .as_deref()
@@ -91,12 +100,7 @@ fn annotated_tag_object(tag: &str) -> Result<Option<String>, Error> {
 }
 
 fn expected_inventory(tag: &str) -> Result<PathBuf, Error> {
-    let expected = [
-        format!("mono-{tag}-x86_64-unknown-linux-gnu.tar.gz"),
-        format!("mono-{tag}-aarch64-apple-darwin.tar.gz"),
-        format!("mono-{tag}-x86_64-apple-darwin.tar.gz"),
-        format!("mono-{tag}-x86_64-pc-windows-msvc.zip"),
-    ];
+    let expected = artifact_inventory(tag)?;
     let path = env::temp_dir().join(format!("mono-release-expected-{}", std::process::id()));
     fs::write(&path, expected.join("\n") + "\n").map_err(|error| {
         Error::Command(format!(

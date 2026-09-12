@@ -8,6 +8,7 @@
 mod process;
 mod release;
 mod release_contract;
+mod release_model;
 mod stamp;
 mod tag;
 mod verify;
@@ -29,7 +30,7 @@ const BINARY_DEFAULT: &str = "target/debug/mono";
     name = "xtask",
     version,
     about = "Repository-specific release automation for mono",
-    after_help = "Run `cargo run -p xtask -- release-prepare --tag v0.1.3` for release preparation, or `cargo run -p xtask -- tag --tag v0.1.3` to create and push a release tag."
+    after_help = "Run `cargo run -p xtask -- release-prepare --tag v0.1.5` to validate a release, `cargo run -p xtask -- release-build --target x86_64-unknown-linux-gnu` to build one canonical artifact, or `cargo run -p xtask -- tag --tag v0.1.5` to create and push a release tag."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -61,11 +62,45 @@ enum Command {
         #[arg(long)]
         tag: Option<String>,
     },
+    /// Build one canonical release artifact for a target.
+    ReleaseBuild {
+        /// Rust target from the canonical release target table.
+        #[arg(long)]
+        target: String,
+        /// Release artifact directory.
+        #[arg(long, default_value = "dist")]
+        directory: PathBuf,
+    },
     /// Build the versioned documentation for a release tag.
     ReleaseDocs {
         /// Version to stamp, for example 0.1.5 or v0.1.5. Defaults to RELEASE_TAG.
         #[arg(long)]
         version: Option<String>,
+        /// Release directory holding the SHA256SUMS the installers bake in.
+        #[arg(long, default_value = "dist")]
+        directory: PathBuf,
+    },
+    /// Verify the committed repository release state and target contract.
+    ReleaseCheck,
+    /// Verify every user-visible release version source agrees.
+    ReleaseVersionCheck {
+        /// Binary to query with --version.
+        #[arg(long)]
+        binary: Option<PathBuf>,
+        /// Generated documentation directory.
+        #[arg(long, default_value = "site")]
+        site: PathBuf,
+        /// Generated release notes.
+        #[arg(long, default_value = "RELEASE_NOTES.md")]
+        notes: PathBuf,
+    },
+    /// Validate the published GitHub release and deployed documentation.
+    ReleaseValidatePublished,
+    /// Validate one native platform release artifact.
+    ReleaseValidatePlatform {
+        /// Rust target from the canonical release target table.
+        #[arg(long)]
+        target: String,
     },
     /// Create or finalize the GitHub release from the assembled artifacts.
     ReleasePublish {
@@ -130,7 +165,33 @@ fn main() -> ExitCode {
         Command::ReleasePrepare { tag } => {
             (release::PREPARE_COMPONENT, release_prepare_command(tag))
         }
-        Command::ReleaseDocs { version } => (release::COMPONENT, release_docs_command(version)),
+        Command::ReleaseBuild { target, directory } => (
+            release::BUILD_COMPONENT,
+            release_build_command(target, directory),
+        ),
+        Command::ReleaseDocs { version, directory } => {
+            (release::COMPONENT, release_docs_command(version, directory))
+        }
+        Command::ReleaseCheck => (
+            release::STATE_COMPONENT,
+            release::check(&stamp::repository_root()),
+        ),
+        Command::ReleaseVersionCheck {
+            binary,
+            site,
+            notes,
+        } => (
+            release::CHECK_COMPONENT,
+            release_version_check_command(binary, site, notes),
+        ),
+        Command::ReleaseValidatePublished => (
+            release::VALIDATE_COMPONENT,
+            release_validate_published_command(),
+        ),
+        Command::ReleaseValidatePlatform { target } => (
+            release::VALIDATE_COMPONENT,
+            release_validate_platform_command(target),
+        ),
         Command::ReleasePublish {
             directory,
             notes,
@@ -186,12 +247,43 @@ fn release_prepare_command(tag: Option<String>) -> Result<(), Error> {
     release::prepare(&stamp::repository_root(), &tag, version)
 }
 
-fn release_docs_command(version: Option<String>) -> Result<(), Error> {
+fn release_build_command(target: String, directory: PathBuf) -> Result<(), Error> {
+    release::build(
+        &stamp::repository_root(),
+        &Tag::from_env()?,
+        &target,
+        &directory,
+    )
+}
+
+fn release_docs_command(version: Option<String>, directory: PathBuf) -> Result<(), Error> {
     let version = match version {
         Some(version) => parse_version(&version)?,
         None => Tag::from_env()?.version,
     };
-    release::docs(&stamp::repository_root(), version)
+    release::docs(&stamp::repository_root(), version, &directory)
+}
+
+fn release_version_check_command(
+    binary: Option<PathBuf>,
+    site: PathBuf,
+    notes: PathBuf,
+) -> Result<(), Error> {
+    release::version_check(
+        &stamp::repository_root(),
+        &Tag::from_env()?,
+        binary.as_deref(),
+        &site,
+        &notes,
+    )
+}
+
+fn release_validate_published_command() -> Result<(), Error> {
+    release::validate_published(&stamp::repository_root())
+}
+
+fn release_validate_platform_command(target: String) -> Result<(), Error> {
+    release::validate_platform(&stamp::repository_root(), &target)
 }
 
 fn release_publish_command(

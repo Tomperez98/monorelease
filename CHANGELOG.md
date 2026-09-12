@@ -5,6 +5,15 @@ Notable changes per release, newest first.
 ## 0.1.5
 Released: 2026-09-12
 
+### Features
+
+- Add one-line installers: `install.sh` (Linux and macOS) and `install.ps1`
+  (Windows) resolve the newest release, verify the archive against its published
+  `SHA256SUMS`, and install to `~/.local/bin`.
+- Publish the installers with the release documentation, tagged and digests baked
+  in, so installing a release needs no GitHub API call. Release bodies hand out
+  that copy.
+
 - [#15](https://github.com/Tomperez98/mono/pull/15)
 
   Documentation

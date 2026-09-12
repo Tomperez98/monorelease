@@ -15,6 +15,46 @@ Mono is a task orchestrator, not a package manager or workspace detector. You de
 
 ## Install
 
+### Install script
+
+The script resolves the newest release, checks the archive against the release's
+published `SHA256SUMS`, and installs to `~/.local/bin`.
+
+Linux and macOS:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Tomperez98/mono/main/install.sh | sh
+```
+
+Windows (PowerShell):
+
+```powershell
+irm https://raw.githubusercontent.com/Tomperez98/mono/main/install.ps1 | iex
+```
+
+Pass options after `sh -s --` when the script arrives on stdin:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Tomperez98/mono/main/install.sh | sh -s -- --version v0.1.5
+curl -fsSL https://raw.githubusercontent.com/Tomperez98/mono/main/install.sh | sh -s -- --prefix /usr/local
+```
+
+Remove the binary with `rm ~/.local/bin/mono`, or `Remove-Item` on Windows — see
+[Uninstall](#uninstall).
+
+Each release also publishes a copy of both installers next to its documentation,
+with its tag and its `SHA256SUMS` digests already inside, so that copy resolves
+neither the version nor the checksums at run time:
+
+```bash
+curl -fsSL https://tomperez98.github.io/mono/install.sh | sh
+```
+
+The copy above is the one the release notes hand out. Both copies accept
+`--version`, or `MONO_VERSION` when the script arrives through a pipe, and fall
+back to the GitHub API only for releases they were not built for; the copy on the
+default branch always uses it.
+
 ### Prebuilt binaries
 
 Download the archive for your platform from the [GitHub releases page](https://github.com/Tomperez98/mono/releases), extract `mono`, and put it on your `PATH`.
@@ -35,6 +75,25 @@ From a checkout, with Rust 1.88 or newer:
 ```bash
 cargo install --path .
 ```
+
+### Uninstall
+
+Mono keeps no state outside the project it runs in, so uninstalling is deleting
+the binary the same way you would delete any other executable:
+
+```bash
+rm ~/.local/bin/mono          # install.sh
+cargo uninstall mono          # cargo install
+```
+
+```powershell
+Remove-Item -Force "$HOME\.local\bin\mono.exe"   # install.ps1
+```
+
+The one thing not to delete by hand is a `cargo install`: cargo records what it
+installed, so `cargo uninstall mono` is the spelling that keeps that bookkeeping
+honest. Per-project caches are separate and already scoped — `mono cache clean`
+removes one project's `.mono/` directory, and nothing outside it.
 
 ## Quick start
 
@@ -222,7 +281,7 @@ Mono uses the same provider-neutral release pattern for every project that adopt
 - Release directories contain an explicit, verified artifact inventory and SHA-256 metadata.
 - Publishing remains an ordinary project task or CI step; Mono does not know registries or package managers.
 
-The repository's release files use pinned placeholders for reproducible source releases: the root package in `Cargo.toml`, the `mono` package in `Cargo.lock`, and the displayed Zensical site version are pinned at `0.0.0`. The release workflow stamps all three from the tag with the `xtask` release coordinator before building. The committed files never move. The coordinator also owns release preparation, versioned documentation, draft creation, artifact upload, retry behavior, and final publication.
+The repository's release files use pinned placeholders for reproducible source releases: the root package in `Cargo.toml`, the `mono` package in `Cargo.lock`, and the displayed Zensical site version are pinned at `0.0.0`. The repository-owned `xtask` coordinator stamps them from the tag, builds the four canonical native archives, writes `site/release.json`, verifies every user-visible version, and restores the placeholders. The committed files never move. GitHub Actions only provisions toolchains, moves artifacts, deploys Pages, and invokes the coordinator.
 
 Prepare and review a release from the newest changelog entry:
 

@@ -1,10 +1,10 @@
 //! Create and push the annotated tag that starts the release workflow.
 
+use std::path::Path;
 use std::process::Command;
 
-use mono::Version;
-
-use crate::Error;
+use crate::release_model::release_context;
+use crate::{Error, stamp};
 
 pub(crate) const COMPONENT: &str = "release-tag";
 const REMOTE: &str = "origin";
@@ -16,10 +16,13 @@ const REMOTE: &str = "origin";
 /// the current `HEAD`, and the pushed tag is the immutable release source.
 pub(crate) fn run(tag: &str) -> Result<(), Error> {
     validate_tag(tag)?;
+    let root = stamp::repository_root();
+    let head = git_output(&["rev-parse", "HEAD"])?;
+    let context = release_context(tag, head.clone(), None, None)?;
+    context.validate_changelog(Path::new(&root))?;
 
     let action = match local_tag_commit(tag)? {
         Some(tag_commit) => {
-            let head = git_output(&["rev-parse", "HEAD"])?;
             if tag_commit != head {
                 return Err(Error::Invalid(format!(
                     "release tag {tag} already points at {tag_commit}, not HEAD {head}"
@@ -56,17 +59,7 @@ fn local_tag_commit(tag: &str) -> Result<Option<String>, Error> {
 }
 
 fn validate_tag(tag: &str) -> Result<(), Error> {
-    let version = tag.strip_prefix('v').ok_or_else(|| invalid_tag(tag))?;
-    if Version::parse(version).is_none() {
-        return Err(invalid_tag(tag));
-    }
-    Ok(())
-}
-
-fn invalid_tag(tag: &str) -> Error {
-    Error::Invalid(format!(
-        "release tag must match `v<major>.<minor>.<patch>`, got `{tag}`"
-    ))
+    crate::release_model::parse_tag(tag).map(|_| ())
 }
 
 fn run_git(args: &[&str]) -> Result<(), Error> {

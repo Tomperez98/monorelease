@@ -61,8 +61,18 @@ pub(crate) fn apply(root: &Path, version: Version) -> Result<(), Error> {
     // Only touch the working tree once every file has stamped successfully, so a
     // failure cannot leave one manifest rewritten and the other untouched.
     for (path, original, stamped) in staged {
-        write(&backup_path(&path), &original)?;
-        write(&path, &stamped)?;
+        if let Err(error) =
+            write(&backup_path(&path), &original).and_then(|()| write(&path, &stamped))
+        {
+            let rollback = restore_backups(root);
+            return if let Err(rollback) = rollback {
+                Err(Error::Invalid(format!(
+                    "stamping failed: {error}; rollback also failed: {rollback}"
+                )))
+            } else {
+                Err(error)
+            };
+        }
     }
 
     println!(
@@ -76,19 +86,17 @@ pub(crate) fn apply(root: &Path, version: Version) -> Result<(), Error> {
 /// Missing backups are not an error: a fresh checkout has nothing to restore,
 /// and a release build that never stamped is already in the pinned state.
 pub(crate) fn restore(root: &Path) -> Result<(), Error> {
-    let mut restored = Vec::new();
-    for (relative, _) in targets() {
-        let path = root.join(relative);
-        let backup = backup_path(&path);
-        if !backup.exists() {
-            continue;
-        }
-        fs::rename(&backup, &path).map_err(|source| Error::Io {
-            path: path.clone(),
-            source,
-        })?;
-        restored.push(relative);
+    let backups = targets()
+        .iter()
+        .filter(|(relative, _)| backup_path(&root.join(relative)).exists())
+        .count();
+    if backups != 0 && backups != targets().len() {
+        return Err(Error::Invalid(format!(
+            "incomplete stamp state: found {backups} of {} backups; refusing partial restore",
+            targets().len()
+        )));
     }
+    let restored = restore_backups(root)?;
 
     if restored.is_empty() {
         println!("{COMPONENT}: no backups found; placeholders are already in place");
@@ -96,6 +104,34 @@ pub(crate) fn restore(root: &Path) -> Result<(), Error> {
         println!("{COMPONENT}: restored {} from backup", restored.join(", "));
     }
     Ok(())
+}
+
+fn restore_file(backup: &Path, path: &Path) -> Result<(), Error> {
+    #[cfg(windows)]
+    if path.exists() {
+        fs::remove_file(path).map_err(|source| Error::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    }
+    fs::rename(backup, path).map_err(|source| Error::Io {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+fn restore_backups(root: &Path) -> Result<Vec<&'static str>, Error> {
+    let mut restored = Vec::new();
+    for (relative, _) in targets() {
+        let path = root.join(relative);
+        let backup = backup_path(&path);
+        if !backup.exists() {
+            continue;
+        }
+        restore_file(&backup, &path)?;
+        restored.push(relative);
+    }
+    Ok(restored)
 }
 
 /// The repository root, independent of the caller's working directory.
