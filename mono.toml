@@ -1,11 +1,9 @@
-schema = 1
-
 [project]
 name = "mono"
 default_pipeline = "ci"
 
 [pipelines.ci]
-tasks = ["changelog-validate", "fmt", "check", "test", "clippy"]
+tasks = ["changelog-validate", "fmt", "check", "test", "clippy", "check-docs"]
 
 [pipelines.release]
 tasks = ["release-verify"]
@@ -21,6 +19,10 @@ timeout_seconds = 30
 [tasks.check]
 command = ["cargo", "check", "--workspace", "--all-targets", "--all-features"]
 depends_on = ["fmt"]
+timeout_seconds = 120
+
+[tasks.check-docs]
+command = ["zensical", "build"]
 timeout_seconds = 120
 
 [tasks.test]

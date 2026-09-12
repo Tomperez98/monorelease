@@ -1,33 +1,58 @@
 # mono
 
-Run a project's commands in dependency order, from one root `mono.toml` — in any language.
+Run a project's build, test, lint, and release commands from one root `mono.toml`—in dependency order, in any language.
 
-`mono` does not detect languages, frameworks, package managers, or project conventions. A task is an argv array executed directly. The only project model is a root manifest containing a task graph.
+[![Mono running the ci pipeline in the interactive task view](https://asciinema.org/a/5JVHsZ7ruT557Qpu.svg)](https://asciinema.org/a/5JVHsZ7ruT557Qpu)
 
 ```console
 $ mono plan
 project mono (/repo/mono)
-would run fmt in /repo/mono: cargo fmt --check [timeout=30s]
-would run check in /repo/mono: cargo check --workspace ... [timeout=120s]
+would run fmt in /repo/mono: cargo fmt --check [timeout=30s] [max_output_bytes=16777216]
+would run check in /repo/mono: cargo check --workspace ... [timeout=120s] [max_output_bytes=16777216]
 ```
 
+Mono is a task orchestrator, not a package manager or workspace detector. You describe the commands and their dependencies; Mono validates the graph, runs independent tasks concurrently, and gives humans and CI the same execution contract.
+
 ## Install
+
+### Prebuilt binaries
+
+Download the archive for your platform from the [GitHub releases page](https://github.com/Tomperez98/mono/releases), extract `mono`, and put it on your `PATH`.
+
+| Platform | Archive suffix |
+| --- | --- |
+| Linux x86_64 | `x86_64-unknown-linux-gnu.tar.gz` |
+| macOS arm64 | `aarch64-apple-darwin.tar.gz` |
+| macOS x86_64 | `x86_64-apple-darwin.tar.gz` |
+| Windows x86_64 | `x86_64-pc-windows-msvc.zip` |
+
+Archives are named `mono-v<version>-<platform>.<format>`.
+
+### Build from source
+
+From a checkout, with Rust 1.88 or newer:
 
 ```bash
 cargo install --path .
 ```
 
-Prebuilt binaries for Linux x86_64, macOS arm64, macOS x86_64, and Windows x86_64 are attached to each [GitHub release](https://github.com/Tomperez98/mono/releases).
-
 ## Quick start
 
-Create one root manifest:
+This repository is itself configured with Mono. From a checkout, inspect the dependency-first plan and run the CI pipeline:
+
+```bash
+cargo install --path .
+mono plan
+mono run ci --ui stream
+```
+
+To add Mono to another repository, create a starter manifest at its root:
 
 ```bash
 mono init
 ```
 
-The generated file is valid immediately and can be edited into the commands your project needs:
+Then replace the generated placeholder task with the commands your project needs. For example, this is a complete pipeline for a Rust project:
 
 ```toml
 schema = 1
@@ -37,82 +62,33 @@ name = "my-project"
 default_pipeline = "ci"
 
 [pipelines.ci]
-tasks = ["build", "test"]
+tasks = ["build", "test", "lint"]
 
 [tasks.build]
-command = ["tool", "build"]
+command = ["cargo", "build", "--workspace"]
 
 [tasks.test]
-command = ["tool", "test"]
+command = ["cargo", "test", "--workspace"]
 depends_on = ["build"]
+
+[tasks.lint]
+command = ["cargo", "clippy", "--workspace", "--", "-D", "warnings"]
+depends_on = ["test"]
 ```
 
-Every task is root-scoped. Use `cwd` when a command belongs to a subdirectory:
-
-```toml
-[tasks.api-test]
-cwd = "services/api"
-command = ["go", "test", "./..."]
-```
-
-There are no package manifests, member globs, standalone mode, package selection, or language-specific task types. A repository with one directory and a repository with one hundred directories use the same model.
-
-Commands can be run from nested directories. `mono` walks upward from `--dir` until it finds the project root manifest:
+Validate the manifest, preview the plan, then run it:
 
 ```bash
-mono --dir services/api task api-test
+mono check
+mono plan
+mono run
 ```
 
-## Commands
+The same model works for Go, Python, JavaScript, Zig, or a repository that mixes languages. Commands are argv arrays, so Mono does not insert a shell or reinterpret arguments.
 
-| Command | What it does |
-| --- | --- |
-| `mono` | Run the default pipeline. |
-| `mono run [PIPELINE]` | Run a named pipeline. `ci` is an alias. |
-| `mono task TASK...` | Run one or more tasks and dependencies. |
-| `mono check` | Validate the root manifest and complete task graph. |
-| `mono list` | List pipelines and tasks. |
-| `mono plan [PIPELINE]` | Print the dependency-first execution plan. |
-| `mono graph [PIPELINE]` | Print task dependency edges. |
-| `mono cache clean` | Delete local cache entries. |
-| `mono changelog ...` | Apply Mono's documented changelog conventions. |
-| `mono release ...` | Create or verify provider-neutral artifact metadata. |
+## The manifest model
 
-Commands accept `--output text|json`. Execution commands also accept
-`--ui auto|tui|stream`:
-
-- `auto` (the default) uses the interactive task UI on a terminal and
-  task-prefixed streaming output in pipes and CI.
-- `tui` explicitly requests the interactive task list and per-task log view;
-  it falls back to streaming output when no interactive terminal is available.
-- `stream` writes task-prefixed lines as they arrive, so concurrent output
-  remains attributable to its task.
-
-`json` is a versioned, newline-delimited machine contract and never starts the
-TUI. Human stream output buffers partial lines until a newline or task
-completion, then prefixes each line with its task id. `run` and `task`
-additionally emit execution lifecycle events (`run_started`, `task_started`,
-`task_output`, `task_finished`, and `run_finished`). `plan`, `graph`, `list`,
-and `check` return one JSON document with `schema = 1` and a command-specific
-`kind`. Failures in JSON mode are emitted as
-`{"schema":1,"kind":"error",...}` and retain the same process exit code as
-text mode. Environment values are never included in plan or list output; only
-configured variable names are reported.
-
-`run` and `task` support:
-
-| Flag | Effect |
-| --- | --- |
-| `--jobs N` | Maximum independent tasks to execute concurrently. |
-| `--dry-run` | Resolve and print the plan without running commands. |
-| `--no-cache` | Skip cache reads and writes. |
-| `--force` | Ignore cache hits and refresh successful entries. |
-| `--output text\|json` | Select the human or machine output contract. |
-| `--ui auto\|tui\|stream` | Select the execution presentation for human output. |
-
-## Manifest model
-
-The manifest schema remains `1`; the root-only model is a deliberate breaking change while Mono is pre-1.0.
+A project has one root `mono.toml`. The manifest contains named pipelines and a global task graph:
 
 ```toml
 schema = 1
@@ -134,22 +110,21 @@ command = ["formatter", "check"]
 [tasks.test]
 command = ["test-runner"]
 depends_on = ["fmt"]
-resource_group = "checks"
 timeout_seconds = 900
 retries = 1
 retry_backoff_seconds = 5
 
 [tasks.release-verify]
 command = ["./automation/release-verify"]
-depends_on = ["test"]
 cwd = "automation"
+depends_on = ["test"]
 
 [tasks.release-cleanup]
 command = ["./automation/release-cleanup"]
 cwd = "automation"
 ```
 
-Task fields:
+### Tasks
 
 | Field | Default | Meaning |
 | --- | --- | --- |
@@ -157,7 +132,7 @@ Task fields:
 | `depends_on` | `[]` | Global task IDs that must complete first. |
 | `cwd` | project root | Existing directory inside the project root. |
 | `env` | `{}` | Extra child-process environment. |
-| `stdin` | `null` | Use `inherit` to pass the parent process's standard input through. |
+| `stdin` | `null` | Use `inherit` to pass the parent's standard input through. |
 | `cache` | `false` | Allow successful results to be reused. |
 | `inputs` | `[]` | Relative patterns included in the cache fingerprint. |
 | `outputs` | `[]` | Relative files copied into and restored from the cache. |
@@ -169,33 +144,81 @@ Task fields:
 | `retry_backoff_seconds` | `0` | Delay between attempts. |
 | `matrix.<name>` | unset | Opaque dimensions expanded into task instances. |
 
-`outputs` are cache outputs. They are not release artifacts. Release files are intentionally handled by the separate `mono release manifest` and `mono release verify` commands, which inventory an explicit directory and generate `BUILD-METADATA.json` and `SHA256SUMS`.
+`outputs` are cache outputs, not release artifacts. Release files are handled by
+`mono release manifest` and `mono release verify`, which inventory an explicit
+directory and generate `BUILD-METADATA.json` and `SHA256SUMS`.
 
-## Execution behavior
+Every task is root-scoped. Set `cwd` when a command belongs to a subdirectory:
 
-- Plans are validated before any task starts: unknown tasks, cycles, invalid paths, bad matrix references, and invalid task configuration fail early.
-- Independent tasks overlap up to `--jobs`; resource groups add explicit serialization only where required.
-- A normal task failure stops new normal work. In-flight tasks finish, then pipeline finalizers run as cleanup work.
-- Finalizers are not cacheable because a cache hit must not skip cleanup side effects.
-- Timeouts terminate the complete child process tree using Unix process groups or Windows Job Objects.
-- Human execution uses the TUI on interactive terminals and task-prefixed stream output elsewhere. Partial output lines are flushed with their task prefix when a task completes. JSON output is newline-delimited and preserves non-UTF-8 task output as byte arrays.
-- Ctrl-C cancels running normal tasks, terminates their process trees, and still permits finalizer tasks to run.
-- Direct execution never changes Mono's process-global working directory.
+```toml
+[tasks.api-test]
+cwd = "services/api"
+command = ["go", "test", "./..."]
+```
+
+From a nested directory, Mono walks upward from `--dir` until it finds the root manifest:
+
+```bash
+mono --dir services/api task api-test
+```
+
+There are no package manifests, member globs, standalone mode, package selection, or language-specific task types. A repository with one directory and a repository with one hundred directories use the same model.
+
+## Commands
+
+| Command | What it does |
+| --- | --- |
+| `mono` | Run the default pipeline. Accepts the global flags only; use `mono run` for the execution flags. |
+| `mono run [PIPELINE]` | Run a named pipeline, or the default pipeline when `PIPELINE` is omitted. `ci` is the conventional CI pipeline name. |
+| `mono task TASK...` | Run specific tasks and their dependencies, skipping the rest of the pipeline. |
+| `mono check` | Validate `mono.toml` and the complete task graph. Also available as `mono doctor`. |
+| `mono list` | List this project's pipelines, tasks, and suggested commands. |
+| `mono plan [PIPELINE]` | Print the dependency-first execution plan without running anything. |
+| `mono graph [PIPELINE]` | Print task dependency edges. |
+| `mono cache clean` | Delete local cache entries. |
+| `mono changelog ...` | Apply Mono's documented changelog conventions. |
+| `mono release ...` | Create or verify provider-neutral release metadata. |
+
+Run `mono --help` or `mono help <command>` for the complete option list.
+
+## Execution and CI
+
+Independent tasks run concurrently up to `--jobs` (the default is the number of CPUs available to the process). Use `resource_group` when tasks share an external resource that must be serialized.
+
+`run` and `task` support:
+
+| Flag | Effect |
+| --- | --- |
+| `--jobs N` | Maximum number of independent tasks to execute concurrently. |
+| `--dry-run` | Resolve and print the plan without running commands. |
+| `--no-cache` | Skip cache reads and writes. Conflicts with `--force`. |
+| `--force` | Ignore cache hits and refresh successful entries. Conflicts with `--no-cache`. |
+| `--output text\|json` | Select the human or machine output contract. |
+| `--ui auto\|tui\|stream` | Select the human execution presentation; bare `mono` accepts it too. |
+
+`mono` with no command runs the default pipeline but accepts the global flags only. Use `mono plan` to preview it, or `mono run` to run it with the execution flags.
+
+`--ui auto` uses the interactive task UI on a terminal and task-prefixed streaming output in pipes and CI. `--ui tui` currently resolves the same way, so the full-screen view is used only when a terminal is attached; pass `--ui stream` for predictable task-prefixed lines anywhere. Use `--output json` for a versioned newline-delimited machine contract; it never starts the TUI.
+
+JSON execution emits `run_started`, `task_started`, `task_output`, `task_finished`, and `run_finished` events. `plan`, `graph`, `list`, and `check` emit one JSON document with `schema = 1` and a command-specific `kind`. Environment values are never included in plan or list output; only configured variable names are reported.
+
+Mono validates the complete plan before starting work. Unknown tasks, cycles, invalid paths, bad matrix references, and invalid task configuration fail early. A normal task failure stops new normal work; in-flight tasks finish, then pipeline finalizers run as cleanup work. Finalizers are not cacheable because a cache hit must not skip cleanup side effects.
+
+Timeouts terminate the complete child process tree using Unix process groups or Windows Job Objects. Ctrl-C cancels normal tasks, terminates their process trees, and still permits finalizers to run. Direct execution never changes Mono's process-global working directory.
 
 ## Release conventions
 
-Mono is intentionally opinionated about release process. Every Mono project gets the same TigerBeetle-inspired changelog and release pattern:
+Mono uses the same provider-neutral release pattern for every project that adopts its release commands:
 
 - `CHANGELOG.md` is Markdown.
 - The newest heading is `## (unreleased)` or `## X.Y.Z`.
 - Version entries contain `Released: YYYY-MM-DD`.
-- Release tags are `vX.Y.Z`.
-- The tag must resolve to the checked-out source commit.
+- Release tags are `vX.Y.Z` and must resolve to the checked-out source commit.
 - The matching changelog entry becomes `RELEASE_NOTES.md`.
 - Release directories contain an explicit, verified artifact inventory and SHA-256 metadata.
 - Publishing remains an ordinary project task or CI step; Mono does not know registries or package managers.
 
-These are release conventions, not language or framework conventions.
+The repository's release files use pinned placeholders for reproducible source releases: the root package in `Cargo.toml`, the `mono` package in `Cargo.lock`, and the displayed Zensical site version are pinned at `0.0.0`. The release workflow stamps all three from the tag with the `xtask` release coordinator before building. The committed files never move. The coordinator also owns release preparation, versioned documentation, draft creation, artifact upload, retry behavior, and final publication.
 
 To create and push an annotated release tag—the tag push starts the GitHub release workflow:
 
@@ -203,7 +226,14 @@ To create and push an annotated release tag—the tag push starts the GitHub rel
 cargo run -p xtask -- tag --tag v0.1.3
 ```
 
-Mono does not publish to npm, Cargo, Maven, PyPI, Docker, or any other registry. Those operations remain ordinary tasks or CI workflow steps, preserving the language-agnostic execution kernel.
+The tag is the only version input. To stamp a checkout manually:
+
+```console
+cargo run -p xtask -- release-stamp --version 0.1.5
+cargo run -p xtask -- release-stamp --restore
+```
+
+`release-stamp` saves `.backup` copies while stamping. The release coordinator uses it around preparation and documentation builds, while each native build job stamps its own throwaway checkout. The committed placeholders remain unchanged. Mono does not publish to npm, Cargo, Maven, PyPI, or Docker; those operations remain ordinary tasks or CI workflow steps.
 
 ## Exit codes
 
@@ -216,10 +246,18 @@ Mono does not publish to npm, Cargo, Maven, PyPI, Docker, or any other registry.
 
 ## Development
 
+Run the repository's complete CI pipeline with:
+
 ```bash
 cargo fmt --check
 cargo test --workspace --all-targets --all-features
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo package --locked
 mono check
+```
+
+Or use the checked-in pipeline to run the same dependency-ordered workflow:
+
+```bash
+mono run ci --ui stream
 ```

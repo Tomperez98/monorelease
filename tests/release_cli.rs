@@ -57,14 +57,7 @@ fn release_commands_create_and_verify_file_artifacts() {
 
     let manifest = mono(
         &[
-            "release",
-            "manifest",
-            "--directory",
-            "dist",
-            "--tag",
-            "v1.0.0",
-            "--commit",
-            "abc123",
+            "release", "manifest", "--dist", "dist", "--tag", "v1.0.0", "--commit", "abc123",
         ],
         temp.path(),
     );
@@ -74,14 +67,7 @@ fn release_commands_create_and_verify_file_artifacts() {
 
     let verify = mono(
         &[
-            "release",
-            "verify",
-            "--directory",
-            "dist",
-            "--tag",
-            "v1.0.0",
-            "--commit",
-            "abc123",
+            "release", "verify", "--dist", "dist", "--tag", "v1.0.0", "--commit", "abc123",
         ],
         temp.path(),
     );
@@ -103,7 +89,7 @@ fn release_commands_enforce_an_expected_artifact_inventory() {
         &[
             "release",
             "manifest",
-            "--directory",
+            "--dist",
             "dist",
             "--expected",
             "expected.txt",
@@ -122,7 +108,7 @@ fn release_commands_enforce_an_expected_artifact_inventory() {
         &[
             "release",
             "manifest",
-            "--directory",
+            "--dist",
             "dist",
             "--expected",
             "expected.txt",
@@ -140,7 +126,7 @@ fn release_commands_enforce_an_expected_artifact_inventory() {
         &[
             "release",
             "verify",
-            "--directory",
+            "--dist",
             "dist",
             "--expected",
             "expected.txt",
@@ -162,14 +148,7 @@ fn a_lightweight_tag_records_no_tag_object() {
     fs::write(temp.path().join("dist/artifact.tar.gz"), b"artifact").unwrap();
 
     let manifest = mono_with_env(
-        &[
-            "release",
-            "manifest",
-            "--directory",
-            "dist",
-            "--tag",
-            "v1.0.0",
-        ],
+        &["release", "manifest", "--dist", "dist", "--tag", "v1.0.0"],
         temp.path(),
         &[("RELEASE_TAG_OBJECT", "")],
     );
@@ -190,7 +169,7 @@ fn a_lightweight_tag_records_no_tag_object() {
         &[
             "release",
             "verify",
-            "--directory",
+            "--dist",
             "dist",
             "--tag",
             "v1.0.0",
@@ -216,7 +195,7 @@ fn an_annotated_tag_object_round_trips_through_the_cli() {
         &[
             "release",
             "manifest",
-            "--directory",
+            "--dist",
             "dist",
             "--tag",
             "v1.0.0",
@@ -231,7 +210,7 @@ fn an_annotated_tag_object_round_trips_through_the_cli() {
         &[
             "release",
             "verify",
-            "--directory",
+            "--dist",
             "dist",
             "--tag",
             "v1.0.0",

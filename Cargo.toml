@@ -1,6 +1,9 @@
 [package]
 name = "mono"
-version = "0.1.4"
+# Pinned placeholder. The release workflow rewrites this (and the matching
+# `Cargo.lock` entry) from the release tag with `xtask release-stamp`, so the
+# committed version never drifts. See README "Release conventions".
+version = "0.0.0"
 edition = "2024"
 rust-version = "1.88"
 description = "Manifest-driven project command orchestration"

@@ -6,9 +6,12 @@ on:
     workflows: [Release]
     types: [completed]
   schedule:
-    # Frequent validation catches upstream drift in runners, hashing tools, and
-    # the release page without waiting for the next release.
+    # Two cadences: the four-hourly run catches upstream drift in runners, hashing
+    # tools, and the release page, and is cheap because it only re-checks the
+    # published contract. The platform artifacts cannot change without a new
+    # release, so the four-OS matrix runs weekly behind `github.event.schedule`.
     - cron: '0 */6 * * *'
+    - cron: '0 3 * * 0'
 
 permissions:
   contents: read
@@ -139,6 +142,21 @@ jobs:
           RELEASE_TAG: ${{ steps.release.outputs.tag }}
         run: cargo run --locked --quiet -p xtask -- release-contract --directory dist --verify-only
 
+      # Rebuilds from pinned manifests must be stamped exactly as `release.yml`
+      # stamped them, or the `cmp` below would only be comparing version strings.
+      - name: Stamp pinned manifests with the release version
+        if: ${{ steps.release.outputs.exists == 'true' && hashFiles('xtask/Cargo.toml') != '' }}
+        env:
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+        shell: bash
+        run: |
+          cargo run --locked --quiet -p xtask -- release-stamp --version "${RELEASE_TAG#v}"
+          zensical_version="$(sed -n 's/^site_name = "Mono v\([^\"]*\)"$/\1/p' zensical.toml)"
+          test "${RELEASE_TAG#v}" = "$zensical_version" || {
+            echo "Zensical version is $zensical_version, expected ${RELEASE_TAG#v}" >&2
+            exit 1
+          }
+
       - name: Rebuild released Linux binary
         if: ${{ steps.release.outputs.exists == 'true' && hashFiles('xtask/Cargo.toml') != '' }}
         run: cargo build --locked --release --target x86_64-unknown-linux-gnu
@@ -153,15 +171,24 @@ jobs:
             exit 1
           }
 
-      - name: Verify Linux artifact provenance
+      # Every published subject, not just the Linux archive: provenance is
+      # per-digest, so verifying one artifact says nothing about the other three.
+      - name: Verify artifact provenance
         if: ${{ steps.release.outputs.exists == 'true' && steps.metadata.outputs.schema != 'none' }}
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
-          archive="$(find dist -maxdepth 1 -type f -name '*x86_64-unknown-linux-gnu.tar.gz' -print -quit)"
-          test -n "$archive"
-          gh attestation verify "$archive" --repo "$GITHUB_REPOSITORY"
+          shopt -s nullglob
+          artifacts=( dist/mono-* )
+          test "${#artifacts[@]}" -gt 0 || {
+            echo 'no release artifacts were downloaded' >&2
+            exit 1
+          }
+          for artifact in "${artifacts[@]}"; do
+            echo "verifying provenance of $artifact"
+            gh attestation verify "$artifact" --repo "$GITHUB_REPOSITORY"
+          done
 
       - name: Run the release pipeline with the published binary
         if: ${{ steps.release.outputs.exists == 'true' && hashFiles('xtask/Cargo.toml') != '' }}
@@ -181,7 +208,9 @@ jobs:
 
   validate_platform:
     name: Validate ${{ matrix.target }} artifact
-    if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
+    # Scheduled runs only exercise the matrix on the weekly cadence; a release
+    # event always validates every platform.
+    if: ${{ (github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success') && (github.event_name != 'schedule' || github.event.schedule == '0 3 * * 0') }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 10
     permissions:

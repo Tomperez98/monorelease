@@ -31,21 +31,52 @@ use mono::{
     release_manifest, release_source, release_verify,
 };
 
+/// One-line value proposition: the reader's task, in the README's words.
+const ABOUT: &str =
+    "Run a project's build, test, lint, and release commands from one root mono.toml";
+
+/// What `--help` adds beyond `-h`: what mono is, and what it deliberately is not.
+const LONG_ABOUT: &str = "Mono is a task orchestrator, not a package manager or workspace \
+detector. You declare the commands and their dependencies; Mono validates the graph, runs \
+independent tasks concurrently, and gives local development and CI the same execution contract.";
+
+/// The screen every reader sees first. It carries the two things `--help` would
+/// otherwise lose — the exit-code contract and commands that actually run — and
+/// deliberately repeats no part of the option list. Written flush left because a
+/// string literal's own indentation is what the reader ends up looking at.
+const AFTER_HELP: &str = "\
+Exit codes:
+  0  success
+  1  the command was understood and failed (red pipeline, invalid manifest)
+  2  the command line was malformed
+  3  mono or its environment failed (unreadable manifest, git unavailable)
+
+Examples:
+  mono init        write a starter mono.toml in this directory
+  mono list        see what this project can run
+  mono plan        see what the default pipeline would do, running nothing
+  mono run ci      run the ci pipeline
+  mono task test   run one task and its dependencies, skipping the rest
+
+With no command, mono runs the project's default pipeline.
+Run `mono help <command>` for command details.";
+
 #[derive(Parser)]
 #[command(
     name = "mono",
     version = env!("CARGO_PKG_VERSION"),
-    about = "Language-agnostic root-project tooling",
-    after_help = "Run `mono help <command>` for command details."
+    about = ABOUT,
+    long_about = LONG_ABOUT,
+    after_help = AFTER_HELP
 )]
 struct Cli {
-    /// Project directory or a path nested inside one.
+    /// Directory to search from; mono walks up to the nearest mono.toml.
     #[arg(long = "dir", global = true, default_value = ".")]
     root: PathBuf,
     /// Output contract for command summaries and execution events.
     #[arg(long, global = true, value_enum, default_value_t = OutputFormat::Text)]
     output: OutputFormat,
-    /// Human task presentation for run and task commands.
+    /// Task presentation for bare `mono`, `run`, and `task`; a no-op elsewhere.
     #[arg(long, global = true, value_enum, default_value_t = UiFormat::Auto)]
     ui: UiFormat,
     #[command(subcommand)]
@@ -54,18 +85,23 @@ struct Cli {
 
 #[derive(Clone, Copy, ValueEnum)]
 enum OutputFormat {
+    /// Human-readable summaries and live task output
     #[value(name = "text")]
     Text,
+    /// Newline-delimited JSON, one document per summary or execution event
     #[value(name = "json")]
     Json,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
 enum UiFormat {
+    /// Full-screen task view when a terminal is attached; prefixed lines otherwise
     #[value(name = "auto")]
     Auto,
+    /// Full-screen task view; prefixed lines when no terminal is attached
     #[value(name = "tui")]
     Tui,
+    /// One prefixed line at a time, without a terminal
     #[value(name = "stream")]
     Stream,
 }
@@ -79,17 +115,21 @@ impl From<OutputFormat> for OutputMode {
     }
 }
 
+/// Flags that shape an execution, grouped under their own `--help` heading so
+/// they never interleave with the global flags shared by every subcommand.
 #[derive(Args)]
+#[command(next_help_heading = "Execution options")]
 struct ExecutionOptions {
+    /// Print the resolved plan and run no commands
     #[arg(long)]
     dry_run: bool,
-    /// Skip reading and writing the local task cache.
+    /// Skip reading and writing the local task cache (conflicts with --force)
     #[arg(long, conflicts_with = "force")]
     no_cache: bool,
-    /// Ignore cache hits and refresh successful cache entries.
+    /// Ignore cache hits and refresh successful cache entries (conflicts with --no-cache)
     #[arg(long, conflicts_with = "no_cache")]
     force: bool,
-    /// Maximum number of independent tasks to execute concurrently.
+    /// Maximum number of independent tasks to execute concurrently
     #[arg(long, default_value_t = default_jobs(), value_parser = parse_jobs)]
     jobs: usize,
 }
@@ -109,11 +149,18 @@ impl Default for ExecutionOptions {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Write a fresh manifest in the selected directory.
+    /// Write a starter mono.toml in the selected directory; refuses to overwrite one
     Init,
-    /// Run a named pipeline, or the default pipeline when omitted.
-    #[command(alias = "ci")]
+    /// Run a named pipeline, or the project's default pipeline
+    #[command(
+        alias = "ci",
+        long_about = "Run a named pipeline end to end: every task it lists, in dependency order.\n\
+\n\
+With no PIPELINE, runs the project's `default_pipeline`. This is what a bare `mono` does.",
+        after_help = "Example: mono run ci --ui stream"
+    )]
     Run {
+        /// Pipeline to run; defaults to the manifest's `default_pipeline`
         #[arg(value_name = "PIPELINE", value_parser = NonEmptyStringValueParser::new())]
         pipeline: Option<String>,
         /// Compatibility spelling for task selection; prefer `mono task`.
@@ -122,8 +169,16 @@ enum Commands {
         #[command(flatten)]
         options: ExecutionOptions,
     },
-    /// Run one or more tasks and their dependencies.
+    /// Run specific tasks and their dependencies, skipping the rest
+    #[command(
+        long_about = "Run one or more tasks, plus everything they depend on, without running the \
+rest of the pipeline. Use this to re-run one step of a pipeline.\n\
+\n\
+Matrix tasks are addressed as `name[dimension=value]`.",
+        after_help = "Example: mono task 'build[os=linux]'"
+    )]
     Task {
+        /// Task names to run, with their dependencies
         #[arg(
             required = true,
             value_name = "TASK",
@@ -133,18 +188,24 @@ enum Commands {
         #[command(flatten)]
         options: ExecutionOptions,
     },
-    /// Validate the selected root project.
-    #[command(alias = "doctor")]
+    /// Validate mono.toml and the complete task graph
+    #[command(
+        alias = "doctor",
+        long_about = "Validate mono.toml and the complete task graph before anything runs. This is \
+the check `mono` performs before every execution.\n\nAlso available as `mono doctor`."
+    )]
     Check,
-    /// List pipelines, tasks, and common commands.
+    /// List this project's pipelines, tasks, and suggested commands
     List,
-    /// Print the resolved plan for the default or named pipeline.
+    /// Print the resolved plan for the default or named pipeline
     Plan {
+        /// Pipeline to resolve; defaults to the manifest's `default_pipeline`
         #[arg(value_name = "PIPELINE", value_parser = NonEmptyStringValueParser::new())]
         pipeline: Option<String>,
     },
-    /// Print dependency edges for the default or named pipeline.
+    /// Print dependency edges for the default or named pipeline
     Graph {
+        /// Pipeline to graph; defaults to the manifest's `default_pipeline`
         #[arg(value_name = "PIPELINE", value_parser = NonEmptyStringValueParser::new())]
         pipeline: Option<String>,
     },
@@ -175,6 +236,7 @@ enum CacheCommands {
 enum ChangelogCommands {
     /// Validate a changelog file.
     Validate {
+        /// Changelog file to validate
         #[arg(long, default_value = DEFAULT_CHANGELOG_PATH)]
         file: PathBuf,
     },
@@ -188,6 +250,7 @@ enum ChangelogCommands {
             value_parser = NonEmptyStringValueParser::new()
         )]
         version: String,
+        /// Changelog file to edit
         #[arg(long, default_value = DEFAULT_CHANGELOG_PATH)]
         file: PathBuf,
     },
@@ -201,8 +264,10 @@ enum ChangelogCommands {
             value_parser = NonEmptyStringValueParser::new()
         )]
         version: String,
+        /// Changelog file to read
         #[arg(long, default_value = DEFAULT_CHANGELOG_PATH)]
         file: PathBuf,
+        /// File to write the extracted notes to
         #[arg(
             long = "output-file",
             alias = "notes-output",
@@ -216,17 +281,23 @@ enum ChangelogCommands {
 /// the matching environment variable is set. `clap` reads the environment, so
 /// [`ReleaseIdentityOptions::resolve`] is a pure transformation.
 #[derive(Args, Default)]
+#[command(next_help_heading = "Release identity")]
 struct ReleaseIdentityOptions {
+    /// Release tag to record, or the `RELEASE_TAG` environment variable
     #[arg(long, env = "RELEASE_TAG")]
     tag: Option<String>,
+    /// Commit the tag points at, or the `GITHUB_SHA` environment variable
     #[arg(long, env = "GITHUB_SHA")]
     commit: Option<String>,
+    /// Repository the release belongs to, or the `GITHUB_REPOSITORY` environment variable
     #[arg(long, env = "GITHUB_REPOSITORY")]
     repository: Option<String>,
-    /// Annotated tag object, absent for a lightweight tag. CI exports the empty
-    /// string for a lightweight tag, so [`resolve`](Self::resolve) drops it.
+    // An annotated tag has one object and a lightweight tag has none. CI exports the
+    // empty string for a lightweight tag, so `resolve` drops a set-but-empty value.
+    /// Annotated tag object; empty for a lightweight tag
     #[arg(long = "tag-object", env = "RELEASE_TAG_OBJECT")]
     tag_object: Option<String>,
+    /// URL of the workflow run that produced the release, or the `GITHUB_RUN_URL` variable
     #[arg(long = "workflow-run", env = "GITHUB_RUN_URL")]
     workflow_run: Option<String>,
 }
@@ -252,6 +323,7 @@ fn non_empty(value: Option<String>) -> Option<String> {
 
 /// Identity for `release source`, where a tag and commit are mandatory.
 #[derive(Args)]
+#[command(next_help_heading = "Release identity")]
 struct SourceIdentityOptions {
     /// Git tag to verify, or the `RELEASE_TAG` environment variable.
     #[arg(
@@ -278,22 +350,22 @@ enum ReleaseCommands {
         #[command(flatten)]
         identity: SourceIdentityOptions,
     },
-    /// Generate BUILD-METADATA.json and SHA256SUMS.
+    /// Generate BUILD-METADATA.json and SHA256SUMS
     Manifest {
-        /// Directory the release metadata is written to, below the root.
-        #[arg(long, default_value = DEFAULT_RELEASE_DIRECTORY)]
-        directory: PathBuf,
-        /// File containing one expected artifact path per line.
+        /// Release directory to write the metadata into, below the root
+        #[arg(long = "dist", alias = "directory", default_value = DEFAULT_RELEASE_DIRECTORY)]
+        dist: PathBuf,
+        /// File containing one expected artifact path per line
         #[arg(long)]
         expected: Option<PathBuf>,
         #[command(flatten)]
         identity: ReleaseIdentityOptions,
     },
-    /// Verify release metadata, checksums, and exact artifact inventory.
+    /// Verify release metadata, checksums, and exact artifact inventory
     Verify {
-        /// Directory the release metadata is read from, below the root.
-        #[arg(long, default_value = DEFAULT_RELEASE_DIRECTORY)]
-        directory: PathBuf,
+        /// Release directory to read the metadata from, below the root
+        #[arg(long = "dist", alias = "directory", default_value = DEFAULT_RELEASE_DIRECTORY)]
+        dist: PathBuf,
         /// File containing one expected artifact path per line.
         #[arg(long)]
         expected: Option<PathBuf>,
@@ -705,11 +777,11 @@ fn run_release(root: &Path, command: ReleaseCommands, output: OutputMode) -> Res
             release_source(root, &identity.tag, &identity.commit)?,
         ),
         ReleaseCommands::Manifest {
-            directory,
+            dist,
             expected,
             identity,
         } => {
-            let directory = resolve_path(root, directory);
+            let directory = resolve_path(root, dist);
             let expected = expected.map(|path| resolve_path(root, path));
             (
                 "release_manifest",
@@ -717,11 +789,11 @@ fn run_release(root: &Path, command: ReleaseCommands, output: OutputMode) -> Res
             )
         }
         ReleaseCommands::Verify {
-            directory,
+            dist,
             expected,
             identity,
         } => {
-            let directory = resolve_path(root, directory);
+            let directory = resolve_path(root, dist);
             let expected = expected.map(|path| resolve_path(root, path));
             (
                 "release_verify",
