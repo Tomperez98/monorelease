@@ -119,7 +119,7 @@ fn execute_plan_with_options(
         .present_run_start(&project.root, plan.len())
         .map_err(SchedulerError::Output)?;
     let force = matches!(cache_mode, CacheMode::Force);
-    let (sender, receiver) = mpsc::channel::<(TaskNode, WorkerReport)>();
+    let (sender, receiver) = mpsc::channel::<(TaskNode, SchedulerEvent)>();
     let (job_sender, job_receiver) = mpsc::channel::<WorkerJob>();
     let shared_job_receiver = Arc::new(Mutex::new(job_receiver));
     let worker_count = jobs.min(plan.len());
@@ -197,63 +197,27 @@ fn execute_plan_with_options(
             .recv()
             .expect("scheduler workers always send one completion result");
 
-        match report {
-            WorkerReport::Finished {
-                result,
-                key,
-                cache_error: store_error,
-            } => {
-                if output.is_live() {
-                    let presentation = match &result {
-                        Ok(result) => output.present_success(&node, result),
-                        Err(error) => output.present_failure(&node, error),
-                    };
-                    presented_live.insert(node.clone());
-                    if let Err(error) = presentation {
-                        output_error = Some(error);
-                        state.stopping = true;
-                    }
-                }
-                if let Some(error) = state.complete(node, result, key, store_error) {
-                    cache_error = Some(error);
-                }
-            }
-            WorkerReport::CacheFailed(error) => {
-                assert!(state.active.remove(&node), "completed task must be active");
-                cache_error = Some(error);
-                state.stopping = true;
-                // Release the resource group held by this task so finalizers
-                // sharing the group can still run.
-                if let Some(group) = state
-                    .tasks
-                    .get(&node)
-                    .expect("completed task must exist in the validated plan")
-                    .resource_group()
-                {
-                    state.active_groups.remove(group);
-                }
-                // Cache failure still unblocks finalizer dependents so the
-                // run can finish with a clean error.
-                if let Some(children) = state.dependents.get(&node).cloned() {
-                    for child in children {
-                        if state.is_finalizer(&child) {
-                            let count = state
-                                .remaining_dependencies
-                                .get_mut(&child)
-                                .expect("dependent must exist in the validated plan");
-                            *count -= 1;
-                            if *count == 0 {
-                                state.ready.insert(child);
-                            }
-                        }
-                    }
-                }
-            }
-            WorkerReport::OutputFailed(error) => {
-                assert!(state.active.remove(&node), "completed task must be active");
+        let effect = state.apply_event(node.clone(), report);
+        if output.is_live() && effect.result_recorded {
+            let result = state
+                .results
+                .get(&node)
+                .expect("finished event records a task result");
+            let presentation = match result {
+                Ok(result) => output.present_success(&node, result),
+                Err(error) => output.present_failure(&node, error),
+            };
+            presented_live.insert(node.clone());
+            if let Err(error) = presentation {
                 output_error = Some(error);
                 state.stopping = true;
             }
+        }
+        if let Some(error) = effect.cache_error {
+            cache_error = Some(error);
+        }
+        if let Some(error) = effect.output_error {
+            output_error = Some(error);
         }
     }
 
@@ -331,6 +295,12 @@ fn execute_plan_with_options(
 /// resource groups, completion results, cache-key index, and the stopping
 /// flag.  Methods transition the graph without touching files, sleeping,
 /// spawning threads, or reading process-global state.
+struct SchedulerEffect {
+    cache_error: Option<CacheError>,
+    output_error: Option<std::io::Error>,
+    result_recorded: bool,
+}
+
 struct PlanState {
     tasks: BTreeMap<TaskNode, Arc<PlannedTask>>,
     remaining_dependencies: BTreeMap<TaskNode, usize>,
@@ -524,7 +494,85 @@ impl PlanState {
         self.active.insert(node.clone());
     }
 
-    /// Record one worker completion.
+    fn release_active(&mut self, node: &TaskNode) {
+        assert!(self.active.remove(node), "completed task must be active");
+        if let Some(group) = self
+            .tasks
+            .get(node)
+            .expect("completed task must exist in the validated plan")
+            .resource_group()
+        {
+            self.active_groups.remove(group);
+        }
+    }
+
+    fn unblock_dependents(&mut self, node: &TaskNode, normal_succeeded: bool) {
+        if let Some(children) = self.dependents.get(node).cloned() {
+            for child in children {
+                let child_is_finalizer = self.is_finalizer(&child);
+                if normal_succeeded || child_is_finalizer {
+                    let count = self
+                        .remaining_dependencies
+                        .get_mut(&child)
+                        .expect("dependent must exist in the validated plan");
+                    *count -= 1;
+                    if *count == 0 {
+                        self.ready.insert(child);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Apply one worker event to the dependency graph.
+    ///
+    /// This is the scheduler's event-driven core: worker threads only produce
+    /// events, while all graph transitions happen synchronously here.
+    fn apply_event(&mut self, node: TaskNode, event: SchedulerEvent) -> SchedulerEffect {
+        match event {
+            SchedulerEvent::Finished {
+                result,
+                key,
+                cache_error,
+            } => {
+                self.release_active(&node);
+                if let Some(key) = key {
+                    self.task_keys.insert(node.clone(), key);
+                }
+                if result.is_err() || cache_error.is_some() {
+                    self.stopping = true;
+                }
+                self.unblock_dependents(&node, result.is_ok() && cache_error.is_none());
+                self.results.insert(node, result);
+                SchedulerEffect {
+                    cache_error,
+                    output_error: None,
+                    result_recorded: true,
+                }
+            }
+            SchedulerEvent::CacheFailed(error) => {
+                self.release_active(&node);
+                self.stopping = true;
+                self.unblock_dependents(&node, false);
+                SchedulerEffect {
+                    cache_error: Some(error),
+                    output_error: None,
+                    result_recorded: false,
+                }
+            }
+            SchedulerEvent::OutputFailed(error) => {
+                self.release_active(&node);
+                self.stopping = true;
+                SchedulerEffect {
+                    cache_error: None,
+                    output_error: Some(error),
+                    result_recorded: false,
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
     fn complete(
         &mut self,
         node: TaskNode,
@@ -532,46 +580,15 @@ impl PlanState {
         key: Option<String>,
         cache_error: Option<CacheError>,
     ) -> Option<CacheError> {
-        assert!(self.active.remove(&node), "completed task must be active");
-        if let Some(group) = self
-            .tasks
-            .get(&node)
-            .expect("completed task must exist in the validated plan")
-            .resource_group()
-        {
-            self.active_groups.remove(group);
-        }
-
-        if let Some(key) = key {
-            self.task_keys.insert(node.clone(), key);
-        }
-        if cache_error.is_some() {
-            self.stopping = true;
-        }
-
-        if result.is_err() || cache_error.is_some() {
-            self.stopping = true;
-        }
-
-        // Unblock dependents.
-        if let Some(children) = self.dependents.get(&node) {
-            for child in children {
-                let child_is_finalizer = self.is_finalizer(child);
-                if result.is_ok() && cache_error.is_none() || child_is_finalizer {
-                    let count = self
-                        .remaining_dependencies
-                        .get_mut(child)
-                        .expect("dependent must exist in the validated plan");
-                    *count -= 1;
-                    if *count == 0 {
-                        self.ready.insert(child.clone());
-                    }
-                }
-            }
-        }
-
-        self.results.insert(node, result);
-        cache_error
+        self.apply_event(
+            node,
+            SchedulerEvent::Finished {
+                result,
+                key,
+                cache_error,
+            },
+        )
+        .cache_error
     }
 
     /// Classify the completed plan and return the first error node.
@@ -645,7 +662,7 @@ struct WorkerJob {
 
 fn worker_loop(
     receiver: Arc<Mutex<mpsc::Receiver<WorkerJob>>>,
-    sender: mpsc::Sender<(TaskNode, WorkerReport)>,
+    sender: mpsc::Sender<(TaskNode, SchedulerEvent)>,
 ) {
     loop {
         let job = match receiver
@@ -666,7 +683,7 @@ fn worker_loop(
 
 /// One worker's whole lifecycle: fingerprint inputs, replay a cache hit, run
 /// the task, and refresh the cache entry.
-fn execute_task(job: WorkerJob) -> WorkerReport {
+fn execute_task(job: WorkerJob) -> SchedulerEvent {
     let WorkerJob {
         node: _,
         task,
@@ -686,7 +703,7 @@ fn execute_task(job: WorkerJob) -> WorkerReport {
         let session = cache_session.expect("cacheable tasks require a prepared cache session");
         match cache.task_key(session.as_ref(), &task, &dependency_keys) {
             Ok(computed) => key = Some(computed),
-            Err(error) => return WorkerReport::CacheFailed(error),
+            Err(error) => return SchedulerEvent::CacheFailed(error),
         }
     }
 
@@ -695,12 +712,12 @@ fn execute_task(job: WorkerJob) -> WorkerReport {
     let replayed = match (key.as_deref(), can_cache && !force) {
         (Some(computed), true) => match cache.lookup(&task, computed) {
             Ok(hit) => hit,
-            Err(error) => return WorkerReport::CacheFailed(error),
+            Err(error) => return SchedulerEvent::CacheFailed(error),
         },
         _ => None,
     };
     if let Some(result) = replayed {
-        return WorkerReport::Finished {
+        return SchedulerEvent::Finished {
             result: Ok(result),
             key,
             cache_error: None,
@@ -726,7 +743,7 @@ fn execute_task(job: WorkerJob) -> WorkerReport {
         if let Err(error) =
             output.present_attempt(&task.node(), attempt + 1, task.retries().saturating_add(1))
         {
-            return WorkerReport::OutputFailed(error);
+            return SchedulerEvent::OutputFailed(error);
         }
         let task_cancellation = (!task.is_finalizer()).then_some(&cancellation);
         match runner.execute(&root, &task, task_cancellation, output_callback.clone()) {
@@ -746,13 +763,13 @@ fn execute_task(job: WorkerJob) -> WorkerReport {
             let cache_error = key
                 .as_deref()
                 .and_then(|computed| cache.store(&task, computed, &result).err());
-            WorkerReport::Finished {
+            SchedulerEvent::Finished {
                 result: Ok(result),
                 key,
                 cache_error,
             }
         }
-        Err(error) => WorkerReport::Finished {
+        Err(error) => SchedulerEvent::Finished {
             result: Err(error),
             key,
             cache_error: None,
@@ -760,9 +777,9 @@ fn execute_task(job: WorkerJob) -> WorkerReport {
     }
 }
 
-/// One worker's report to the scheduling loop.
-enum WorkerReport {
-    /// The worker finished, with either a task result or a runner failure.
+/// One worker's event to the scheduling loop.
+enum SchedulerEvent {
+    /// A worker finished, with either a task result or a runner failure.
     /// `cache_error` records a successful run whose cache entry could not be
     /// written; it is `None` when `result` itself is an error.
     Finished {
@@ -953,6 +970,29 @@ mod tests {
         let state = PlanState::new(&plan).expect("valid plan succeeds");
         assert_eq!(state.ready.len(), 1);
         assert_eq!(state.active.len(), 0);
+    }
+
+    #[test]
+    fn cache_failure_event_releases_resources_and_unblocks_finalizers() {
+        let plan = planned(
+            "[project]\nname = \"fixture\"\n\n[pipelines.ci]\ntasks = [\"build\"]\nfinally = [\"cleanup\"]\n\n[tasks.build]\ncommand = [\"echo\", \"build\"]\nresource_group = \"db\"\n\n[tasks.cleanup]\ncommand = [\"echo\", \"cleanup\"]\nresource_group = \"db\"\n",
+        );
+        let mut state = PlanState::new(&plan).expect("plan succeeds");
+        state.mark_dispatched(&TaskNode::new("build"), false);
+
+        let effect = state.apply_event(
+            TaskNode::new("build"),
+            SchedulerEvent::CacheFailed(CacheError::Invalid {
+                message: "disk full".to_owned(),
+            }),
+        );
+
+        assert!(effect.cache_error.is_some());
+        assert!(effect.output_error.is_none());
+        assert!(state.active.is_empty());
+        assert!(state.active_groups.is_empty());
+        assert!(state.stopping);
+        assert_eq!(state.next_ready(), Some(TaskNode::new("cleanup")));
     }
 
     #[test]

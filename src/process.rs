@@ -13,7 +13,7 @@ use process_wrap::std::JobObject;
 use process_wrap::std::ProcessGroup;
 use process_wrap::std::{ChildWrapper, CommandWrap};
 
-use crate::runner::{ChildProcess, ProcessExit};
+use crate::runner::{ChildProcess, ProcessExit, TerminationOutcome};
 
 /// A child process whose process tree can be terminated reliably.
 ///
@@ -42,10 +42,18 @@ impl ManagedChild {
 
     /// Send a hard termination signal to the complete process group or Job
     /// Object without waiting for the direct child.
-    fn terminate_tree(&mut self) -> io::Result<()> {
+    fn terminate_tree(&mut self) -> io::Result<TerminationOutcome> {
         match self.child.start_kill() {
-            Ok(()) => Ok(()),
-            Err(_error) if self.child.try_wait()?.is_some() => Ok(()),
+            Ok(()) => Ok(TerminationOutcome::Terminated),
+            Err(_error) if self.child.try_wait()?.is_some() => {
+                Ok(TerminationOutcome::AlreadyExited)
+            }
+            #[cfg(target_os = "macos")]
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                // process-wrap can report EPERM when killpg races with a
+                // short-lived child whose process group has disappeared.
+                Ok(TerminationOutcome::AlreadyExited)
+            }
             Err(error) => Err(error),
         }
     }
@@ -105,7 +113,7 @@ impl ChildProcess for ManagedChild {
         })
     }
 
-    fn terminate_tree(&mut self) -> io::Result<()> {
+    fn terminate_tree(&mut self) -> io::Result<TerminationOutcome> {
         self.terminate_tree()
     }
 }

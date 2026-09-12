@@ -49,8 +49,15 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
+      # Install the driver rather than `cargo run`-ing it from `target/debug`:
+      # the `test` task re-links that binary, and Windows will not delete a
+      # running executable. `--profile dev` reuses the artifacts the tasks
+      # build, so the install adds no compilation of its own.
+      - name: Install Mono
+        run: cargo install --locked --path . --profile dev
+
       - name: Validate manifests and run project CI pipeline
-        run: cargo run --locked -- ci --no-cache --output text --ui stream
+        run: mono ci --no-cache --output text --ui stream
 
       - name: Verify distributable package
         run: cargo package --locked

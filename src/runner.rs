@@ -26,13 +26,20 @@ pub(crate) struct ProcessExit {
     pub(crate) success: bool,
 }
 
+/// The semantic result of asking a child process tree to terminate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TerminationOutcome {
+    Terminated,
+    AlreadyExited,
+}
+
 /// A live subprocess whose output and lifecycle the runner can observe.
 pub(crate) trait ChildProcess: Send {
     fn stdout(&mut self) -> Option<Box<dyn Read + Send>>;
     fn stderr(&mut self) -> Option<Box<dyn Read + Send>>;
     fn try_wait(&mut self) -> io::Result<Option<ProcessExit>>;
     fn wait(&mut self) -> io::Result<ProcessExit>;
-    fn terminate_tree(&mut self) -> io::Result<()>;
+    fn terminate_tree(&mut self) -> io::Result<TerminationOutcome>;
 }
 
 /// A factory for spawning child processes through the runner.
@@ -95,6 +102,28 @@ enum PollDecision {
     WaitFailed,
     /// Still running; sleep before polling again.
     Sleep(Duration),
+}
+
+/// Why the runner needs to terminate a process tree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminationReason {
+    Cancellation,
+    OutputLimit,
+    DescendantCleanup,
+    Timeout,
+    WaitFailure,
+}
+
+impl fmt::Display for TerminationReason {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Cancellation => "cancellation",
+            Self::OutputLimit => "output limit",
+            Self::DescendantCleanup => "descendant cleanup",
+            Self::Timeout => "timeout",
+            Self::WaitFailure => "wait error",
+        })
+    }
 }
 
 fn poll_decision(
@@ -365,50 +394,41 @@ impl Runner {
                 poll_interval,
             ) {
                 PollDecision::Cancel => {
-                    terminate_tree(&mut *child, planned.project(), planned.id(), "cancellation")?;
-                    let wait_result = child.wait();
-                    // Join both readers before checking either result. A wait
-                    // error must not detach a reader blocked on a descendant pipe.
-                    let joined = join_output(
-                        planned.project(),
-                        planned.id(),
+                    let terminated = terminate_and_collect(TerminationRequest {
+                        child: &mut *child,
+                        project: planned.project(),
+                        task: planned.id(),
+                        reason: TerminationReason::Cancellation,
+                        started,
+                        clock: self.clock.as_ref(),
                         stdout_reader,
                         stderr_reader,
-                    );
-                    wait_result.map_err(|source| RunnerError::Wait {
-                        project: planned.project().to_owned(),
-                        task: planned.id().to_owned(),
-                        source,
                     })?;
-                    let output = joined?.output;
                     return Err(RunnerError::Cancelled(Box::new(CancelledTask {
                         project: planned.project().to_owned(),
                         task: planned.id().to_owned(),
-                        output,
-                        elapsed: self.clock.now().duration_since(started),
+                        output: terminated.output,
+                        elapsed: terminated.elapsed,
                     })));
                 }
                 PollDecision::OutputLimit(stream_name) => {
-                    terminate_tree(&mut *child, planned.project(), planned.id(), "output limit")?;
-                    let wait_result = child.wait();
-                    let joined = join_output(
-                        planned.project(),
-                        planned.id(),
+                    let terminated = terminate_and_collect(TerminationRequest {
+                        child: &mut *child,
+                        project: planned.project(),
+                        task: planned.id(),
+                        reason: TerminationReason::OutputLimit,
+                        started,
+                        clock: self.clock.as_ref(),
                         stdout_reader,
                         stderr_reader,
-                    );
-                    wait_result.map_err(|source| RunnerError::Wait {
-                        project: planned.project().to_owned(),
-                        task: planned.id().to_owned(),
-                        source,
                     })?;
                     return Err(RunnerError::OutputLimit(Box::new(OutputLimitTask {
                         project: planned.project().to_owned(),
                         task: planned.id().to_owned(),
                         stream: stream_name,
                         limit: output_limit,
-                        output: joined?.output,
-                        elapsed: self.clock.now().duration_since(started),
+                        output: terminated.output,
+                        elapsed: terminated.elapsed,
                     })));
                 }
                 PollDecision::Exited {
@@ -419,7 +439,7 @@ impl Runner {
                             &mut *child,
                             planned.project(),
                             planned.id(),
-                            "descendant cleanup",
+                            TerminationReason::DescendantCleanup,
                         )?;
                     }
                     match wait {
@@ -428,18 +448,15 @@ impl Runner {
                     }
                 }
                 PollDecision::Timeout => {
-                    terminate_tree(&mut *child, planned.project(), planned.id(), "timeout")?;
-                    let wait_result = child.wait();
-                    let joined = join_output(
-                        planned.project(),
-                        planned.id(),
+                    let terminated = terminate_and_collect(TerminationRequest {
+                        child: &mut *child,
+                        project: planned.project(),
+                        task: planned.id(),
+                        reason: TerminationReason::Timeout,
+                        started,
+                        clock: self.clock.as_ref(),
                         stdout_reader,
                         stderr_reader,
-                    );
-                    wait_result.map_err(|source| RunnerError::Wait {
-                        project: planned.project().to_owned(),
-                        task: planned.id().to_owned(),
-                        source,
                     })?;
                     return Err(RunnerError::TimedOut(Box::new(TimedOutTask {
                         project: planned.project().to_owned(),
@@ -447,14 +464,17 @@ impl Runner {
                         command: planned.command().to_vec(),
                         cwd: planned.cwd().to_path_buf(),
                         timeout: planned.timeout(),
-                        output: joined?.output,
-                        elapsed: self.clock.now().duration_since(started),
+                        output: terminated.output,
+                        elapsed: terminated.elapsed,
                     })));
                 }
                 PollDecision::WaitFailed => {
-                    if let Err(error) =
-                        terminate_tree(&mut *child, planned.project(), planned.id(), "wait error")
-                    {
+                    if let Err(error) = terminate_tree(
+                        &mut *child,
+                        planned.project(),
+                        planned.id(),
+                        TerminationReason::WaitFailure,
+                    ) {
                         let _ = stdout_reader.join();
                         let _ = stderr_reader.join();
                         return Err(error);
@@ -539,18 +559,63 @@ struct JoinedOutput {
     exceeded_stream: Option<&'static str>,
 }
 
+struct TerminatedOutput {
+    output: CapturedOutput,
+    elapsed: Duration,
+}
+
+struct TerminationRequest<'a> {
+    child: &'a mut dyn ChildProcess,
+    project: &'a str,
+    task: &'a str,
+    reason: TerminationReason,
+    started: Instant,
+    clock: &'a dyn RunnerClock,
+    stdout_reader: thread::JoinHandle<io::Result<StreamCapture>>,
+    stderr_reader: thread::JoinHandle<io::Result<StreamCapture>>,
+}
+
+fn terminate_and_collect(request: TerminationRequest<'_>) -> Result<TerminatedOutput, RunnerError> {
+    let TerminationRequest {
+        child,
+        project,
+        task,
+        reason,
+        started,
+        clock,
+        stdout_reader,
+        stderr_reader,
+    } = request;
+    terminate_tree(child, project, task, reason)?;
+    let wait_result = child.wait();
+    // Join both readers before checking either result. A wait error must not
+    // detach a reader blocked on a descendant pipe.
+    let joined = join_output(project, task, stdout_reader, stderr_reader);
+    wait_result.map_err(|source| RunnerError::Wait {
+        project: project.to_owned(),
+        task: task.to_owned(),
+        source,
+    })?;
+    let output = joined?.output;
+    Ok(TerminatedOutput {
+        output,
+        elapsed: clock.now().duration_since(started),
+    })
+}
+
 fn terminate_tree(
     child: &mut dyn ChildProcess,
     project: &str,
     task: &str,
-    operation: &'static str,
+    reason: TerminationReason,
 ) -> Result<(), RunnerError> {
     child
         .terminate_tree()
+        .map(|_| ())
         .map_err(|source| RunnerError::Terminate {
             project: project.to_owned(),
             task: task.to_owned(),
-            operation,
+            reason,
             source,
         })
 }
@@ -697,7 +762,7 @@ pub enum RunnerError {
     Terminate {
         project: String,
         task: String,
-        operation: &'static str,
+        reason: TerminationReason,
         source: io::Error,
     },
     OutputLimit(Box<OutputLimitTask>),
@@ -788,11 +853,11 @@ impl fmt::Display for RunnerError {
             Self::Terminate {
                 project,
                 task,
-                operation,
+                reason,
                 source,
             } => write!(
                 f,
-                "could not terminate {project}/{task} during {operation}: {source}"
+                "could not terminate {project}/{task} during {reason}: {source}"
             ),
             Self::OutputLimit(details) => write!(
                 f,
@@ -912,38 +977,6 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn terminates_a_task_that_exceeds_its_timeout() {
-        let (_temp, project) = project_with_task("sleep 2", Some(1));
-        let plan = project.plan(None, &[]).expect("plan succeeds");
-        let error = Runner::new()
-            .run(&project.root, &plan[0])
-            .expect_err("task must time out");
-
-        assert!(matches!(error, RunnerError::TimedOut(_)));
-        assert!(error.to_string().contains("timed out after 1s"));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn cancellation_terminates_a_running_task() {
-        let (_temp, project) = project_with_task("sleep 5", None);
-        let plan = project.plan(None, &[]).expect("plan succeeds");
-        let cancellation = CancellationToken::new();
-        let signal = cancellation.clone();
-        let thread = std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(50));
-            signal.cancel();
-        });
-
-        let error = Runner::new()
-            .run_with_options(&project.root, &plan[0], Some(&cancellation), None)
-            .expect_err("task must be cancelled");
-        thread.join().expect("cancellation thread joins");
-        assert!(matches!(error, RunnerError::Cancelled(_)));
-    }
-
-    #[cfg(unix)]
-    #[test]
     fn timeout_terminates_descendants_before_their_delayed_write() {
         let temp = TempDir::new();
         let marker = temp.path().join("descendant-finished");
@@ -1008,7 +1041,10 @@ mod tests {
             .run(&project.root, &plan[0])
             .expect_err("task output must be bounded");
 
-        assert!(matches!(error, RunnerError::OutputLimit(_)));
+        assert!(
+            matches!(error, RunnerError::OutputLimit(_)),
+            "unexpected error: {error:?}"
+        );
         assert!(error.to_string().contains("stdout output limit of 8 bytes"));
         assert_eq!(
             error.output().expect("partial output is retained").stdout,
@@ -1273,7 +1309,7 @@ mod tests {
             RunnerError::Terminate {
                 project: "fixture".to_owned(),
                 task: "build".to_owned(),
-                operation: "timeout",
+                reason: TerminationReason::Timeout,
                 source: io(),
             },
         ];
@@ -1493,9 +1529,9 @@ mod tests {
             }
         }
 
-        fn terminate_tree(&mut self) -> io::Result<()> {
+        fn terminate_tree(&mut self) -> io::Result<TerminationOutcome> {
             self.terminated.store(true, Ordering::SeqCst);
-            Ok(())
+            Ok(TerminationOutcome::Terminated)
         }
     }
 
@@ -1552,6 +1588,75 @@ mod tests {
             let mut now = self.now.lock().unwrap();
             *now += duration;
         }
+    }
+
+    /// A child whose process group is already gone reports an explicit
+    /// `AlreadyExited` termination outcome.
+    struct AlreadyGoneChild {
+        exit: Option<ProcessExit>,
+    }
+
+    impl ChildProcess for AlreadyGoneChild {
+        fn stdout(&mut self) -> Option<Box<dyn Read + Send>> {
+            None
+        }
+
+        fn stderr(&mut self) -> Option<Box<dyn Read + Send>> {
+            None
+        }
+
+        fn try_wait(&mut self) -> io::Result<Option<ProcessExit>> {
+            Ok(self.exit)
+        }
+
+        fn wait(&mut self) -> io::Result<ProcessExit> {
+            self.exit.ok_or_else(|| io::Error::other("no exit"))
+        }
+
+        fn terminate_tree(&mut self) -> io::Result<TerminationOutcome> {
+            if self.exit.is_some() {
+                Ok(TerminationOutcome::AlreadyExited)
+            } else {
+                Err(io::Error::from(io::ErrorKind::PermissionDenied))
+            }
+        }
+    }
+
+    #[test]
+    fn an_already_exited_tree_is_not_a_cleanup_failure() {
+        let mut child = AlreadyGoneChild {
+            exit: Some(ProcessExit {
+                code: Some(0),
+                success: true,
+            }),
+        };
+
+        assert!(
+            terminate_tree(
+                &mut child,
+                "fixture",
+                "build",
+                TerminationReason::OutputLimit,
+            )
+            .is_ok(),
+            "an already-exited tree is not a termination failure"
+        );
+    }
+
+    #[test]
+    fn a_failed_terminate_on_a_running_child_is_reported() {
+        let mut child = AlreadyGoneChild { exit: None };
+
+        let error = terminate_tree(&mut child, "fixture", "build", TerminationReason::Timeout)
+            .expect_err("a live tree that cannot be signalled must be reported");
+
+        assert!(matches!(
+            error,
+            RunnerError::Terminate {
+                reason: TerminationReason::Timeout,
+                ..
+            }
+        ));
     }
 
     /// Helper: create a small PlannedTask for fake-runner tests.

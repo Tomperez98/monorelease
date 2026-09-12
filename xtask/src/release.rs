@@ -710,6 +710,7 @@ fn sha256_file(path: &Path) -> Result<String, Error> {
     Ok(format!("{:x}", digest.finalize()))
 }
 
+#[allow(unused_variables)]
 fn set_executable(path: &Path) -> Result<(), Error> {
     #[cfg(unix)]
     {

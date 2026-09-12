@@ -345,3 +345,16 @@ Or use the checked-in pipeline to run the same dependency-ordered workflow:
 ```bash
 mono run ci --ui stream
 ```
+
+On Windows, run that pipeline through an installed Mono. The `test` task
+re-links `target/debug/mono`, which is the very binary that `cargo run -- ci`
+executes, and Windows will not delete a running executable:
+
+```bash
+cargo install --locked --path . --profile dev
+mono run ci --ui stream
+```
+
+`--profile dev` reuses the artifacts the tasks build, so the install adds no
+compilation of its own. The `install.sh`/`install.ps1` release binaries work the
+same way and need no Rust toolchain.

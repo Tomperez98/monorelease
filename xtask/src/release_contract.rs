@@ -9,6 +9,7 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use mono::{
     ReleaseError, ReleaseIdentity, create_manifest_with_expected, verify_manifest_with_expected,
@@ -19,6 +20,11 @@ use crate::release_model::artifact_inventory;
 
 pub(crate) const COMPONENT: &str = "release-contract";
 const DEFAULT_DIRECTORY: &str = "dist";
+
+// Tests and release steps can invoke the contract concurrently in one process.
+// Include a monotonic suffix so one caller cannot remove another caller's
+// temporary inventory file.
+static EXPECTED_INVENTORY_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) fn run(directory: &Path, verify_only: bool) -> Result<(), Error> {
     let identity = release_identity()?;
@@ -101,7 +107,11 @@ fn annotated_tag_object(tag: &str) -> Result<Option<String>, Error> {
 
 fn expected_inventory(tag: &str) -> Result<PathBuf, Error> {
     let expected = artifact_inventory(tag)?;
-    let path = env::temp_dir().join(format!("mono-release-expected-{}", std::process::id()));
+    let unique = EXPECTED_INVENTORY_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let path = env::temp_dir().join(format!(
+        "mono-release-expected-{}-{unique}",
+        std::process::id()
+    ));
     fs::write(&path, expected.join("\n") + "\n").map_err(|error| {
         Error::Command(format!(
             "failed to write temporary release inventory {}: {error}",
